@@ -314,10 +314,6 @@ type Server struct {
 	// Set from EIGENINFERENCE_R2_CDN_URL env var. Empty disables CDN metadata.
 	r2CDNURL string
 
-	// r2SitePackagesCDNURL is the R2 bucket URL for site packages (e.g.
-	// auto-update manifests). Set from EIGENINFERENCE_R2_SITE_PACKAGES_CDN_URL.
-	r2SitePackagesCDNURL string
-
 	// corsOrigin is the allowed CORS origin (e.g. "https://console.darkbloom.dev").
 	// Set from CORS_ORIGIN env var. Empty defaults to the production console domain.
 	corsOrigin string
@@ -732,7 +728,6 @@ func NewServer(reg *registry.Registry, st store.Store, cfg ServerConfig, logger 
 	s.baseURL = strings.TrimRight(cfg.BaseURL, "/")
 	s.minProviderVersion = strings.TrimSpace(cfg.MinProviderVersion)
 	s.r2CDNURL = strings.TrimRight(cfg.R2CDNURL, "/")
-	s.r2SitePackagesCDNURL = strings.TrimRight(cfg.R2SitePackagesCDNURL, "/")
 	s.releaseKey = cfg.ReleaseKey
 
 	return s
@@ -1644,7 +1639,7 @@ func (s *Server) mdmWebhookTokenValid(r *http.Request) bool {
 var installScript []byte
 
 // installScriptPlaceholder is substituted with the coordinator's public URL at
-// serve time. Keep in sync with coordinator/internal/api/install.sh.
+// serve time. Keep in sync with coordinator/api/install.sh.
 //
 // The legacy install.sh also substituted __DARKBLOOM_R2_CDN_URL__ and
 // __DARKBLOOM_R2_SITE_PACKAGES_CDN_URL__ for the Python runtime download.

@@ -16,21 +16,17 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/eigeninference/d-inference/coordinator/auth"
 	"github.com/eigeninference/d-inference/coordinator/internal/e2e"
 	"github.com/eigeninference/d-inference/coordinator/payments"
 	"github.com/eigeninference/d-inference/coordinator/protocol"
@@ -392,36 +388,27 @@ func (s *Server) resolveRequestedModel(parsed map[string]any, rawBody []byte, re
 	return buildID, requested, rb, true
 }
 
-// maybeFallbackAliasCapacity keeps public aliases available during a desired-build
-// saturation event. Alias resolution intentionally prefers Desired when it is
-// routable, but if every desired provider is transiently full and Previous has
-// immediate capacity, route this request to Previous instead of returning a fast
-// 429. Hard constraints and permanent model-too-large failures are handled by the
-// caller and do not use this fallback. The TTFT estimate for Previous is also
-// returned so the caller does not need to recompute it.
-func (s *Server) maybeFallbackAliasCapacity(parsed map[string]any, publicModel, currentModel string, estimatedPromptTokens, requestedMaxTokens int, traits registry.RequestTraits, requiresVision bool, allowedProviderSerials []string) (string, int, int, int, time.Duration, bool, bool) {
-	if publicModel == "" || publicModel == currentModel {
-		return currentModel, 0, 0, 0, 0, false, false
-	}
-	target, ok := s.registry.AliasTarget(publicModel)
-	if !ok || target.Desired != currentModel || target.Previous == "" {
-		return currentModel, 0, 0, 0, 0, false, false
-	}
-	if s.modelShed(target.Previous, publicModel) {
-		return currentModel, 0, 0, 0, 0, false, false
-	}
-	if !s.registry.IsModelInCatalog(target.Previous) {
-		return currentModel, 0, 0, 0, 0, false, false
-	}
-	candidates, rejections, tooLarge, bestTTFT, hasTTFT := s.registry.QuickCapacityCheckWithTTFTForRequest(target.Previous, estimatedPromptTokens, requestedMaxTokens, traits, requiresVision, allowedProviderSerials...)
-	if candidates <= 0 {
-		return currentModel, candidates, rejections, tooLarge, bestTTFT, hasTTFT, false
-	}
-	parsed["model"] = target.Previous
-	return target.Previous, candidates, rejections, tooLarge, bestTTFT, hasTTFT, true
-}
+// aliasFallbackMode selects the failure policy for maybeFallbackAlias.
+type aliasFallbackMode int
 
-func (s *Server) maybeFallbackAliasTTFT(parsed map[string]any, publicModel, currentModel string, estimatedPromptTokens, requestedMaxTokens int, ttftThreshold time.Duration, traits registry.RequestTraits, requiresVision bool, allowedProviderSerials []string) (string, int, int, int, time.Duration, bool, bool) {
+const (
+	// aliasFallbackCapacity routes to Previous whenever it has any free capacity.
+	aliasFallbackCapacity aliasFallbackMode = iota
+	// aliasFallbackTTFT additionally rejects Previous when its best TTFT estimate
+	// would miss the per-request ceiling (ttftThreshold).
+	aliasFallbackTTFT
+)
+
+// maybeFallbackAlias keeps public aliases available during a desired-build
+// saturation event. Alias resolution intentionally prefers Desired when it is
+// routable, but if every desired provider is transiently full (aliasFallbackCapacity)
+// or too slow to hit the TTFT ceiling (aliasFallbackTTFT) and Previous can serve,
+// route this request to Previous instead of returning a fast 429 / slow stream.
+// Hard constraints and permanent model-too-large failures are handled by the
+// caller and do not use this fallback. The TTFT estimate for Previous is also
+// returned so the caller does not need to recompute it. ttftThreshold is only
+// consulted in aliasFallbackTTFT mode.
+func (s *Server) maybeFallbackAlias(parsed map[string]any, mode aliasFallbackMode, publicModel, currentModel string, estimatedPromptTokens, requestedMaxTokens int, ttftThreshold time.Duration, traits registry.RequestTraits, requiresVision bool, allowedProviderSerials []string) (string, int, int, int, time.Duration, bool, bool) {
 	if publicModel == "" || publicModel == currentModel {
 		return currentModel, 0, 0, 0, 0, false, false
 	}
@@ -429,15 +416,23 @@ func (s *Server) maybeFallbackAliasTTFT(parsed map[string]any, publicModel, curr
 	if !ok || target.Desired != currentModel || target.Previous == "" {
 		return currentModel, 0, 0, 0, 0, false, false
 	}
-	if s.modelShed(target.Previous, publicModel) {
+	// Previous must be a real, non-shed catalog build before we probe it.
+	if s.modelShed(target.Previous, publicModel) || !s.registry.IsModelInCatalog(target.Previous) {
 		return currentModel, 0, 0, 0, 0, false, false
 	}
-	if !s.registry.IsModelInCatalog(target.Previous) {
-		return currentModel, 0, 0, 0, 0, false, false
-	}
+	// A SINGLE Previous-build probe drives both modes; the mode only decides
+	// whether the probe's TTFT estimate also gates the fallback.
 	candidates, rejections, tooLarge, bestTTFT, hasTTFT := s.registry.QuickCapacityCheckWithTTFTForRequest(target.Previous, estimatedPromptTokens, requestedMaxTokens, traits, requiresVision, allowedProviderSerials...)
-	if candidates <= 0 || ttftTooSlow(bestTTFT, hasTTFT, ttftThreshold) {
-		return target.Previous, candidates, rejections, tooLarge, bestTTFT, hasTTFT, false
+	enforceTTFT := mode == aliasFallbackTTFT
+	if candidates <= 0 || (enforceTTFT && ttftTooSlow(bestTTFT, hasTTFT, ttftThreshold)) {
+		// No fallback. TTFT mode reports the probed Previous build (the caller
+		// uses it as the alternate TTFT estimate); capacity mode discards the
+		// model, so keep the unchanged current build.
+		failModel := currentModel
+		if enforceTTFT {
+			failModel = target.Previous
+		}
+		return failModel, candidates, rejections, tooLarge, bestTTFT, hasTTFT, false
 	}
 	parsed["model"] = target.Previous
 	return target.Previous, candidates, rejections, tooLarge, bestTTFT, hasTTFT, true
@@ -772,545 +767,6 @@ func (s *Server) dispatchOneProvider(
 	pendingCleanup = false
 
 	return provider, pr, decision, "", 0
-}
-
-func intFromRequestValue(v any) (int, bool) {
-	switch x := v.(type) {
-	case int:
-		return x, true
-	case int32:
-		return int(x), true
-	case int64:
-		return int(x), true
-	case float64:
-		return int(x), true
-	case json.Number:
-		n, err := x.Int64()
-		if err != nil {
-			return 0, false
-		}
-		return int(n), true
-	default:
-		return 0, false
-	}
-}
-
-// approximateTokenCount returns a rough token estimate for routing and queue
-// admission. The len/4 heuristic is a reasonable average for English text
-// with GPT-style BPE tokenizers. This value feeds into the scheduler's
-// capacity checks (pendingTokenBudget, freeMemoryAdmits) where a tighter
-// estimate produces better routing decisions.
-//
-// For billing reservation (where underestimation causes provider shortfall),
-// use approximateTokenCountUpperBound instead.
-func approximateTokenCount(v any) int {
-	if v == nil {
-		return 0
-	}
-	switch x := v.(type) {
-	case string:
-		if x == "" {
-			return 0
-		}
-		tokens := len(x) / 4
-		if tokens < 1 {
-			tokens = 1
-		}
-		return tokens
-	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return 0
-		}
-		tokens := len(b) / 4
-		if tokens < 1 {
-			tokens = 1
-		}
-		return tokens
-	}
-}
-
-// approximateTokenCountUpperBound returns a guaranteed upper bound on the
-// number of tokens a BPE tokenizer would produce for v. Every BPE vocabulary
-// starts with one token per byte and can only merge, so len(text) >= tokens
-// for any model family, any language, forever. This is used only for billing
-// reservation to ensure the pre-flight debit always covers the actual cost.
-//
-// Using len(text) over-reserves by ~3-4x on average for English prose, but
-// the difference is refunded immediately after inference completes, so
-// consumers are never overcharged — they only need sufficient balance to
-// cover the reservation hold.
-func approximateTokenCountUpperBound(v any) int {
-	if v == nil {
-		return 0
-	}
-	switch x := v.(type) {
-	case string:
-		return len(x)
-	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return 0
-		}
-		return len(b)
-	}
-}
-
-func estimatePromptTokens(parsed map[string]any) int {
-	total := 0
-	if v, ok := parsed["messages"]; ok {
-		total += messagesPromptTokens(v)
-	}
-	if v, ok := parsed["input"]; ok {
-		total += inputPromptTokens(v)
-	}
-	if v, ok := parsed["prompt"]; ok {
-		total += approximateTokenCount(v)
-	}
-	if total == 0 {
-		total = approximateTokenCount(parsed)
-	}
-	return total
-}
-
-// estimateBillingPromptTokens returns a guaranteed upper bound on prompt
-// tokens for billing reservation. Uses byte-length (not len/4) so the
-// pre-flight reservation always covers actual cost. This value must NOT
-// be used for routing — see estimatePromptTokens for that.
-func estimateBillingPromptTokens(parsed map[string]any) int {
-	total := 0
-	if v, ok := parsed["messages"]; ok {
-		// Billing MUST stay a guaranteed upper bound (len(bytes) >= tokens for any
-		// BPE tokenizer), so it keeps counting full message bytes — including a
-		// base64 image's bytes and every non-content field (role, tool_calls,
-		// name). Switching to the media-aware flat count here would DROP those
-		// fields and under-reserve for tool-calling requests. Over-reservation on a
-		// large image is safe (it is refunded after inference); the routing/ITPM
-		// estimate (estimatePromptTokens) is the media-aware one.
-		total += approximateTokenCountUpperBound(v)
-	}
-	if v, ok := parsed["input"]; ok {
-		total += approximateTokenCountUpperBound(v)
-	}
-	if v, ok := parsed["prompt"]; ok {
-		total += approximateTokenCountUpperBound(v)
-	}
-	if total == 0 {
-		total = approximateTokenCountUpperBound(parsed)
-	}
-	return total
-}
-
-// Media prompt-token costs. A vision encoder turns each image/video into a
-// bounded number of soft tokens (Gemma 4 caps around a few hundred per image)
-// regardless of the base64 byte length, so counting a `data:` URI as text
-// inflates the estimate by orders of magnitude — distorting routing admission and
-// over-reserving balance. These flat per-media costs keep both sane.
-const (
-	imagePromptTokenCost = 300
-	videoPromptTokenCost = 1500
-)
-
-// isMediaPartType reports whether an OpenAI/OpenRouter content-part type denotes
-// image or video input.
-func isMediaPartType(t string) bool {
-	switch t {
-	// OpenAI chat (image_url/video_url), OpenAI Responses (input_image/input_video),
-	// and Anthropic /v1/messages content blocks ({"type":"image"|"video","source":…}).
-	case "image_url", "input_image", "image", "video_url", "input_video", "video":
-		return true
-	}
-	return false
-}
-
-// messageContentTokens estimates ROUTING prompt tokens for one message's
-// `content`, counting text parts as text (len/4) and each image/video part as a
-// flat media cost (never the base64 length). Used only for the routing/ITPM
-// estimate; billing uses approximateTokenCountUpperBound (a guaranteed upper
-// bound that intentionally still counts the base64 bytes).
-func messageContentTokens(content any) int {
-	textTokens := func(s string) int {
-		if s == "" {
-			return 0
-		}
-		if t := len(s) / 4; t > 0 {
-			return t
-		}
-		return 1
-	}
-	switch c := content.(type) {
-	case string:
-		return textTokens(c)
-	case []any:
-		total := 0
-		for _, part := range c {
-			pm, ok := part.(map[string]any)
-			if !ok {
-				continue
-			}
-			typ, _ := pm["type"].(string)
-			switch {
-			case typ == "text" || typ == "input_text":
-				if s, ok := pm["text"].(string); ok {
-					total += textTokens(s)
-				}
-			case typ == "image_url" || typ == "input_image" || typ == "image":
-				total += imagePromptTokenCost
-			case typ == "video_url" || typ == "input_video" || typ == "video":
-				total += videoPromptTokenCost
-			default:
-				if b, err := json.Marshal(pm); err == nil {
-					total += len(b) / 4
-				}
-			}
-		}
-		return total
-	default:
-		return approximateTokenCount(content)
-	}
-}
-
-// messagesPromptTokens sums media-aware routing content tokens across a messages
-// array. Falls back to the len/4 heuristic when messages isn't the standard
-// array shape.
-func messagesPromptTokens(messages any) int {
-	arr, ok := messages.([]any)
-	if !ok {
-		return approximateTokenCount(messages)
-	}
-	total := 0
-	for _, m := range arr {
-		mm, ok := m.(map[string]any)
-		if !ok {
-			total += approximateTokenCount(m)
-			continue
-		}
-		total += 4 // small per-message framing (role + delimiters)
-		total += messageContentTokens(mm["content"])
-	}
-	return total
-}
-
-// inputPromptTokens estimates the Responses API `input` field. A string input
-// is plain text (len/4). Structured input is an array of message-like items with
-// `content` parts, so reuse the same media-aware content estimator as chat
-// messages instead of counting JSON wrapper bytes.
-func inputPromptTokens(input any) int {
-	switch x := input.(type) {
-	case string:
-		return approximateTokenCount(x)
-	case []any:
-		total := 0
-		for _, item := range x {
-			switch m := item.(type) {
-			case string:
-				total += approximateTokenCount(m)
-			case map[string]any:
-				content, ok := m["content"]
-				if !ok {
-					total += approximateTokenCount(m)
-					continue
-				}
-				total += 4 // role/type framing, matching messagesPromptTokens.
-				total += messageContentTokens(content)
-			default:
-				total += approximateTokenCount(item)
-			}
-		}
-		return total
-	default:
-		return approximateTokenCount(input)
-	}
-}
-
-// contentPartsHaveMedia reports whether a `content` value (a content-part array)
-// carries any image/video part.
-func contentPartsHaveMedia(content any) bool {
-	parts, ok := content.([]any)
-	if !ok {
-		return false
-	}
-	for _, part := range parts {
-		pm, ok := part.(map[string]any)
-		if !ok {
-			continue
-		}
-		if typ, _ := pm["type"].(string); isMediaPartType(typ) {
-			return true
-		}
-	}
-	return false
-}
-
-// detectMediaRequirement reports whether the request carries image/video input.
-// The coordinator sees plaintext at this point (sealedTransport decrypts before
-// the handler), so this drives the vision routing gate and the fail-fast "no
-// vision-capable provider" response. It scans both the Chat Completions
-// `messages[].content` parts and the Responses API `input[].content` parts so a
-// media request on either surface is gated (never silently routed text-blind).
-func detectMediaRequirement(parsed map[string]any) bool {
-	if messages, ok := parsed["messages"].([]any); ok {
-		for _, m := range messages {
-			if mm, ok := m.(map[string]any); ok && contentPartsHaveMedia(mm["content"]) {
-				return true
-			}
-		}
-	}
-	// Responses API: `input` may be a string (no media) or an array of items,
-	// each carrying `content` parts in the same image_url/input_image shape.
-	if input, ok := parsed["input"].([]any); ok {
-		for _, item := range input {
-			if im, ok := item.(map[string]any); ok && contentPartsHaveMedia(im["content"]) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// isInlineDataURI reports whether a media reference is an inline base64 data: URI
-// — the ONLY form the provider's E2E-encrypted VLM path accepts (see
-// VLMRequestInference.MediaError.invalidURL, which 400s anything else).
-func isInlineDataURI(s string) bool {
-	return strings.HasPrefix(strings.TrimSpace(s), "data:")
-}
-
-// mediaPartURLString returns the URL/inline reference carried by a media content
-// part and whether the part IS a media part. Covers OpenAI chat (image_url/
-// video_url objects or bare strings), OpenAI Responses (input_image/input_video),
-// and Anthropic source blocks ({type:"image"|"video", source:{type,…}}). A media
-// part whose reference can't be read returns ("", true) so the caller fails OPEN.
-func mediaPartURLString(pm map[string]any) (ref string, isMedia bool) {
-	typ, _ := pm["type"].(string)
-	if !isMediaPartType(typ) {
-		return "", false
-	}
-	switch typ {
-	case "image_url", "input_image", "video_url", "input_video":
-		field := "image_url"
-		if typ == "video_url" || typ == "input_video" {
-			field = "video_url"
-		}
-		switch v := pm[field].(type) {
-		case string:
-			return v, true
-		case map[string]any:
-			if u, ok := v["url"].(string); ok {
-				return u, true
-			}
-		}
-		return "", true
-	case "image", "video": // Anthropic source block
-		if src, ok := pm["source"].(map[string]any); ok {
-			switch st, _ := src["type"].(string); st {
-			case "url":
-				u, _ := src["url"].(string)
-				return u, true // remote reference
-			case "base64":
-				// Inline raw base64 (not a data: URI). Treated as inline/OK in v1 —
-				// the provider's Anthropic path accepts it; only remote refs are the
-				// production storm. Marked inline so it is never rejected here.
-				return "data:anthropic-inline-base64", true
-			}
-		}
-		return "", true
-	}
-	return "", true
-}
-
-// validateMediaParts walks every media part in a chat (messages[]) or Responses
-// (input[]) body and returns the first REMOTE / non-inline media reference. The
-// provider VLM path accepts ONLY inline data: URIs, so a remote http(s)://,
-// file://, or otherwise non-data: reference is the production gemma-vision 400
-// source. Returns ok=false with the offending reference so the caller rejects it
-// pre-dispatch (one clean 400) instead of dispatching and 400ing across the fleet.
-// Unknown/unreadable part shapes fall through (fail-OPEN) — never wrongly 400 a
-// body we don't model.
-func validateMediaParts(parsed map[string]any) (badRef string, ok bool) {
-	check := func(content any) (string, bool) {
-		parts, ok := content.([]any)
-		if !ok {
-			return "", true
-		}
-		for _, p := range parts {
-			pm, ok := p.(map[string]any)
-			if !ok {
-				continue
-			}
-			ref, isMedia := mediaPartURLString(pm)
-			if !isMedia || ref == "" {
-				continue
-			}
-			if !isInlineDataURI(ref) {
-				return ref, false
-			}
-		}
-		return "", true
-	}
-	if msgs, ok := parsed["messages"].([]any); ok {
-		for _, m := range msgs {
-			if mm, ok := m.(map[string]any); ok {
-				if ref, good := check(mm["content"]); !good {
-					return ref, false
-				}
-			}
-		}
-	}
-	if input, ok := parsed["input"].([]any); ok {
-		for _, it := range input {
-			if im, ok := it.(map[string]any); ok {
-				if ref, good := check(im["content"]); !good {
-					return ref, false
-				}
-			}
-		}
-	}
-	return "", true
-}
-
-// visionRejectRemoteEnabled gates the C4 pre-dispatch remote-media-URL rejection.
-// Default ON; DARKBLOOM_VISION_REJECT_REMOTE_URLS=false (or 0) restores the prior
-// dispatch-then-provider-400 behavior (still bounded by C1). Read live so the
-// kill switch toggles without a redeploy.
-func visionRejectRemoteEnabled() bool {
-	v := strings.TrimSpace(os.Getenv("DARKBLOOM_VISION_REJECT_REMOTE_URLS"))
-	if v == "" {
-		return true
-	}
-	on, err := strconv.ParseBool(v)
-	return err != nil || on
-}
-
-// rejectRemoteMediaURLs fails a vision request fast (one terminal 400) when any
-// media part carries a remote/non-inline URL, mirroring the provider's data:-only
-// contract. Pre-dispatch — no provider is contacted. handled=true => caller returns.
-func (s *Server) rejectRemoteMediaURLs(w http.ResponseWriter, r *http.Request, parsed map[string]any, model, publicModel string, requiresVision, hasTools bool) (handled bool) {
-	if !requiresVision || !visionRejectRemoteEnabled() {
-		return false
-	}
-	badRef, ok := validateMediaParts(parsed)
-	if ok {
-		return false
-	}
-	shown := badRef
-	if len(shown) > 200 {
-		shown = shown[:200] + "…"
-	}
-	stream, _ := parsed["stream"].(bool)
-	s.recordRejection(rejectionInfo{
-		r:               r,
-		stage:           "validation",
-		reasonCode:      "bad_param",
-		httpStatus:      http.StatusBadRequest,
-		keyID:           keyIDFromContext(r.Context()),
-		consumerKeyHash: store.HashKey(consumerKeyFromContext(r.Context())),
-		requestedModel:  publicModel,
-		resolvedModel:   model,
-		stream:          stream,
-		requiresVision:  true,
-		hasTools:        hasTools,
-		params:          rejectionSamplingParams(parsed),
-	})
-	s.ddIncr("inference.media_remote_url_rejected", []string{"model:" + model})
-	writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error",
-		"image/video input must be an inline base64 data: URI (e.g. \"data:image/jpeg;base64,…\"); "+
-			"remote http(s):// and file:// media URLs are not supported on this end-to-end-encrypted endpoint. Got: "+shown,
-		withParam("messages")))
-	return true
-}
-
-// requestHasTools reports whether the request carries a non-empty top-level
-// "tools" array (Chat Completions and Responses API share the field name).
-// Drives Traits.HasTools so tool-bearing requests only route to providers whose
-// binaries survive tool-schema template rendering (version floor + per-model
-// template_render_ok gate in the scheduler).
-func requestHasTools(parsed map[string]any) bool {
-	tools, ok := parsed["tools"].([]any)
-	return ok && len(tools) > 0
-}
-
-func requestCacheAffinityKey(parsed map[string]any) string {
-	raw, ok := parsed["prompt_cache_key"].(string)
-	if !ok || raw == "" {
-		return ""
-	}
-	const maxPromptCacheKeyBytes = 512
-	if len(raw) > maxPromptCacheKeyBytes {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(raw))
-	return fmt.Sprintf("%x", sum[:])
-}
-
-func estimateRequestedMaxTokens(parsed map[string]any) int {
-	for _, key := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
-		if n, ok := intFromRequestValue(parsed[key]); ok && n > 0 {
-			if copies, ok := intFromRequestValue(parsed["n"]); ok && copies > 1 {
-				return n * copies
-			}
-			return n
-		}
-	}
-	if copies, ok := intFromRequestValue(parsed["n"]); ok && copies > 1 {
-		return 256 * copies
-	}
-	return 256
-}
-
-func parseProviderSerialAllowlist(parsed map[string]any) ([]string, bool, error) {
-	var rawValues []any
-	provided := false
-	for _, key := range []string{"provider_serial", "provider_serials"} {
-		v, ok := parsed[key]
-		if !ok {
-			continue
-		}
-		provided = true
-		switch x := v.(type) {
-		case string:
-			rawValues = append(rawValues, x)
-		case []any:
-			rawValues = append(rawValues, x...)
-		default:
-			return nil, true, fmt.Errorf("%s must be a string or array of strings", key)
-		}
-	}
-	if !provided {
-		return nil, false, nil
-	}
-
-	seen := make(map[string]struct{}, len(rawValues))
-	ids := make([]string, 0, len(rawValues))
-	for _, raw := range rawValues {
-		id, ok := raw.(string)
-		if !ok {
-			return nil, true, fmt.Errorf("provider_serials must contain only strings")
-		}
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
-		}
-		if _, exists := seen[id]; exists {
-			continue
-		}
-		seen[id] = struct{}{}
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 {
-		return nil, true, fmt.Errorf("provider_serials must include at least one provider serial")
-	}
-	return ids, true, nil
-}
-
-func stripProviderRoutingFields(parsed map[string]any) bool {
-	changed := false
-	for _, key := range []string{"provider_serial", "provider_serials"} {
-		if _, ok := parsed[key]; ok {
-			delete(parsed, key)
-			changed = true
-		}
-	}
-	return changed
 }
 
 // penaltySafeProviderVersion is the first provider release whose VLM penalty
@@ -2133,7 +1589,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// owner's machine instead (handled below).
 		candidateCount, capacityRejections, modelTooLarge, bestTTFT, hasTTFT := s.registry.QuickCapacityCheckWithTTFTForRequest(model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials...)
 		if candidateCount == 0 && capacityRejections > 0 {
-			if fallbackModel, fallbackCandidates, fallbackRejections, fallbackTooLarge, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasCapacity(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
+			if fallbackModel, fallbackCandidates, fallbackRejections, fallbackTooLarge, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackCapacity, publicModel, model, estimatedPromptTokens, requestedMaxTokens, 0, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
 				model = fallbackModel
 				candidateCount, capacityRejections, modelTooLarge = fallbackCandidates, fallbackRejections, fallbackTooLarge
 				bestTTFT, hasTTFT = fallbackTTFT, fallbackHasTTFT
@@ -2372,7 +1828,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 				s.registry.RecordWarmPoolTTFTMiss(model, ttftThreshold)
 				s.triggerWarmPool()
 				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:ttft_soft_served"})
-			} else if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasTTFT(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
+			} else if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackTTFT, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
 				model = fallbackModel
 				if isResponsesAPI {
 					providerParsed, err := responsesRequestToChatCompletions(parsed)
@@ -2488,7 +1944,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// model may have been rewritten by a capacity- or TTFT-fallback above
-	// (maybeFallbackAliasCapacity / maybeFallbackAliasTTFT), so refresh the context
+	// (maybeFallbackAlias), so refresh the context
 	// window for the FINAL build before handing it to the dispatch loop — otherwise
 	// shouldStopFailover/classifyRejection would compare a provider's budget against
 	// the originally-resolved model's context. Overwrite only on a successful lookup
@@ -3159,7 +2615,7 @@ func stripThinkBlocks(text string) (string, string) {
 }
 
 // normalizeSSEChunk fixes fields in SSE chunks to match the OpenAI spec.
-// Some backends (e.g. vllm-mlx) emit "content":null instead of "content":"",
+// Some backends emit "content":null instead of "content":"",
 // and include "usage":null which strict parsers (ForgeCode, Codex) reject
 // because they expect usage to be either absent or a full object.
 func normalizeSSEChunk(chunk string) string {
@@ -4140,61 +3596,6 @@ func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
 		fmt.Sprintf("model %q not found", id), withParam("model")))
 }
 
-// handleCreateKey handles POST /v1/auth/keys — creates a new consumer API key.
-// Requires Privy authentication. The key is linked to the user's account so
-// requests made with the key are billed to the same account.
-func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error",
-			"API key creation requires a Privy account — authenticate with a Privy access token"))
-		return
-	}
-
-	key, err := s.store.CreateKeyForAccount(user.AccountID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse("server_error", "failed to create key"))
-		return
-	}
-	writeJSON(w, http.StatusOK, types.CreateKeyResponse{
-		APIKey:    key,
-		AccountID: user.AccountID,
-	})
-}
-
-// handleRevokeKey handles DELETE /v1/auth/keys — revokes an API key.
-// The caller must own the key (same account). Requires Privy auth so a
-// compromised API key cannot revoke legitimate keys.
-func (s *Server) handleRevokeKey(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error", "authentication required"))
-		return
-	}
-
-	var body struct {
-		Key string `json:"key"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Key == "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("bad_request", "provide {\"key\": \"sk-db-...\"}"))
-		return
-	}
-
-	owner := s.store.GetKeyAccount(body.Key)
-	if owner != user.AccountID {
-		writeJSON(w, http.StatusForbidden, errorResponse("forbidden", "you can only revoke your own keys"))
-		return
-	}
-
-	if !s.store.RevokeKey(body.Key) {
-		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "key not found or already revoked"))
-		return
-	}
-	s.invalidateAPIKeyCache(body.Key)
-
-	writeJSON(w, http.StatusOK, types.RevokeKeyResponse{Status: "revoked"})
-}
-
 // ── Multi-key management handlers (GET/POST/PATCH/DELETE /v1/keys) ────
 
 // createAPIKeyRequest is the POST /v1/keys (and rotate inherit) body. Money is
@@ -4216,376 +3617,6 @@ func usdToMicro(usd float64) int64 { return int64(math.Round(usd * 1_000_000)) }
 
 // microToUSD converts micro-USD to a USD float.
 func microToUSD(micro int64) float64 { return float64(micro) / 1_000_000 }
-
-// apiKeyToResponse projects a stored key into its masked API representation,
-// computing the current-window spend and remaining budget.
-func (s *Server) apiKeyToResponse(k *store.APIKey) types.APIKeyResponse {
-	resp := types.APIKeyResponse{
-		ID:            k.ID,
-		Name:          k.Name,
-		Label:         k.Label,
-		Disabled:      k.Disabled,
-		LimitReset:    store.NormalizeResetWindow(k.LimitReset),
-		RPMLimit:      k.RPMLimit,
-		ITPMLimit:     k.ITPMLimit,
-		OTPMLimit:     k.OTPMLimit,
-		AllowedModels: k.AllowedModels,
-		SelfRouteOnly: k.SelfRouteOnly,
-		ExpiresAt:     k.ExpiresAt,
-		CreatedAt:     k.CreatedAt,
-		LastUsedAt:    k.LastUsedAt,
-	}
-	since := store.KeySpendWindowStart(resp.LimitReset, time.Now())
-	spent := s.store.KeySpendSince(k.ID, since)
-	resp.UsageUSD = microToUSD(spent)
-	if k.LimitMicroUSD != nil {
-		limitUSD := microToUSD(*k.LimitMicroUSD)
-		resp.LimitUSD = &limitUSD
-		remaining := *k.LimitMicroUSD - spent
-		if remaining < 0 {
-			remaining = 0
-		}
-		remUSD := microToUSD(remaining)
-		resp.RemainingUSD = &remUSD
-	}
-	return resp
-}
-
-// validateKeyLimitInputs sanity-checks user-supplied limit values. Returns a
-// human-readable error string (empty when valid).
-func validateKeyLimitInputs(reset string, limitUSD *float64, rpm, itpm, otpm *int64, expiresAt *time.Time) string {
-	switch reset {
-	case "", store.KeyResetNone, store.KeyResetDaily, store.KeyResetWeekly, store.KeyResetMonthly:
-	default:
-		return "limit_reset must be one of: none, daily, weekly, monthly"
-	}
-	if limitUSD != nil && *limitUSD < 0 {
-		return "limit_usd must be >= 0"
-	}
-	if rpm != nil && *rpm < 0 {
-		return "rpm_limit must be >= 0"
-	}
-	if itpm != nil && *itpm < 0 {
-		return "itpm_limit must be >= 0"
-	}
-	if otpm != nil && *otpm < 0 {
-		return "otpm_limit must be >= 0"
-	}
-	if expiresAt != nil && !expiresAt.IsZero() && expiresAt.Before(time.Now()) {
-		return "expires_at must be in the future"
-	}
-	return ""
-}
-
-// keyModelAllowed returns false when the calling key restricts models via an
-// allow-list that does not include the requested model. Account-scoped/legacy
-// keys (no key in context) and keys without an allow-list always pass.
-func (s *Server) keyModelAllowed(ctx context.Context, model string) bool {
-	k := apiKeyFromContext(ctx)
-	if k == nil || len(k.AllowedModels) == 0 {
-		return true
-	}
-	for _, m := range k.AllowedModels {
-		if m == model {
-			return true
-		}
-	}
-	return false
-}
-
-// checkKeySpendCap reports whether charging additionalMicroUSD to the calling
-// key would exceed its per-key spend cap in the current window. It returns
-// (message, ok); ok=false means the request must be rejected with 402. The
-// per-account balance ledger is still the hard atomic ceiling — this is the
-// soft, per-key sub-cap, enforced against settled usage (so concurrent
-// in-flight requests are eventually-consistent, never over the account balance).
-func (s *Server) checkKeySpendCap(ctx context.Context, additionalMicroUSD int64) (string, bool) {
-	k := apiKeyFromContext(ctx)
-	if k == nil || k.ID == "" || k.LimitMicroUSD == nil {
-		return "", true
-	}
-	since := store.KeySpendWindowStart(k.LimitReset, time.Now())
-	spent := s.store.KeySpendSince(k.ID, since)
-	if spent+additionalMicroUSD > *k.LimitMicroUSD {
-		window := store.NormalizeResetWindow(k.LimitReset)
-		if window == store.KeyResetNone {
-			window = "total"
-		}
-		return fmt.Sprintf("API key spend limit reached (%s cap $%.2f, used $%.2f) — raise this key's limit or use another key",
-			window, microToUSD(*k.LimitMicroUSD), microToUSD(spent)), false
-	}
-	return "", true
-}
-
-// handleListAPIKeys handles GET /v1/keys — lists the caller's keys (masked).
-func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error", "authentication required"))
-		return
-	}
-	keys, err := s.store.ListAPIKeys(user.AccountID)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse("server_error", "failed to list keys"))
-		return
-	}
-	out := make([]types.APIKeyResponse, 0, len(keys))
-	for i := range keys {
-		out = append(out, s.apiKeyToResponse(&keys[i]))
-	}
-	writeJSON(w, http.StatusOK, types.APIKeyListResponse{Object: "list", Data: out})
-}
-
-// handleCreateAPIKey handles POST /v1/keys — mints a new named, optionally
-// limited key. The raw secret is returned exactly once.
-func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error",
-			"API key creation requires a Privy account — authenticate with a Privy access token"))
-		return
-	}
-
-	var req createAPIKeyRequest
-	if r.Body != nil {
-		// A missing/empty body is allowed (creates a default unnamed key).
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeJSON(w, http.StatusBadRequest, errorResponse("bad_request", "invalid JSON body"))
-			return
-		}
-	}
-	if msg := validateKeyLimitInputs(req.LimitReset, req.LimitUSD, req.RPMLimit, req.ITPMLimit, req.OTPMLimit, req.ExpiresAt); msg != "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("bad_request", msg))
-		return
-	}
-
-	opts := store.APIKeyCreate{
-		Name:          strings.TrimSpace(req.Name),
-		LimitReset:    store.NormalizeResetWindow(req.LimitReset),
-		RPMLimit:      req.RPMLimit,
-		ITPMLimit:     req.ITPMLimit,
-		OTPMLimit:     req.OTPMLimit,
-		AllowedModels: req.AllowedModels,
-		SelfRouteOnly: req.SelfRouteOnly,
-		ExpiresAt:     req.ExpiresAt,
-	}
-	if req.LimitUSD != nil {
-		m := usdToMicro(*req.LimitUSD)
-		opts.LimitMicroUSD = &m
-	}
-
-	raw, rec, err := s.store.CreateAPIKey(user.AccountID, opts)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse("server_error", "failed to create key"))
-		return
-	}
-	writeJSON(w, http.StatusOK, types.CreateAPIKeyResponse{
-		Key:  raw,
-		Data: s.apiKeyToResponse(rec),
-	})
-}
-
-// handleGetAPIKey handles GET /v1/keys/{id}.
-func (s *Server) handleGetAPIKey(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error", "authentication required"))
-		return
-	}
-	id := r.PathValue("id")
-	k, err := s.store.GetAPIKeyByID(user.AccountID, id)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "key not found"))
-		return
-	}
-	writeJSON(w, http.StatusOK, s.apiKeyToResponse(k))
-}
-
-// handleGetCallingKey handles GET /v1/key — returns the metadata for the API
-// key used to authenticate the request (OpenRouter parity).
-func (s *Server) handleGetCallingKey(w http.ResponseWriter, r *http.Request) {
-	k := apiKeyFromContext(r.Context())
-	if k == nil || k.ID == "" {
-		writeJSON(w, http.StatusNotFound, errorResponse("not_found",
-			"no key metadata — this endpoint requires API key authentication"))
-		return
-	}
-	writeJSON(w, http.StatusOK, s.apiKeyToResponse(k))
-}
-
-// handleUpdateAPIKey handles PATCH /v1/keys/{id} — sparse update of a key's
-// name, disabled flag, limits, reset window, expiry, and model allow-list.
-func (s *Server) handleUpdateAPIKey(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error", "authentication required"))
-		return
-	}
-	id := r.PathValue("id")
-	existing, err := s.store.GetAPIKeyByID(user.AccountID, id)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "key not found"))
-		return
-	}
-
-	// Decode into a presence map so we can distinguish "field omitted" (leave
-	// unchanged) from "field set to null" (clear the limit).
-	var patch map[string]json.RawMessage
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResponse("bad_request", "invalid JSON body"))
-		return
-	}
-	if msg := applyKeyPatch(existing, patch); msg != "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("bad_request", msg))
-		return
-	}
-	if msg := validateKeyLimitInputs(existing.LimitReset, nil, existing.RPMLimit, existing.ITPMLimit, existing.OTPMLimit, existing.ExpiresAt); msg != "" {
-		writeJSON(w, http.StatusBadRequest, errorResponse("bad_request", msg))
-		return
-	}
-
-	// Bump the auth-cache generation before AND after the mutation so a
-	// concurrent request cannot keep authenticating with a stale (e.g.
-	// just-disabled) cached record.
-	s.invalidateAllAPIKeyCache()
-	updated, err := s.store.UpdateAPIKey(user.AccountID, id, *existing)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse("server_error", "failed to update key"))
-		return
-	}
-	s.invalidateAllAPIKeyCache()
-	writeJSON(w, http.StatusOK, s.apiKeyToResponse(updated))
-}
-
-// applyKeyPatch merges a presence-aware PATCH body into an existing key record.
-// Returns a human-readable error string on invalid input (empty when ok).
-func applyKeyPatch(k *store.APIKey, patch map[string]json.RawMessage) string {
-	if raw, ok := patch["name"]; ok {
-		var name string
-		if err := json.Unmarshal(raw, &name); err != nil {
-			return "invalid value for name"
-		}
-		k.Name = strings.TrimSpace(name)
-	}
-	if raw, ok := patch["disabled"]; ok {
-		var disabled bool
-		if err := json.Unmarshal(raw, &disabled); err != nil {
-			return "invalid value for disabled"
-		}
-		k.Disabled = disabled
-	}
-	if raw, ok := patch["limit_reset"]; ok {
-		var reset string
-		if err := json.Unmarshal(raw, &reset); err != nil {
-			return "invalid value for limit_reset"
-		}
-		k.LimitReset = store.NormalizeResetWindow(reset)
-	}
-	if raw, ok := patch["limit_usd"]; ok {
-		if string(raw) == "null" {
-			k.LimitMicroUSD = nil
-		} else {
-			var usd float64
-			if err := json.Unmarshal(raw, &usd); err != nil {
-				return "invalid value for limit_usd"
-			}
-			if usd < 0 {
-				return "limit_usd must be >= 0"
-			}
-			m := usdToMicro(usd)
-			k.LimitMicroUSD = &m
-		}
-	}
-	if raw, ok := patch["allowed_models"]; ok {
-		if string(raw) == "null" {
-			k.AllowedModels = nil
-		} else {
-			var models []string
-			if err := json.Unmarshal(raw, &models); err != nil {
-				return "invalid value for allowed_models"
-			}
-			k.AllowedModels = models
-		}
-	}
-	if raw, ok := patch["self_route_only"]; ok {
-		var v bool
-		if err := json.Unmarshal(raw, &v); err != nil {
-			return "invalid value for self_route_only"
-		}
-		k.SelfRouteOnly = v
-	}
-	for field, dst := range map[string]**int64{
-		"rpm_limit":  &k.RPMLimit,
-		"itpm_limit": &k.ITPMLimit,
-		"otpm_limit": &k.OTPMLimit,
-	} {
-		if raw, ok := patch[field]; ok {
-			if string(raw) == "null" {
-				*dst = nil
-			} else {
-				var v int64
-				if err := json.Unmarshal(raw, &v); err != nil {
-					return "invalid value for " + field
-				}
-				*dst = &v
-			}
-		}
-	}
-	if raw, ok := patch["expires_at"]; ok {
-		if string(raw) == "null" {
-			k.ExpiresAt = nil
-		} else {
-			var t time.Time
-			if err := json.Unmarshal(raw, &t); err != nil {
-				return "invalid value for expires_at (use RFC 3339)"
-			}
-			k.ExpiresAt = &t
-		}
-	}
-	return ""
-}
-
-// handleDeleteAPIKey handles DELETE /v1/keys/{id} — permanently deletes a key.
-func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error", "authentication required"))
-		return
-	}
-	id := r.PathValue("id")
-	s.invalidateAllAPIKeyCache()
-	if err := s.store.RevokeAPIKeyByID(user.AccountID, id); err != nil {
-		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "key not found"))
-		return
-	}
-	s.invalidateAllAPIKeyCache()
-	writeJSON(w, http.StatusOK, types.RevokeKeyResponse{Status: "revoked"})
-}
-
-// handleRotateAPIKey handles POST /v1/keys/{id}/rotate — mints a fresh secret
-// carrying the same limits and metadata, then deletes the old key. The new
-// secret is returned exactly once.
-func (s *Server) handleRotateAPIKey(w http.ResponseWriter, r *http.Request) {
-	user := auth.UserFromContext(r.Context())
-	if user == nil {
-		writeJSON(w, http.StatusUnauthorized, errorResponse("auth_error", "authentication required"))
-		return
-	}
-	id := r.PathValue("id")
-	// Bump the auth-cache generation before AND after the mutation so the old
-	// secret stops authenticating the instant rotation commits.
-	s.invalidateAllAPIKeyCache()
-	raw, rec, err := s.store.RotateAPIKey(user.AccountID, id)
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, errorResponse("not_found", "key not found"))
-		return
-	}
-	s.invalidateAllAPIKeyCache()
-	writeJSON(w, http.StatusOK, types.CreateAPIKeyResponse{
-		Key:  raw,
-		Data: s.apiKeyToResponse(rec),
-	})
-}
 
 // handleHealth handles GET /health.
 // Returns the coordinator's status and the number of connected providers.
@@ -4787,13 +3818,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // handleCompletions handles POST /v1/completions.
-// Proxies OpenAI-compatible text completions to the provider's vllm-mlx server.
+// Proxies OpenAI-compatible text completions to the selected provider over the
+// E2E-encrypted WebSocket relay (MLX-Swift in-process backend).
 func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	s.handleGenericInference(w, r, "/v1/completions")
 }
 
 // handleAnthropicMessages handles POST /v1/messages.
-// Proxies Anthropic-compatible messages API to the provider's vllm-mlx server.
+// Proxies the Anthropic-compatible messages API to the selected provider over
+// the E2E-encrypted WebSocket relay (MLX-Swift in-process backend).
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	s.handleGenericInference(w, r, "/v1/messages")
 }
@@ -5034,7 +4067,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	} else {
 		candidateCount, capacityRejections, modelTooLarge, bestTTFT, hasTTFT := s.registry.QuickCapacityCheckWithTTFTForRequest(model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials...)
 		if candidateCount == 0 && capacityRejections > 0 {
-			if fallbackModel, fallbackCandidates, fallbackRejections, fallbackTooLarge, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasCapacity(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
+			if fallbackModel, fallbackCandidates, fallbackRejections, fallbackTooLarge, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackCapacity, publicModel, model, estimatedPromptTokens, requestedMaxTokens, 0, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
 				model = fallbackModel
 				candidateCount, capacityRejections, modelTooLarge = fallbackCandidates, fallbackRejections, fallbackTooLarge
 				bestTTFT, hasTTFT = fallbackTTFT, fallbackHasTTFT
@@ -5216,7 +4249,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 				s.registry.RecordWarmPoolTTFTMiss(model, ttftThreshold)
 				s.triggerWarmPool()
 				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:ttft_soft_served"})
-			} else if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAliasTTFT(parsed, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
+			} else if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackTTFT, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
 				model = fallbackModel
 			} else {
 				// Hard TTFT gate, no faster alias: 429 + Retry-After, and feed the
