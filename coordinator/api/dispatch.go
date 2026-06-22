@@ -320,6 +320,11 @@ func (d *dispatchState) recordRoutingDecisionFor(provider *registry.Provider, pr
 		provider.Mu().Unlock()
 	}
 
+	// Phase-0 shadow TTFT admission/spread metrics. No-op unless the request was
+	// evaluated (admission mode != off AND a provider was selected). Emitted on
+	// the synchronous path (cheap counter incr), not inside the async store write.
+	s.emitTTFTShadowMetrics(d.model, decision)
+
 	s.submitTelemetry("recordInferenceRoute", func() {
 		if err := s.store.RecordInferenceRoute(record); err != nil && s.logger != nil {
 			s.logger.Error("inference_routes record write failed",
@@ -365,6 +370,28 @@ func applyTimingDecomposition(out *store.InferenceRouteOutcome, t *registry.Requ
 	out.EncryptMs = timingMsBetween(t.RoutedAt, t.EncryptedAt)
 	out.QueueWaitMs = timingMsBetween(t.QueuedAt, t.DispatchedAt)
 	out.DispatchMs = timingMsBetween(t.DispatchedAt, firstChunk)
+}
+
+// commitFirstContent records the first CONTENT chunk on the committed attempt and
+// stamps FirstContentAt (the actual_ttft_ms anchor) in the SAME instant, on the
+// dispatch goroutine that reads the chunk. Stamping HERE — rather than later in
+// writeCommittedResponse — guarantees FirstContentAt is set before ANY route
+// outcome is built for this attempt: the committed/success outcome written by
+// this goroutine (e.g. waitFirstChunk / waitAccepted's defer) AND the terminal
+// completeRouteOutcome written concurrently by handleComplete on the provider
+// read-loop. Without it a fast single-chunk completion could persist
+// actual_ttft_ms as 0/NULL (applyPendingRouteTelemetry derives it solely from
+// FirstContentAt). pr is the COMMITTED attempt — the backup on a speculative
+// backup win, the primary otherwise. MarkFirstChunkArrived is kept (idempotent:
+// it preserves an earlier preamble's first-byte time for dispatch_to_first_chunk_ms).
+func (d *dispatchState) commitFirstContent(pr *registry.PendingRequest, chunk string) {
+	d.firstChunk = chunk
+	pr.MarkFirstChunkArrived()
+	pr.MarkFirstContentArrived()
+	// Mark THIS attempt as the committed one so handleComplete's fallback only
+	// ever stamps FirstContentAt for the attempt that actually delivered content —
+	// never a late-completing abandoned/retried attempt sharing the same Timing.
+	pr.MarkContentCommitted()
 }
 
 // successRoutingOutcome builds a success outcome for the committed attempt.
@@ -1055,8 +1082,7 @@ func (d *dispatchState) waitFirstChunk() (outcome dispatchOutcome) {
 			speculativeTimer.Stop()
 			deadlineTimer.Stop()
 			if ok {
-				d.firstChunk = chunk
-				pr.MarkFirstChunkArrived()
+				d.commitFirstContent(pr, chunk)
 				d.committed = true
 			} else {
 				select {
@@ -1271,8 +1297,7 @@ func (d *dispatchState) waitNoBackup() dispatchOutcome {
 			}
 			remainingDeadline.Stop()
 			if ok {
-				d.firstChunk = chunk
-				pr.MarkFirstChunkArrived()
+				d.commitFirstContent(pr, chunk)
 				d.committed = true
 			} else {
 				select {
@@ -1384,8 +1409,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 			s.cancelDispatch(backupProvider, backupPR)
 			if ok {
 				d.markSpeculativeLoser(backupPR)
-				d.firstChunk = chunk
-				pr.MarkFirstChunkArrived()
+				d.commitFirstContent(pr, chunk)
 				d.committed = true
 			} else {
 				select {
@@ -1426,8 +1450,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 				d.pr = backupPR
 				d.requestID = d.pr.RequestID
 				d.heldChunks = backupHeld
-				d.firstChunk = chunk
-				d.pr.MarkFirstChunkArrived()
+				d.commitFirstContent(d.pr, chunk)
 				d.committed = true
 			} else {
 				select {
@@ -1573,8 +1596,7 @@ func (d *dispatchState) raceBackupChunkClosedWaitPrimary(provider *registry.Prov
 			}
 			remainingPrimary.Stop()
 			if ok {
-				d.firstChunk = chunk
-				pr.MarkFirstChunkArrived()
+				d.commitFirstContent(pr, chunk)
 				d.committed = true
 			} else {
 				select {
@@ -1671,8 +1693,7 @@ func (d *dispatchState) racePrimaryFailedWaitBackup(backupProvider *registry.Pro
 				d.pr = backupPR
 				d.requestID = d.pr.RequestID
 				d.heldChunks = backupHeld
-				d.firstChunk = chunk
-				d.pr.MarkFirstChunkArrived()
+				d.commitFirstContent(d.pr, chunk)
 				d.committed = true
 			} else {
 				select {
@@ -1768,8 +1789,7 @@ func (d *dispatchState) raceBackupErrWaitPrimary(provider *registry.Provider, pr
 			}
 			primaryDeadline.Stop()
 			if ok {
-				d.firstChunk = chunk
-				pr.MarkFirstChunkArrived()
+				d.commitFirstContent(pr, chunk)
 				d.committed = true
 			} else {
 				select {
@@ -1882,8 +1902,7 @@ func (d *dispatchState) waitAccepted() (outcome dispatchOutcome) {
 			}
 			chunkTimer.Stop()
 			if ok {
-				d.firstChunk = chunk
-				pr.MarkFirstChunkArrived()
+				d.commitFirstContent(pr, chunk)
 				d.committed = true
 			} else {
 				// Closed — check for error. Use a short grace
@@ -2296,9 +2315,10 @@ func (d *dispatchState) writeCommittedResponse() {
 	// (known up front, adequate for normalization) and the provider's benchmarked
 	// PrefillTPS (set once at registration, read-only thereafter).
 	if pr.Timing != nil && d.firstChunk != "" {
-		if pr.Timing.FirstContentAt.IsZero() {
-			pr.Timing.FirstContentAt = time.Now()
-		}
+		// FirstContentAt was already stamped at the content-commit site
+		// (commitFirstContent), earlier in THIS goroutine, so contentLatency reads
+		// a set value here. No re-stamp needed; just read it for the reputation
+		// latency sample.
 		sample := adjustLatencyForPrefill(contentLatency(pr.Timing), pr.EstimatedPromptTokens, provider.PrefillTPS)
 		s.registry.RecordLatency(provider.ID, sample)
 	}

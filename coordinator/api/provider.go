@@ -1897,6 +1897,22 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 			})
 		}
 
+		// Fallback actual_ttft_ms anchor for the COMMITTED attempt only. The
+		// dispatch/handler goroutine normally stamps FirstContentAt at the
+		// content-commit site (commitFirstContent / the generic stamp); this
+		// fallback covers the fast single-chunk case where TypeInferenceComplete
+		// reaches this provider read-loop goroutine before that stamp runs. It is
+		// gated on ContentCommittedSafe so it ONLY ever stamps for the attempt that
+		// actually committed content: an abandoned/retried attempt that completes
+		// late (it never committed) must NOT stamp the SHARED Timing, or its stale
+		// timestamp would clamp/zero the real committed retry's actual_ttft_ms
+		// (FirstContentAt is first-write-wins). MarkFirstContentArrived is
+		// idempotent, so for the committed attempt this is a no-op when the
+		// dispatch goroutine already stamped.
+		if pr.ContentCommittedSafe() && msg.Usage.CompletionTokens > 0 {
+			pr.MarkFirstContentArrived()
+		}
+
 		// Update the routing telemetry outcome with final token counts and timing.
 		// handleComplete is the authoritative final writer for provider completion;
 		// when the consumer already disconnected this is a partial success because
@@ -1904,25 +1920,15 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 		// the full response.
 		outcome := completeRouteOutcome(pr, msg.Usage, totalCost, consumerGone)
 		if pr.Timing != nil {
-			t := pr.Timing
-			// This runs on the provider read-loop goroutine, not the request
-			// owner. FirstChunkAt is the one Timing field the dispatch goroutine
-			// writes after dispatch (while streaming), so read it via the
-			// mutex-guarded accessor to avoid a data race. The remaining fields
-			// (DispatchedAt, ReceivedAt, and those used by applyTimingDecomposition)
-			// are all stamped before dispatch and are safe to read here via the
-			// provider-registration happens-before edge.
+			// completeRouteOutcome already applied the per-attempt timing via
+			// applyPendingRouteTelemetry — actual_ttft_ms (from FirstContentAt),
+			// dispatch_to_first_chunk_ms (from FirstChunkAt), total_duration_ms,
+			// and the ParseMs..DispatchMs decomposition — all using the
+			// mutex-guarded timing accessors, which are race-free on this provider
+			// read-loop goroutine. This block only ADDS the measured decode
+			// throughput, which needs FirstChunkAt read via the same guarded
+			// accessor.
 			firstChunk := pr.FirstChunkAtSafe()
-			if !firstChunk.IsZero() && !t.DispatchedAt.IsZero() {
-				ms := float64(firstChunk.Sub(t.DispatchedAt).Milliseconds())
-				outcome.ActualTTFTMs = ms
-				outcome.DispatchToFirstChunkMs = ms
-			}
-			if !t.ReceivedAt.IsZero() {
-				outcome.TotalDurationMs = float64(time.Since(t.ReceivedAt).Milliseconds())
-			}
-			// Coordinator-side latency decomposition (ParseMs..DispatchMs).
-			applyTimingDecomposition(outcome, t, firstChunk)
 			// Measured decode throughput: completion tokens over the decode
 			// window (first chunk -> completion). Guard zero/negative durations
 			// and zero tokens so unmeasurable requests record 0.
