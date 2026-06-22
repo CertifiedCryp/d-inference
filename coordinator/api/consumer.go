@@ -1023,235 +1023,6 @@ func copyJSONMap(in map[string]any) map[string]any {
 	return out
 }
 
-func responsesContentText(content any) string {
-	switch c := content.(type) {
-	case nil:
-		return ""
-	case string:
-		return c
-	case []any:
-		parts := make([]string, 0, len(c))
-		for _, part := range c {
-			switch p := part.(type) {
-			case string:
-				if p != "" {
-					parts = append(parts, p)
-				}
-			case map[string]any:
-				if text, _ := p["text"].(string); text != "" {
-					parts = append(parts, text)
-					continue
-				}
-				if p["type"] == "input_image" || p["type"] == "input_file" {
-					// Text models cannot consume binary Responses parts yet.
-					// Preserve the turn shape without leaking URLs or blobs.
-					parts = append(parts, fmt.Sprintf("[%s omitted]", p["type"]))
-				}
-			}
-		}
-		return strings.Join(parts, "\n")
-	default:
-		b, err := json.Marshal(c)
-		if err != nil {
-			return fmt.Sprint(c)
-		}
-		return string(b)
-	}
-}
-
-func responsesInputToChatMessages(input any) ([]map[string]any, error) {
-	switch v := input.(type) {
-	case string:
-		return []map[string]any{{"role": "user", "content": v}}, nil
-	case []any:
-		messages := make([]map[string]any, 0, len(v))
-		for _, raw := range v {
-			item, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			if typ, _ := item["type"].(string); typ != "" {
-				switch typ {
-				case "message":
-					role, _ := item["role"].(string)
-					if role == "" {
-						role = "user"
-					}
-					if role == "developer" {
-						role = "system"
-					}
-					messages = append(messages, map[string]any{
-						"role":    role,
-						"content": responsesContentText(item["content"]),
-					})
-				case "function_call":
-					callID, _ := item["call_id"].(string)
-					if callID == "" {
-						callID, _ = item["id"].(string)
-					}
-					name, _ := item["name"].(string)
-					args, _ := item["arguments"].(string)
-					messages = append(messages, map[string]any{
-						"role":    "assistant",
-						"content": "",
-						"tool_calls": []map[string]any{{
-							"id":   callID,
-							"type": "function",
-							"function": map[string]any{
-								"name":      name,
-								"arguments": args,
-							},
-						}},
-					})
-				case "function_call_output":
-					callID, _ := item["call_id"].(string)
-					messages = append(messages, map[string]any{
-						"role":         "tool",
-						"tool_call_id": callID,
-						"content":      responsesContentText(item["output"]),
-					})
-				case "reasoning":
-					// Reasoning items are model-side metadata, not prompt text.
-					continue
-				default:
-					return nil, fmt.Errorf("unsupported Responses input item type %q", typ)
-				}
-				continue
-			}
-
-			role, _ := item["role"].(string)
-			if role == "" {
-				continue
-			}
-			if role == "developer" {
-				role = "system"
-			}
-			messages = append(messages, map[string]any{
-				"role":    role,
-				"content": responsesContentText(item["content"]),
-			})
-		}
-		if len(messages) == 0 {
-			return nil, fmt.Errorf("Responses input did not contain any chat-compatible messages")
-		}
-		return messages, nil
-	default:
-		return nil, fmt.Errorf("Responses input must be a string or array")
-	}
-}
-
-func responsesToolsToChatTools(raw any) ([]any, error) {
-	tools, ok := raw.([]any)
-	if !ok || len(tools) == 0 {
-		return nil, nil
-	}
-	out := make([]any, 0, len(tools))
-	for _, rawTool := range tools {
-		tool, ok := rawTool.(map[string]any)
-		if !ok {
-			continue
-		}
-		typ, _ := tool["type"].(string)
-		if typ == "" || typ == "function" {
-			name, _ := tool["name"].(string)
-			if name == "" {
-				if fn, _ := tool["function"].(map[string]any); fn != nil {
-					out = append(out, tool)
-					continue
-				}
-				return nil, fmt.Errorf("function tool is missing name")
-			}
-			fn := map[string]any{"name": name}
-			if description, ok := tool["description"].(string); ok {
-				fn["description"] = description
-			}
-			if parameters, ok := tool["parameters"]; ok {
-				fn["parameters"] = parameters
-			}
-			out = append(out, map[string]any{
-				"type":     "function",
-				"function": fn,
-			})
-			continue
-		}
-		return nil, fmt.Errorf("unsupported Responses tool type %q", typ)
-	}
-	return out, nil
-}
-
-func responsesToolChoiceToChat(raw any) (any, error) {
-	choice, ok := raw.(map[string]any)
-	if !ok {
-		return raw, nil
-	}
-	typ, _ := choice["type"].(string)
-	if typ == "function" {
-		name, _ := choice["name"].(string)
-		if name == "" {
-			return nil, fmt.Errorf("function tool_choice is missing name")
-		}
-		return map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": name,
-			},
-		}, nil
-	}
-	return raw, nil
-}
-
-func responsesTextFormatToChatResponseFormat(raw any) any {
-	text, ok := raw.(map[string]any)
-	if !ok {
-		return nil
-	}
-	format, ok := text["format"].(map[string]any)
-	if !ok {
-		return nil
-	}
-	switch format["type"] {
-	case "json_object":
-		return map[string]any{"type": "json_object"}
-	case "json_schema":
-		return map[string]any{
-			"type":        "json_schema",
-			"json_schema": format,
-		}
-	}
-	return nil
-}
-
-func responsesRequestToChatCompletions(parsed map[string]any) (map[string]any, error) {
-	messages, err := responsesInputToChatMessages(parsed["input"])
-	if err != nil {
-		return nil, err
-	}
-
-	out := copyJSONMap(parsed)
-	delete(out, "input")
-	delete(out, "endpoint")
-	delete(out, "max_output_tokens")
-	delete(out, "text")
-	out["messages"] = messages
-	if maxTokens := explicitMaxTokens(parsed); maxTokens > 0 {
-		out["max_tokens"] = maxTokens
-	}
-	if tools, err := responsesToolsToChatTools(parsed["tools"]); err != nil {
-		return nil, err
-	} else if len(tools) > 0 {
-		out["tools"] = tools
-	}
-	if choice, err := responsesToolChoiceToChat(parsed["tool_choice"]); err != nil {
-		return nil, err
-	} else if choice != nil {
-		out["tool_choice"] = choice
-	}
-	if responseFormat := responsesTextFormatToChatResponseFormat(parsed["text"]); responseFormat != nil {
-		out["response_format"] = responseFormat
-	}
-	return out, nil
-}
-
 // handleChatCompletions handles POST /v1/chat/completions.
 //
 // This is the main inference endpoint. It validates the request, finds an
@@ -1467,70 +1238,21 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pre-flight balance reservation — atomically debit the worst-case cost
-	// using the byte-length upper bound for prompt tokens (guaranteed >=
-	// actual tokens for any BPE tokenizer) plus max_tokens we just bounded
-	// the generation to. The post-inference charge refunds any unused
-	// portion. The routing estimate (estimatedPromptTokens, len/4) is kept
-	// separate so scheduler capacity checks aren't over-inflated.
-	var reservedMicroUSD int64
-	serviceReservation := false
-	// Self-route is free: skip the pre-flight balance reservation and the
-	// per-key spend cap entirely. A zero-balance owner must never be blocked
-	// from running on their own machine, and a self_route_only key never spends.
-	if s.billing != nil && !policy.enabled {
-		consumerKey := consumerKeyFromContext(r.Context())
-		reservedMicroUSD = s.reservationCost(model, billingPromptTokens, requestedMaxTokens)
-		// Per-key spend cap (phase 1) — checked before the reservation so a
-		// capped key never debits the account ledger.
-		if msg, ok := s.checkKeySpendCap(r.Context(), reservedMicroUSD); !ok {
-			s.recordRejection(rejectionInfo{
-				r:                     r,
-				stage:                 "balance",
-				reasonCode:            "insufficient_quota",
-				httpStatus:            http.StatusPaymentRequired,
-				keyID:                 keyIDFromContext(r.Context()),
-				consumerKeyHash:       store.HashKey(consumerKeyFromContext(r.Context())),
-				requestedModel:        publicModel,
-				resolvedModel:         model,
-				stream:                stream,
-				estimatedPromptTokens: estimatedPromptTokens,
-				requestedMaxTokens:    requestedMaxTokens,
-				requiresVision:        requiresVision,
-				hasTools:              hasTools,
-				params:                rejectionSamplingParams(parsed),
-			})
-			writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_quota", msg, withCode("insufficient_quota")))
-			return
-		}
-		var err error
-		serviceReservation, err = s.reserveInitialBalance(consumerKey, model, reservedMicroUSD)
-		if err != nil {
-			if errors.Is(err, store.ErrInsufficientBalance) {
-				s.recordRejection(rejectionInfo{
-					r:                     r,
-					stage:                 "balance",
-					reasonCode:            "insufficient_funds",
-					httpStatus:            http.StatusPaymentRequired,
-					keyID:                 keyIDFromContext(r.Context()),
-					consumerKeyHash:       store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:        publicModel,
-					resolvedModel:         model,
-					stream:                stream,
-					estimatedPromptTokens: estimatedPromptTokens,
-					requestedMaxTokens:    requestedMaxTokens,
-					requiresVision:        requiresVision,
-					hasTools:              hasTools,
-					params:                rejectionSamplingParams(parsed),
-				})
-				writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_funds",
-					"your balance is too low for this request — add funds at /billing or lower max_tokens", withCode("insufficient_quota")))
-			} else {
-				s.logger.Error("balance reservation failed (DB error)", "consumer_key", consumerKey, "error", err)
-				s.writeServiceUnavailable(w, model)
-			}
-			return
-		}
+	// Pre-flight balance reservation + per-key spend cap (see
+	// reserveInferenceBalance). Self-route and a nil billing backend are free.
+	reservedMicroUSD, serviceReservation, reserveHandled := s.reserveInferenceBalance(w, r, parsed, balanceReservationParams{
+		model:                 model,
+		publicModel:           publicModel,
+		billingPromptTokens:   billingPromptTokens,
+		estimatedPromptTokens: estimatedPromptTokens,
+		requestedMaxTokens:    requestedMaxTokens,
+		stream:                stream,
+		requiresVision:        requiresVision,
+		hasTools:              hasTools,
+		policy:                policy,
+	})
+	if reserveHandled {
+		return
 	}
 	timing.ReservedAt = time.Now()
 
@@ -1565,330 +1287,60 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Self-route pre-flight: confirm the caller owns an online machine that can
-	// serve this model, with precise errors and no fallback to the paid fleet.
-	if policy.enabled {
-		if s.selfRouteUnavailable(w, r, policy.ownerAccountID, model) {
+	// Shared routing/capacity admission preflight (self-route / prefer / public
+	// capacity+TTFT gate — see runInferenceAdmission). On the chat path an alias
+	// fallback must refresh the threaded rawBody: re-lowering Responses input→chat
+	// when applicable, which can itself fail with a 400. Thread that as the
+	// onModelFallback callback; resolvedModel uses the new build to match the
+	// pre-extraction behavior.
+	onModelFallback := func(newModel string) bool {
+		if !isResponsesAPI {
+			rawBody, _ = marshalForwardBody(parsed)
+			return true
+		}
+		providerParsed, err := responsesRequestToChatCompletions(parsed)
+		if err != nil {
 			refundReservation()
-			return
-		}
-	} else if policy.prefer {
-		// Prefer mode: SKIP the public fleet pre-flight. QuickCapacityCheck has
-		// no owner-trust relaxation, so it would spuriously 429/503 a request
-		// whose own (idle, possibly un-enrolled / private-only) machine could
-		// serve it while the public fleet is busy. Dispatch does owned-first
-		// routing with a paid public fallback and the normal queue, which is the
-		// correct gate for prefer.
-	} else {
-		ttftThreshold := deadline
-		// Pre-flight capacity check: can ANY provider serve this model right
-		// now? If not, return 429 immediately rather than queueing for up to
-		// 120s. OpenRouter treats 429 as "rate limited" (no uptime penalty) vs
-		// 503 which counts as downtime. Fast 429s also preserve our TTFT
-		// metrics. Self-route skips this fleet-wide gate — it queues on the
-		// owner's machine instead (handled below).
-		candidateCount, capacityRejections, modelTooLarge, bestTTFT, hasTTFT := s.registry.QuickCapacityCheckWithTTFTForRequest(model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials...)
-		if candidateCount == 0 && capacityRejections > 0 {
-			if fallbackModel, fallbackCandidates, fallbackRejections, fallbackTooLarge, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackCapacity, publicModel, model, estimatedPromptTokens, requestedMaxTokens, 0, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
-				model = fallbackModel
-				candidateCount, capacityRejections, modelTooLarge = fallbackCandidates, fallbackRejections, fallbackTooLarge
-				bestTTFT, hasTTFT = fallbackTTFT, fallbackHasTTFT
-				if isResponsesAPI {
-					providerParsed, err := responsesRequestToChatCompletions(parsed)
-					if err != nil {
-						refundReservation()
-						s.recordRejection(rejectionInfo{
-							r:                     r,
-							stage:                 "validation",
-							reasonCode:            "bad_param",
-							httpStatus:            http.StatusBadRequest,
-							keyID:                 keyIDFromContext(r.Context()),
-							consumerKeyHash:       store.HashKey(consumerKeyFromContext(r.Context())),
-							requestedModel:        publicModel,
-							resolvedModel:         model,
-							stream:                stream,
-							estimatedPromptTokens: estimatedPromptTokens,
-							requestedMaxTokens:    requestedMaxTokens,
-							requiresVision:        requiresVision,
-							hasTools:              hasTools,
-							params:                rejectionSamplingParams(parsed),
-						})
-						writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", err.Error()))
-						return
-					}
-					rawBody, _ = marshalForwardBody(providerParsed)
-				} else {
-					rawBody, _ = marshalForwardBody(parsed)
-				}
-			}
-		}
-		// Smart early-429 for structurally-unservable long prompts
-		// (prompt+max_tokens beyond the model context window or any provider's
-		// token budget). Gated (default off) and fail-open. Runs AFTER the alias
-		// capacity fallback so an alias whose Previous build still has capacity
-		// fails over first; an unservable request is then rejected with an
-		// uptime-neutral 429 (OpenRouter fails over) instead of admit→5xx.
-		if s.shedIfUnservable(w, r, parsed, publicModel, model, modelMaxContext, stream, estimatedPromptTokens, requestedMaxTokens, requiresVision, hasTools, allowedProviderSerials, refundReservation) {
-			return
-		}
-		if candidateCount == 0 && capacityRejections == 0 && modelTooLarge > 0 {
-			// Providers serve this model but none can ever fit it — non-retryable.
-			// Surface a clear 503 instead of a 429 the client would retry forever.
-			refundReservation()
-			s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:model_too_large"})
 			s.recordRejection(rejectionInfo{
-				r:                       r,
-				stage:                   "preflight_capacity",
-				reasonCode:              "model_too_large",
-				httpStatus:              http.StatusServiceUnavailable,
-				keyID:                   keyIDFromContext(r.Context()),
-				consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-				requestedModel:          publicModel,
-				resolvedModel:           model,
-				stream:                  stream,
-				estimatedPromptTokens:   estimatedPromptTokens,
-				requestedMaxTokens:      requestedMaxTokens,
-				requiresVision:          requiresVision,
-				hasTools:                hasTools,
-				params:                  rejectionSamplingParams(parsed),
-				servabilityComputed:     true,
-				candidateCount:          candidateCount,
-				capacityRejections:      capacityRejections,
-				modelTooLargeRejections: modelTooLarge,
-				bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
+				r:                     r,
+				stage:                 "validation",
+				reasonCode:            "bad_param",
+				httpStatus:            http.StatusBadRequest,
+				keyID:                 keyIDFromContext(r.Context()),
+				consumerKeyHash:       store.HashKey(consumerKeyFromContext(r.Context())),
+				requestedModel:        publicModel,
+				resolvedModel:         newModel,
+				stream:                stream,
+				estimatedPromptTokens: estimatedPromptTokens,
+				requestedMaxTokens:    requestedMaxTokens,
+				requiresVision:        requiresVision,
+				hasTools:              hasTools,
+				params:                rejectionSamplingParams(parsed),
 			})
-			writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_unavailable",
-				fmt.Sprintf("model %q is too large for any currently available provider", publicModel),
-				withCode("model_unavailable")))
-			return
+			writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", err.Error()))
+			return false
 		}
-		if candidateCount == 0 && capacityRejections > 0 {
-			// Routing v2 W3: feed the autoscaler the demand the preflight sees.
-			s.registry.RecordWarmPoolCapacityReject(model)
-			s.triggerWarmPool()
-			// Queue-before-shed (default on): providers exist for this model but
-			// all are at capacity right now. Rather than an immediate 429, let the
-			// request fall through to the normal dispatch+queue path so a slot
-			// freeing — or a cold load completing — within the queue window serves
-			// it. The dispatch/queue path still returns a 429 when the queue is
-			// full or the wait times out (true saturation). The reservation is
-			// kept for dispatch.
-			// Dedicated-family models (e.g. Gemma 4) bypass queue-before-shed when
-			// their dedicated boxes are saturated: holding an OpenRouter request in
-			// the 120s queue would blow its TTFT SLA, so shed immediately with a
-			// 429 + Retry-After for a clean failover rather than waiting on a
-			// dedicated slot that may not free in time.
-			if s.queueBeforeShedEnabled() && !s.registry.IsDedicatedModel(model) {
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:capacity_queue_spill"})
-			} else {
-				// Fast-shed: immediate 429 (always for dedicated models; for every
-				// model when queue-before-shed is disabled).
-				retryAfter := s.estimateRetryAfter(model)
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				refundReservation()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:capacity_429"})
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "preflight_capacity",
-					reasonCode:              "machine_busy",
-					httpStatus:              http.StatusTooManyRequests,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					retryAfterMs:            retryAfter * 1000,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
-				})
-				writeJSON(w, http.StatusTooManyRequests, errorResponse("rate_limit_exceeded",
-					fmt.Sprintf("all providers for model %q are at capacity — retry after %ds", publicModel, retryAfter),
-					withCode("rate_limit_exceeded")))
-				return
-			}
-		}
-		if candidateCount == 0 && capacityRejections == 0 && modelTooLarge == 0 {
-			// No provider is even structurally eligible right now: the model's
-			// whole pool is offline/untrusted, trait-gated (below the tools floor
-			// / render-broken), or — the case the shape-keyed breaker introduces —
-			// every serving provider is in inference-error cooldown for THIS
-			// request shape.
-			//
-			// Routing v2 W3 cold-dispatch (default on): before shedding, check
-			// whether an idle on-disk provider could be WARMED to serve this model
-			// (and would then pass admission for these traits). If so, spill the
-			// request into the queue instead of 503'ing — the enqueue path kicks
-			// the model-swap machinery, and the queued request drains onto the
-			// provider once the cold load completes. Note that an idle, fitting
-			// cold provider is already a scheduler candidate (slot "unknown" is
-			// eligible), so this branch usually only fires for genuinely
-			// unservable demand; it is the safety valve for the narrow window
-			// where a loadable cold provider is not yet a candidate.
-			//
-			// Feed the autoscaler the demand regardless of outcome.
-			s.registry.RecordWarmPoolCapacityReject(model)
-			s.triggerWarmPool()
-			if s.coldDispatchEnabled() && s.coldSpillAvailable(model, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials) {
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:cold_dispatch_spill"})
-				// Fall through to dispatch+queue; reservation kept.
-			} else if s.registry.IsDedicatedModel(model) && s.registry.HasProviderForModel(model, allowedProviderSerials...) {
-				// Dedicated-box model (e.g. Gemma 4): the fleet DOES serve this
-				// model, but no provider DEDICATED to it can take the request right
-				// now — either none are dedicated, or the dedicated ones are busy/
-				// cooling. That is transient capacity pressure, not an absent model,
-				// so shed to OpenRouter as a 429 + Retry-After (clean failover)
-				// rather than a 503 (which can get the endpoint marked unhealthy /
-				// deranked). Mirrors the capacity_429 path above.
-				retryAfter := s.estimateRetryAfter(model)
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				refundReservation()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:dedicated_capacity_429"})
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "preflight_capacity",
-					reasonCode:              "machine_busy",
-					httpStatus:              http.StatusTooManyRequests,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					retryAfterMs:            retryAfter * 1000,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
-				})
-				writeJSON(w, http.StatusTooManyRequests, errorResponse("rate_limit_exceeded",
-					fmt.Sprintf("no provider dedicated to model %q is available right now — retry after %ds", publicModel, retryAfter),
-					withCode("rate_limit_exceeded")))
-				return
-			} else {
-				// None of these clear by a slot freeing up, so queueing for up to
-				// 120s only adds misleading latency before the same error. Fail
-				// fast with a retryable 503 + Retry-After (OpenRouter treats 503
-				// as unavailable, not a uptime-penalised error here because the
-				// body is explicit). This mirrors the trait fast-fails above for
-				// the transient-cooldown case they cannot see.
-				retryAfter := s.estimateRetryAfter(model)
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				refundReservation()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:no_eligible_provider"})
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "preflight_capacity",
-					reasonCode:              "no_provider",
-					httpStatus:              http.StatusServiceUnavailable,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					retryAfterMs:            retryAfter * 1000,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
-				})
-				writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_unavailable",
-					fmt.Sprintf("no provider for model %q is available right now — retry after %ds", publicModel, retryAfter),
-					withCode("model_unavailable")))
-				return
-			}
-		}
-		if ttftTooSlow(bestTTFT, hasTTFT, ttftThreshold) {
-			if !s.ttftHardReject {
-				// Soft TTFT gate (default): a provider passed every routing and
-				// capacity gate, and pr.MaxTTFTMs is left 0 in soft mode, so the
-				// dispatch path serves the best-available provider instead of
-				// re-rejecting (P1 fix). Do NOT divert to an older alias build here
-				// (P2 fix) — the desired build is routable. A soft-serve over the
-				// deadline is still a TTFT near-miss, so feed the autoscaler so it
-				// grows warm capacity for this model.
-				s.registry.RecordWarmPoolTTFTMiss(model, ttftThreshold)
-				s.triggerWarmPool()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:ttft_soft_served"})
-			} else if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackTTFT, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
-				model = fallbackModel
-				if isResponsesAPI {
-					providerParsed, err := responsesRequestToChatCompletions(parsed)
-					if err != nil {
-						refundReservation()
-						s.recordRejection(rejectionInfo{
-							r:                     r,
-							stage:                 "validation",
-							reasonCode:            "bad_param",
-							httpStatus:            http.StatusBadRequest,
-							keyID:                 keyIDFromContext(r.Context()),
-							consumerKeyHash:       store.HashKey(consumerKeyFromContext(r.Context())),
-							requestedModel:        publicModel,
-							resolvedModel:         model,
-							stream:                stream,
-							estimatedPromptTokens: estimatedPromptTokens,
-							requestedMaxTokens:    requestedMaxTokens,
-							requiresVision:        requiresVision,
-							hasTools:              hasTools,
-							params:                rejectionSamplingParams(parsed),
-						})
-						writeJSON(w, http.StatusBadRequest, errorResponse("invalid_request_error", err.Error()))
-						return
-					}
-					rawBody, _ = marshalForwardBody(providerParsed)
-				} else {
-					rawBody, _ = marshalForwardBody(parsed)
-				}
-			} else {
-				// Hard TTFT gate, no faster alias: shed with a 429 + Retry-After,
-				// and feed the autoscaler a TTFT-miss so warm capacity grows.
-				s.registry.RecordWarmPoolTTFTMiss(model, ttftThreshold)
-				s.triggerWarmPool()
-				retryModel, retryTTFT := fasterTTFTEstimate(model, bestTTFT, fallbackModel, fallbackTTFT, fallbackHasTTFT)
-				refundReservation()
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "routing_ttft",
-					reasonCode:              "ttft_too_slow",
-					httpStatus:              http.StatusTooManyRequests,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              float64(retryTTFT.Milliseconds()),
-				})
-				s.writeTTFTTooSlow(w, retryModel, publicModel, retryTTFT, ttftThreshold)
-				return
-			}
-		}
+		rawBody, _ = marshalForwardBody(providerParsed)
+		return true
+	}
+	var preflightHandled bool
+	model, preflightHandled = s.runInferenceAdmission(w, r, parsed, inferenceAdmissionParams{
+		model:                  model,
+		publicModel:            publicModel,
+		stream:                 stream,
+		estimatedPromptTokens:  estimatedPromptTokens,
+		requestedMaxTokens:     requestedMaxTokens,
+		requiresVision:         requiresVision,
+		hasTools:               hasTools,
+		modelMaxContext:        modelMaxContext,
+		allowedProviderSerials: allowedProviderSerials,
+		deadline:               deadline,
+		policy:                 policy,
+		refundReservation:      refundReservation,
+		onModelFallback:        onModelFallback,
+	})
+	if preflightHandled {
+		return
 	}
 
 	// Dispatch to a provider with speculative TTFT-aware dispatch. On the
@@ -3344,258 +2796,6 @@ func buildNonStreamingResponse(requestID, model string, msg extractedMessage, us
 // from the catalog can't appear in the listing anyway, and adding it would
 // pollute the hidden set (e.g. an alias pointing at a not-yet-registered build).
 // Empty ids are ignored.
-func hideAliasBuild(hidden map[string]struct{}, catalogByID map[string]store.SupportedModel, buildID string) {
-	if buildID == "" {
-		return
-	}
-	if _, inCatalog := catalogByID[buildID]; inCatalog {
-		hidden[buildID] = struct{}{}
-	}
-}
-
-// aliasModelEntries builds the consumer-facing /v1/models entries for active
-// public aliases and returns the set of underlying build ids those aliases
-// cover (so the caller can hide them from the default listing). The hidden set
-// covers EVERY build an alias references — desired, previous, and the retired
-// lineage — so a concrete quant build never appears as its own entry once it is
-// behind an alias. Each alias entry derives its metadata from its primary build
-// — the desired build, or the previous build if the desired one isn't in the
-// catalog yet — and aggregates live capacity across the desired and previous
-// builds so the alias's routable/warm counts reflect every quant currently
-// serving it (retired builds are hide-only and never contribute capacity).
-func (s *Server) aliasModelEntries(
-	capByModel map[string]*registry.ModelCapacity,
-	catalogByID map[string]store.SupportedModel,
-	registryByID map[string]store.ModelRegistryEntry,
-) ([]types.ModelEntry, map[string]struct{}) {
-	hidden := make(map[string]struct{})
-	aliases, err := s.store.ListModelAliases()
-	if err != nil {
-		s.logger.Error("model registry: failed to list aliases", "error", err)
-		return nil, hidden
-	}
-
-	entries := make([]types.ModelEntry, 0, len(aliases))
-	for _, a := range aliases {
-		if !a.Active || a.DesiredBuild == "" {
-			continue
-		}
-		// A consumer must only ever see the alias, never a concrete build behind
-		// it. Hide EVERY build this alias references — desired, previous, AND the
-		// retired lineage — from the standalone listing, even if the alias itself
-		// isn't advertisable right now. (Capacity below aggregates only the
-		// routable desired/previous members; retired builds are hide-only.)
-		hideAliasBuild(hidden, catalogByID, a.DesiredBuild)
-		hideAliasBuild(hidden, catalogByID, a.PreviousBuild)
-		for _, b := range a.RetiredBuilds {
-			hideAliasBuild(hidden, catalogByID, b)
-		}
-		// Primary build = the desired build when it's in the catalog, else the
-		// previous build (so the alias keeps a real entry while the desired build
-		// is mid-registration). An alias whose builds are all out of catalog
-		// resolves to nothing and must not be advertised (it would 503).
-		members := make([]string, 0, 2)
-		desiredInCatalog := false
-		if _, ok := catalogByID[a.DesiredBuild]; ok {
-			members = append(members, a.DesiredBuild)
-			desiredInCatalog = true
-		}
-		previousInCatalog := false
-		if a.PreviousBuild != "" {
-			if _, ok := catalogByID[a.PreviousBuild]; ok {
-				members = append(members, a.PreviousBuild)
-				previousInCatalog = true
-			}
-		}
-		var primary string
-		switch {
-		case desiredInCatalog:
-			primary = a.DesiredBuild
-		case previousInCatalog:
-			primary = a.PreviousBuild
-		default:
-			// No in-catalog build backs this alias — don't advertise it.
-			continue
-		}
-
-		routable, warm := 0, 0
-		canAccept := false
-		for _, b := range members {
-			if cap, ok := capByModel[b]; ok {
-				routable += cap.RoutableProviders
-				warm += cap.WarmProviders
-				canAccept = canAccept || cap.CanAccept
-			}
-		}
-
-		cm := catalogByID[primary]
-		reg, hasReg := registryByID[primary]
-		displayName := a.DisplayName
-		if displayName == "" {
-			displayName = cm.DisplayName
-		}
-		metadata := types.ModelMetadata{
-			ModelType:         cm.ModelType,
-			Quantization:      "", // an alias spans quants; omit the per-build quant
-			DisplayName:       displayName,
-			RoutableProviders: routable,
-			WarmProviders:     warm,
-			CanAccept:         canAccept,
-		}
-		entry := types.ModelEntry{
-			ID:       a.AliasID,
-			Object:   "model",
-			OwnedBy:  "eigeninference",
-			Name:     displayName,
-			Metadata: metadata,
-		}
-		// Pricing / context / features come from the primary build's registry
-		// entry. Quantization is intentionally left blank on the alias.
-		primaryQuant := ""
-		if hasReg {
-			primaryQuant = reg.Quantization
-		}
-		s.openRouterModelFieldsFor(primary, primaryQuant, reg, hasReg).applyToModelEntry(&entry)
-		entry.Quantization = ""
-		var caps []string
-		if hasReg {
-			caps = reg.Capabilities
-		}
-		entry.InputModalities, entry.OutputModalities = deriveModalities(cm.ModelType, caps)
-		entries = append(entries, entry)
-	}
-	return entries, hidden
-}
-
-// listModelEntries assembles the consumer-facing model entries shared by
-// GET /v1/models and GET /v1/models/{id}. includeBuilds also lists the raw
-// quant builds hidden behind public aliases (ops/debug).
-func (s *Server) listModelEntries(includeBuilds bool) ([]types.ModelEntry, error) {
-	models := s.registry.ListModels()
-
-	// Build a lookup of capacity data keyed by model ID.
-	capacities := s.registry.ModelCapacitySnapshot()
-	capByModel := make(map[string]*registry.ModelCapacity, len(capacities))
-	for i := range capacities {
-		capByModel[capacities[i].ModelID] = &capacities[i]
-	}
-
-	// Filter to only show models from the active catalog, and capture the richer
-	// registry entries used to populate the OpenRouter provider fields. These
-	// lookups are shared with the dedicated /v1/models/openrouter feed.
-	catalogByID, registryByID, err := s.activeCatalogLookups()
-	if err != nil {
-		return nil, err
-	}
-
-	// Public aliases are the consumer-facing model names; their underlying
-	// quant builds are hidden by default so consumers never see the quant.
-	aliasEntries, hiddenBuilds := s.aliasModelEntries(capByModel, catalogByID, registryByID)
-
-	data := make([]types.ModelEntry, 0, len(models)+len(aliasEntries))
-	data = append(data, aliasEntries...)
-	for _, m := range models {
-		cm, inCatalog := catalogByID[m.ID]
-		if len(catalogByID) > 0 && !inCatalog {
-			continue
-		}
-		if _, hidden := hiddenBuilds[m.ID]; hidden && !includeBuilds {
-			continue
-		}
-		metadata := types.ModelMetadata{
-			ModelType:         m.ModelType,
-			Quantization:      m.Quantization,
-			ProviderCount:     m.Providers,
-			AttestedProviders: m.AttestedProviders,
-			TrustLevel:        string(m.TrustLevel),
-		}
-		// Add capacity fields from live snapshot.
-		if cap, ok := capByModel[m.ID]; ok {
-			metadata.RoutableProviders = cap.RoutableProviders
-			metadata.WarmProviders = cap.WarmProviders
-			metadata.CanAccept = cap.CanAccept
-		} else {
-			metadata.RoutableProviders = 0
-			metadata.WarmProviders = 0
-			metadata.CanAccept = false
-		}
-		if m.Attestation != nil {
-			metadata.Attestation = &types.ModelAttestation{
-				SecureEnclave: m.Attestation.SecureEnclave,
-				SIPEnabled:    m.Attestation.SIPEnabled,
-				SecureBoot:    m.Attestation.SecureBoot,
-			}
-		}
-		if inCatalog && cm.DisplayName != "" {
-			metadata.DisplayName = cm.DisplayName
-		}
-
-		entry := types.ModelEntry{
-			ID:            m.ID,
-			Object:        "model",
-			Created:       0,
-			OwnedBy:       "eigeninference",
-			Name:          metadata.DisplayName,
-			HuggingFaceID: m.ID, // model IDs are HuggingFace paths
-			Metadata:      metadata,
-		}
-
-		// OpenRouter provider fields (quantization, per-token pricing, sampling
-		// params, and registry-sourced metadata), shared with the dedicated
-		// /v1/models/openrouter feed.
-		reg, hasReg := registryByID[m.ID]
-		s.openRouterModelFieldsFor(m.ID, m.Quantization, reg, hasReg).applyToModelEntry(&entry)
-
-		// Modalities are derived from the model's capabilities (text by default).
-		var caps []string
-		if hasReg {
-			caps = reg.Capabilities
-		}
-		entry.InputModalities, entry.OutputModalities = deriveModalities(m.ModelType, caps)
-
-		data = append(data, entry)
-	}
-
-	return data, nil
-}
-
-func (s *Server) handleListModels(w http.ResponseWriter, r *http.Request) {
-	// Pass ?include_builds=1 (ops/debug) to also list the raw quant builds.
-	data, err := s.listModelEntries(r.URL.Query().Get("include_builds") == "1")
-	if err != nil {
-		s.logger.Error("model registry: failed to list active models", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to list models"))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, types.ModelListResponse{
-		Object: "list",
-		Data:   data,
-	})
-}
-
-// handleGetModel handles GET /v1/models/{id...} — the OpenAI "retrieve model"
-// endpoint. Model IDs may contain slashes (HuggingFace paths), hence the
-// wildcard path segment. Hidden quant builds are retrievable by their exact
-// id, matching the behavior of requesting one for inference.
-func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	data, err := s.listModelEntries(true)
-	if err != nil {
-		s.logger.Error("model registry: failed to list active models", "error", err)
-		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to list models"))
-		return
-	}
-	for _, entry := range data {
-		if entry.ID == id {
-			writeJSON(w, http.StatusOK, entry)
-			return
-		}
-	}
-	writeJSON(w, http.StatusNotFound, errorResponse("model_not_found",
-		fmt.Sprintf("model %q not found", id), withParam("model")))
-}
-
 // ── Multi-key management handlers (GET/POST/PATCH/DELETE /v1/keys) ────
 
 // createAPIKeyRequest is the POST /v1/keys (and rotate inherit) body. Money is
@@ -3809,14 +3009,6 @@ func (s *Server) handleProviderEarnings(w http.ResponseWriter, r *http.Request) 
 
 // --- helpers ---
 
-// writeJSON serializes v as JSON and writes it to the response with the
-// given HTTP status code. Sets Content-Type to application/json.
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
-}
-
 // handleCompletions handles POST /v1/completions.
 // Proxies OpenAI-compatible text completions to the selected provider over the
 // E2E-encrypted WebSocket relay (MLX-Swift in-process backend).
@@ -3956,65 +3148,23 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// Pre-flight balance reservation — same worst-case-cost reservation as
-	// handleChatCompletions, using the byte-length upper bound for prompt
-	// tokens so the reservation always covers actual cost.
+	// Pre-flight balance reservation + per-key spend cap (see
+	// reserveInferenceBalance). Self-route and a nil billing backend are free.
 	consumerKey := consumerKeyFromContext(r.Context())
 	consumerLocation := s.requestLocation(r)
-	var reservedMicroUSD int64
-	serviceReservation := false
-	// Self-route is free: skip the reservation and per-key spend cap.
-	if s.billing != nil && !policy.enabled {
-		reservedMicroUSD = s.reservationCost(model, billingPromptTokens, requestedMaxTokens)
-		// Per-key spend cap (phase 1) — checked before the reservation.
-		if msg, ok := s.checkKeySpendCap(r.Context(), reservedMicroUSD); !ok {
-			s.recordRejection(rejectionInfo{
-				r:                     r,
-				stage:                 "balance",
-				reasonCode:            "insufficient_quota",
-				httpStatus:            http.StatusPaymentRequired,
-				keyID:                 keyIDFromContext(r.Context()),
-				consumerKeyHash:       store.HashKey(consumerKeyFromContext(r.Context())),
-				requestedModel:        publicModel,
-				resolvedModel:         model,
-				stream:                stream,
-				estimatedPromptTokens: estimatedPromptTokens,
-				requestedMaxTokens:    requestedMaxTokens,
-				requiresVision:        requiresVision,
-				hasTools:              hasTools,
-				params:                rejectionSamplingParams(parsed),
-			})
-			writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_quota", msg, withCode("insufficient_quota")))
-			return
-		}
-		var err error
-		serviceReservation, err = s.reserveInitialBalance(consumerKey, model, reservedMicroUSD)
-		if err != nil {
-			if errors.Is(err, store.ErrInsufficientBalance) {
-				s.recordRejection(rejectionInfo{
-					r:                     r,
-					stage:                 "balance",
-					reasonCode:            "insufficient_funds",
-					httpStatus:            http.StatusPaymentRequired,
-					keyID:                 keyIDFromContext(r.Context()),
-					consumerKeyHash:       store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:        publicModel,
-					resolvedModel:         model,
-					stream:                stream,
-					estimatedPromptTokens: estimatedPromptTokens,
-					requestedMaxTokens:    requestedMaxTokens,
-					requiresVision:        requiresVision,
-					hasTools:              hasTools,
-					params:                rejectionSamplingParams(parsed),
-				})
-				writeJSON(w, http.StatusPaymentRequired, errorResponse("insufficient_funds",
-					"your balance is too low for this request — add funds at /billing or lower max_tokens", withCode("insufficient_quota")))
-			} else {
-				s.logger.Error("balance reservation failed (DB error)", "consumer_key", consumerKey, "error", err)
-				s.writeServiceUnavailable(w, model)
-			}
-			return
-		}
+	reservedMicroUSD, serviceReservation, reserveHandled := s.reserveInferenceBalance(w, r, parsed, balanceReservationParams{
+		model:                 model,
+		publicModel:           publicModel,
+		billingPromptTokens:   billingPromptTokens,
+		estimatedPromptTokens: estimatedPromptTokens,
+		requestedMaxTokens:    requestedMaxTokens,
+		stream:                stream,
+		requiresVision:        requiresVision,
+		hasTools:              hasTools,
+		policy:                policy,
+	})
+	if reserveHandled {
+		return
 	}
 	refundReservation := func() {
 		if reservedMicroUSD > 0 {
@@ -4054,235 +3204,28 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		return info
 	}
 
-	// Self-route pre-flight (precise errors, no paid fallback); otherwise the
-	// fleet-wide capacity 429 (same logic as handleChatCompletions).
-	if policy.enabled {
-		if s.selfRouteUnavailable(w, r, policy.ownerAccountID, model) {
-			refundReservation()
-			return
-		}
-	} else if policy.prefer {
-		// Prefer mode skips the public fleet pre-flight (no owner-trust
-		// relaxation there); owned-first dispatch + paid fallback + queue gate it.
-	} else {
-		candidateCount, capacityRejections, modelTooLarge, bestTTFT, hasTTFT := s.registry.QuickCapacityCheckWithTTFTForRequest(model, estimatedPromptTokens, requestedMaxTokens, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials...)
-		if candidateCount == 0 && capacityRejections > 0 {
-			if fallbackModel, fallbackCandidates, fallbackRejections, fallbackTooLarge, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackCapacity, publicModel, model, estimatedPromptTokens, requestedMaxTokens, 0, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
-				model = fallbackModel
-				candidateCount, capacityRejections, modelTooLarge = fallbackCandidates, fallbackRejections, fallbackTooLarge
-				bestTTFT, hasTTFT = fallbackTTFT, fallbackHasTTFT
-			}
-		}
-		// Smart early-429 for structurally-unservable long prompts (mirrors
-		// handleChatCompletions): runs AFTER the alias capacity fallback. Gated
-		// (default off), fail-open.
-		if s.shedIfUnservable(w, r, parsed, publicModel, model, modelMaxContext, stream, estimatedPromptTokens, requestedMaxTokens, requiresVision, hasTools, allowedProviderSerials, refundReservation) {
-			return
-		}
-		if candidateCount == 0 && capacityRejections == 0 && modelTooLarge > 0 {
-			refundReservation()
-			s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:model_too_large"})
-			s.recordRejection(rejectionInfo{
-				r:                       r,
-				stage:                   "preflight_capacity",
-				reasonCode:              "model_too_large",
-				httpStatus:              http.StatusServiceUnavailable,
-				keyID:                   keyIDFromContext(r.Context()),
-				consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-				requestedModel:          publicModel,
-				resolvedModel:           model,
-				stream:                  stream,
-				estimatedPromptTokens:   estimatedPromptTokens,
-				requestedMaxTokens:      requestedMaxTokens,
-				requiresVision:          requiresVision,
-				hasTools:                hasTools,
-				params:                  rejectionSamplingParams(parsed),
-				servabilityComputed:     true,
-				candidateCount:          candidateCount,
-				capacityRejections:      capacityRejections,
-				modelTooLargeRejections: modelTooLarge,
-				bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
-			})
-			writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_unavailable",
-				fmt.Sprintf("model %q is too large for any currently available provider", publicModel),
-				withCode("model_unavailable")))
-			return
-		}
-		if candidateCount == 0 && capacityRejections > 0 {
-			// Routing v2 W3: feed the autoscaler the demand the preflight sees.
-			s.registry.RecordWarmPoolCapacityReject(model)
-			s.triggerWarmPool()
-			// Queue-before-shed (default on): all providers for this model are at
-			// capacity right now. Fall through to the dispatch+queue path so a slot
-			// freeing — or a cold load completing — within the queue window serves
-			// it; the queue path still 429s on a full queue or wait timeout.
-			// Dedicated-family models (e.g. Gemma 4) bypass queue-before-shed when
-			// saturated — fast-429 for a clean OpenRouter failover instead of a
-			// 120s queue that would blow the TTFT SLA. Mirrors handleChatCompletions.
-			if s.queueBeforeShedEnabled() && !s.registry.IsDedicatedModel(model) {
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:capacity_queue_spill"})
-			} else {
-				retryAfter := s.estimateRetryAfter(model)
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				refundReservation()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:capacity_429"})
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "preflight_capacity",
-					reasonCode:              "machine_busy",
-					httpStatus:              http.StatusTooManyRequests,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					retryAfterMs:            retryAfter * 1000,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
-				})
-				writeJSON(w, http.StatusTooManyRequests, errorResponse("rate_limit_exceeded",
-					fmt.Sprintf("all providers for model %q are at capacity — retry after %ds", publicModel, retryAfter),
-					withCode("rate_limit_exceeded")))
-				return
-			}
-		}
-		if candidateCount == 0 && capacityRejections == 0 && modelTooLarge == 0 {
-			// No structurally-eligible provider right now (offline, trait-gated,
-			// or shape-cooled by the inference-error breaker).
-			//
-			// Routing v2 W3 cold-dispatch (default on): if an idle on-disk provider
-			// could be warmed to serve this model (and would pass admission for
-			// these traits), spill into the queue instead of 503'ing — the enqueue
-			// path kicks the model-swap machinery and the queued request drains
-			// onto the provider once the cold load completes. Feed the autoscaler
-			// the demand regardless of outcome.
-			s.registry.RecordWarmPoolCapacityReject(model)
-			s.triggerWarmPool()
-			if s.coldDispatchEnabled() && s.coldSpillAvailable(model, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials) {
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:cold_dispatch_spill"})
-				// Fall through to dispatch+queue; reservation kept.
-			} else if s.registry.IsDedicatedModel(model) && s.registry.HasProviderForModel(model, allowedProviderSerials...) {
-				// Dedicated-box model served by the fleet but no dedicated box is
-				// available right now: transient capacity, so shed with 429 +
-				// Retry-After (not 503). Mirrors the chat-completions preflight so
-				// /v1/completions and /v1/messages classify the shed identically.
-				retryAfter := s.estimateRetryAfter(model)
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				refundReservation()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:dedicated_capacity_429"})
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "preflight_capacity",
-					reasonCode:              "machine_busy",
-					httpStatus:              http.StatusTooManyRequests,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					retryAfterMs:            retryAfter * 1000,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
-				})
-				writeJSON(w, http.StatusTooManyRequests, errorResponse("rate_limit_exceeded",
-					fmt.Sprintf("no provider dedicated to model %q is available right now — retry after %ds", publicModel, retryAfter),
-					withCode("rate_limit_exceeded")))
-				return
-			} else {
-				// Queueing cannot help — fail fast with a retryable 503 instead of
-				// a 120s queue. Mirrors the chat-completions preflight.
-				retryAfter := s.estimateRetryAfter(model)
-				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-				refundReservation()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:no_eligible_provider"})
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "preflight_capacity",
-					reasonCode:              "no_provider",
-					httpStatus:              http.StatusServiceUnavailable,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					retryAfterMs:            retryAfter * 1000,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              ttftMsForRejection(bestTTFT, hasTTFT),
-				})
-				writeJSON(w, http.StatusServiceUnavailable, errorResponse("model_unavailable",
-					fmt.Sprintf("no provider for model %q is available right now — retry after %ds", publicModel, retryAfter),
-					withCode("model_unavailable")))
-				return
-			}
-		}
-		ttftThreshold := genericDeadline
-		if ttftTooSlow(bestTTFT, hasTTFT, ttftThreshold) {
-			if !s.ttftHardReject {
-				// Soft TTFT gate (default): serve the best-available provider
-				// (MaxTTFTMs is 0 in soft mode — P1 fix); do not divert to an older
-				// alias build (P2 fix). Feed the autoscaler a near-miss to grow
-				// warm capacity for this model.
-				s.registry.RecordWarmPoolTTFTMiss(model, ttftThreshold)
-				s.triggerWarmPool()
-				s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:ttft_soft_served"})
-			} else if fallbackModel, _, _, _, fallbackTTFT, fallbackHasTTFT, switched := s.maybeFallbackAlias(parsed, aliasFallbackTTFT, publicModel, model, estimatedPromptTokens, requestedMaxTokens, ttftThreshold, registry.RequestTraits{HasTools: hasTools}, requiresVision, allowedProviderSerials); switched {
-				model = fallbackModel
-			} else {
-				// Hard TTFT gate, no faster alias: 429 + Retry-After, and feed the
-				// autoscaler a TTFT-miss so warm capacity grows.
-				s.registry.RecordWarmPoolTTFTMiss(model, ttftThreshold)
-				s.triggerWarmPool()
-				retryModel, retryTTFT := fasterTTFTEstimate(model, bestTTFT, fallbackModel, fallbackTTFT, fallbackHasTTFT)
-				refundReservation()
-				s.recordRejection(rejectionInfo{
-					r:                       r,
-					stage:                   "routing_ttft",
-					reasonCode:              "ttft_too_slow",
-					httpStatus:              http.StatusTooManyRequests,
-					keyID:                   keyIDFromContext(r.Context()),
-					consumerKeyHash:         store.HashKey(consumerKeyFromContext(r.Context())),
-					requestedModel:          publicModel,
-					resolvedModel:           model,
-					stream:                  stream,
-					estimatedPromptTokens:   estimatedPromptTokens,
-					requestedMaxTokens:      requestedMaxTokens,
-					requiresVision:          requiresVision,
-					hasTools:                hasTools,
-					params:                  rejectionSamplingParams(parsed),
-					servabilityComputed:     true,
-					candidateCount:          candidateCount,
-					capacityRejections:      capacityRejections,
-					modelTooLargeRejections: modelTooLarge,
-					bestTTFTMs:              float64(retryTTFT.Milliseconds()),
-				})
-				s.writeTTFTTooSlow(w, retryModel, publicModel, retryTTFT, ttftThreshold)
-				return
-			}
-		}
+	// Shared routing/capacity admission preflight (self-route / prefer / public
+	// capacity+TTFT gate — see runInferenceAdmission). This handler rebuilds the
+	// provider body from parsed at dispatch (maybeFallbackAlias already rewrote
+	// parsed["model"]), so no body-refresh callback is needed.
+	var preflightHandled bool
+	model, preflightHandled = s.runInferenceAdmission(w, r, parsed, inferenceAdmissionParams{
+		model:                  model,
+		publicModel:            publicModel,
+		stream:                 stream,
+		estimatedPromptTokens:  estimatedPromptTokens,
+		requestedMaxTokens:     requestedMaxTokens,
+		requiresVision:         requiresVision,
+		hasTools:               hasTools,
+		modelMaxContext:        modelMaxContext,
+		allowedProviderSerials: allowedProviderSerials,
+		deadline:               genericDeadline,
+		policy:                 policy,
+		refundReservation:      refundReservation,
+		onModelFallback:        nil,
+	})
+	if preflightHandled {
+		return
 	}
 
 	requestID := uuid.New().String()
@@ -4871,37 +3814,3 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		s.handleNonStreamingResponseWithFirstChunk(w, r, pr, firstChunks)
 	}
 }
-
-// errorDetailOpt carries optional fields for OpenAI-compatible error responses.
-type errorDetailOpt struct {
-	param string // e.g. "model", "max_tokens"
-	code  string // e.g. "model_not_found", "insufficient_quota"
-}
-
-// errorResponse builds a standard OpenAI-compatible error response body.
-// By default, code is inferred from errType. Callers can override code or
-// set param via withParam / withCode helpers.
-func errorResponse(errType, message string, opts ...errorDetailOpt) map[string]any {
-	detail := map[string]any{
-		"type":    errType,
-		"message": message,
-		"code":    errType, // default: code mirrors type
-	}
-	for _, o := range opts {
-		if o.param != "" {
-			detail["param"] = o.param
-		}
-		if o.code != "" {
-			detail["code"] = o.code
-		}
-	}
-	return map[string]any{
-		"error": detail,
-	}
-}
-
-// withParam returns an option that sets the "param" field on an error response.
-func withParam(p string) errorDetailOpt { return errorDetailOpt{param: p} }
-
-// withCode returns an option that overrides the "code" field on an error response.
-func withCode(c string) errorDetailOpt { return errorDetailOpt{code: c} }
