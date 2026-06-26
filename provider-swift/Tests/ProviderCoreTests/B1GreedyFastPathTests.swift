@@ -38,6 +38,7 @@ struct B1GreedyFastPathEligibilityTests {
         maxTokens: Int = 128,
         maxContextLength: Int = 8192,
         cacheScope: String = "",
+        prefixCacheEnabled: Bool = false,
         activeBridgeCount: Int = 0,
         pendingRequestCount: Int = 0,
         fastPathActive: Bool = false,
@@ -56,6 +57,7 @@ struct B1GreedyFastPathEligibilityTests {
             maxTokens: maxTokens,
             maxContextLength: maxContextLength,
             cacheScope: cacheScope,
+            prefixCacheEnabled: prefixCacheEnabled,
             activeBridgeCount: activeBridgeCount,
             pendingRequestCount: pendingRequestCount,
             fastPathActive: fastPathActive,
@@ -129,6 +131,17 @@ struct B1GreedyFastPathEligibilityTests {
         #expect(!eligible(cacheScope: "tenant-abc"))
     }
 
+    @Test("an enabled prefix/checkpoint cache defers even unscoped requests")
+    func prefixCacheEnabledIsIneligible() {
+        // With the fast path default-on, an unscoped greedy request would
+        // otherwise take it and bypass the checkpoint prefix cache (cold prefill,
+        // no planRestoredCheckpoint/capture). Defer to the engine whenever a
+        // prefix cache is active so stores/hits keep working (Codex P2).
+        #expect(!eligible(prefixCacheEnabled: true))
+        // The canonical request stays eligible when no prefix cache is active.
+        #expect(eligible(prefixCacheEnabled: false))
+    }
+
     @Test("any concurrent or queued work disqualifies the exclusive fast path")
     func nonExclusiveIsIneligible() {
         #expect(!eligible(activeBridgeCount: 1))
@@ -145,15 +158,18 @@ struct B1GreedyFastPathEligibilityTests {
         #expect(!eligible(hasContainer: false))
     }
 
-    @Test("env flags are off by default in this process")
-    func envFlagDefaultOff() {
-        // The CI runner does not set these, so the static gate is false. (If a
-        // developer exported them, this documents the expectation rather than
-        // asserting a hard false.)
+    @Test("fast path is ON by default; env flags opt OUT")
+    func envFlagDefaultOn() {
+        // Default ON: the gate is true unless EITHER flag is set to a falsey
+        // value (0/false/no/off). The CI runner does not set them, so the gate
+        // is true. (If a developer exported an opt-out, this documents the
+        // expectation rather than asserting a hard true.)
         let env = ProcessInfo.processInfo.environment
-        let expected = env["DARKBLOOM_B1_GREEDY_FAST_PATH"] == "1"
-            || env["DARKBLOOM_GEMMA_B1_FAST_PATH"] == "1"
-        #expect(BatchScheduler.b1GreedyFastPathEnabled() == expected)
+        let off: Set<String> = ["0", "false", "no", "off"]
+        let optedOut =
+            off.contains((env["DARKBLOOM_B1_GREEDY_FAST_PATH"] ?? "").lowercased())
+            || off.contains((env["DARKBLOOM_GEMMA_B1_FAST_PATH"] ?? "").lowercased())
+        #expect(BatchScheduler.b1GreedyFastPathEnabled() == !optedOut)
     }
 }
 
@@ -183,7 +199,10 @@ struct B1GreedyFastPathBenchmark {
             promptTokens: promptTokens,
             maxTokens: maxTokens,
             temperature: 0.0,
-            requestId: "b1-bench-\(UUID().uuidString.prefix(8))"
+            requestId: "b1-bench-\(UUID().uuidString.prefix(8))",
+            // `submitTokenized` now defaults `allowFastPath: false` (Codex P2 — keep
+            // direct tokenized tool prompts on the engine); this A/B bench opts in.
+            allowFastPath: true
         )
         var run = FastPathRun()
         var chunks: [String] = []

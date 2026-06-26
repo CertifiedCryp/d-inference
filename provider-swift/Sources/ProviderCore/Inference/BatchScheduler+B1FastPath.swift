@@ -19,7 +19,8 @@
 // `GenerationEvent` stream.
 //
 // Safety posture:
-//   * OFF by default; opt in with an env flag.
+//   * ON by default; opt OUT with an env flag (`DARKBLOOM_B1_GREEDY_FAST_PATH=0`
+//     or `DARKBLOOM_GEMMA_B1_FAST_PATH=0`).
 //   * Conservative gate — anything that isn't a single exclusive greedy text
 //     request falls back to the batched engine, so the engine path's behavior
 //     is never altered.
@@ -38,15 +39,27 @@ extension BatchScheduler {
 
     // MARK: - Env gate
 
-    /// True when the operator opted into the B=1 greedy fast path. Two flags are
-    /// accepted: `DARKBLOOM_B1_GREEDY_FAST_PATH` (generic) and
-    /// `DARKBLOOM_GEMMA_B1_FAST_PATH` (Gemma-targeted alias). Either set to `"1"`
-    /// enables it. Read per-call (cheap) so tests can toggle it via the
-    /// environment without restarting the scheduler.
+    /// Whether the B=1 greedy fast path is enabled. **Default ON.** Two flags are
+    /// accepted as an opt-OUT: `DARKBLOOM_B1_GREEDY_FAST_PATH` (generic) and
+    /// `DARKBLOOM_GEMMA_B1_FAST_PATH` (Gemma-targeted alias). Set EITHER to
+    /// `"0"`/`"false"`/`"no"`/`"off"` to disable; any other (or absent) value
+    /// keeps it on. Read per-call (cheap) so tests / operators can toggle it via
+    /// the environment without restarting the scheduler.
+    ///
+    /// (Still only ENGAGES for requests that pass every conservative eligibility
+    /// gate in `b1FastPathEligiblePure` — Gemma-family, greedy, no KV quant, no
+    /// tools, in-context, single exclusive in-flight request. Anything else
+    /// defers to the batched engine regardless of this flag.)
     static func b1GreedyFastPathEnabled() -> Bool {
         let env = ProcessInfo.processInfo.environment
-        return env["DARKBLOOM_B1_GREEDY_FAST_PATH"] == "1"
-            || env["DARKBLOOM_GEMMA_B1_FAST_PATH"] == "1"
+        let off: Set<String> = ["0", "false", "no", "off"]
+        if let v = env["DARKBLOOM_B1_GREEDY_FAST_PATH"], off.contains(v.lowercased()) {
+            return false
+        }
+        if let v = env["DARKBLOOM_GEMMA_B1_FAST_PATH"], off.contains(v.lowercased()) {
+            return false
+        }
+        return true
     }
 
     // MARK: - Eligibility
@@ -84,6 +97,11 @@ extension BatchScheduler {
             maxTokens: maxTokens,
             maxContextLength: maxContextLength,
             cacheScope: cacheScope,
+            // Prefix/checkpoint cache active for this model (checkpoint tier for
+            // Gemma-4/GPT-OSS, engine tier for pure-attention models). When on, an
+            // unscoped request must stay on the engine so cache stores/hits keep
+            // working — the fast path bypasses planRestoredCheckpoint/capture.
+            prefixCacheEnabled: checkpointManager != nil || enginePrefixCacheActive,
             activeBridgeCount: activeBridges.count,
             pendingRequestCount: pendingRequestCount,
             fastPathActive: !fastPathTasks.isEmpty,
@@ -107,6 +125,7 @@ extension BatchScheduler {
         maxTokens: Int,
         maxContextLength: Int,
         cacheScope: String,
+        prefixCacheEnabled: Bool,
         activeBridgeCount: Int,
         pendingRequestCount: Int,
         fastPathActive: Bool,
@@ -155,6 +174,15 @@ extension BatchScheduler {
         // fresh cache and does not participate in the checkpoint / engine prefix
         // tiers, so a scoped request keeps the engine path to retain cache reuse.
         guard cacheScope.isEmpty else { return false }
+        // Prefix/checkpoint cache enabled: even an UNSCOPED greedy request would
+        // normally populate/hit the checkpoint (or engine-tier) prefix cache via
+        // `planRestoredCheckpoint` / `finalizeRestore` + the engine capture hooks.
+        // The fast path bypasses all of that (cold prefill on a fresh cache), so
+        // when a prefix cache is active (the provider default) we defer to the
+        // engine — otherwise default-on would silently stop populating/serving the
+        // cache for the common unscoped path (and break the HybridCheckpoint
+        // live tests that assert stores/hits).
+        guard !prefixCacheEnabled else { return false }
         // Exclusive: no other in-flight or queued work. Concurrent batched work
         // would defeat the single-row assumption (shared GPU + KV headroom).
         guard activeBridgeCount == 0 else { return false }
@@ -324,6 +352,9 @@ extension BatchScheduler {
     /// task self-removes; callers that also clear `fastPathTasks` (e.g.
     /// `stopCurrentEngine`) make late `clearFastPathTask` calls harmless no-ops.
     func cancelAllFastPathTasks() {
+        // Defensive: also drop any in-progress admission fence (a `submitTokenized`
+        // suspended at its KV-reserve await). Its own exit will also clear this.
+        fastPathAdmitting = false
         for task in fastPathTasks.values { task.cancel() }
     }
 
@@ -344,6 +375,11 @@ extension BatchScheduler {
     /// nil'd `engine` (every submit path short-circuits on a nil engine).
     /// Idempotent: a no-op when nothing is in flight.
     func waitForFastPathTasks() async {
+        // Clear the admission fence first (before the early-return guard) so a
+        // `submitTokenized` suspended mid-admission can't leave it stuck set after
+        // teardown. `stopCurrentEngine` has already nil'd `engine`, so no new fast
+        // path can begin.
+        fastPathAdmitting = false
         let inflight = Array(fastPathTasks.values)
         guard !inflight.isEmpty else { return }
         for task in inflight { task.cancel() }
