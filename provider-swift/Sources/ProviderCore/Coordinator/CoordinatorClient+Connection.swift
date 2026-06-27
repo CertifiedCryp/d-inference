@@ -62,6 +62,17 @@ extension CoordinatorClient {
         let useTLS = (scheme == "wss" || scheme == "https")
         let params = useTLS ? NWParameters.tls : NWParameters.tcp
 
+        // Disable Nagle's algorithm (TCP_NODELAY). Without this, the kernel
+        // batches small WebSocket frames (~200 bytes each) and delays sending
+        // until the previous segment is ACKed or enough data accumulates to
+        // fill an MSS (~1460 bytes) — adding 40-200ms latency per chunk.
+        // URLSessionWebSocketTask sets TCP_NODELAY internally; NWConnection
+        // does not, so we must opt in. This is critical for the inference
+        // hot path where each frame must leave immediately.
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        params.defaultProtocolStack.transportProtocol = tcpOptions
+
         let wsOptions = NWProtocolWebSocket.Options()
         // Auto-reply to coordinator-initiated pings so the link stays alive without
         // hand-rolling pong replies on the receive path.
