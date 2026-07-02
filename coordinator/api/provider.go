@@ -819,7 +819,10 @@ func (s *Server) sendChallenge(ctx context.Context, providerID string, provider 
 
 	writeCtx, writeCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer writeCancel()
-	if err := provider.WriteText(writeCtx, data); err != nil {
+	// Control lane: a challenge must not queue behind multi-MiB inference
+	// frames — a congested data lane would turn transport backpressure into
+	// "attestation timeout" reputation events.
+	if err := provider.WriteTextControl(writeCtx, data); err != nil {
 		s.logger.Error("failed to send challenge", "provider_id", providerID, "error", err)
 		tracker.remove(nonce)
 		return
@@ -1498,7 +1501,7 @@ func (s *Server) handleChunk(providerID string, provider *registry.Provider, msg
 		}
 		return
 	}
-	chunkData, err := decryptTextResponseChunk(provider, pr, msg)
+	chunkData, err := s.decryptTextResponseChunk(provider, pr, msg)
 	if err != nil {
 		s.logger.Warn("rejecting insecure response chunk",
 			"provider_id", providerID,
@@ -1514,15 +1517,69 @@ func (s *Server) handleChunk(providerID string, provider *registry.Provider, msg
 		})
 		return
 	}
-	// Non-blocking send — if consumer is gone the chunk is dropped.
+	// Fast path: non-blocking send — this is the provider's single read
+	// goroutine, so it must not stall behind one slow consumer. A full channel
+	// means the consumer is ≥256 chunks behind; silently dropping the chunk
+	// (the old behavior) would deliver a corrupted stream with missing tokens
+	// that is still billed. Instead, give a healthy-but-bursty consumer a
+	// bounded grace window to free one slot (sendChunkWithGrace), and only
+	// then fail the request: cancel the provider's generation and surface a
+	// terminal error to the consumer goroutine.
 	select {
 	case pr.ChunkCh <- chunkData:
 	default:
-		s.logger.Warn("dropped chunk, consumer channel full", "request_id", msg.RequestID)
+		if sendChunkWithGrace(pr, chunkData) {
+			return
+		}
+		s.logger.Error("chunk buffer overflow — failing request instead of corrupting stream",
+			"provider_id", providerID,
+			"request_id", msg.RequestID,
+		)
+		s.ddIncr("inference.chunk_overflow_abort", []string{})
+		s.sendProviderCancel(provider, msg.RequestID)
+		// 499 + "request cancelled" classifies as a consumer-side terminal in
+		// handleInferenceError: no provider reputation hit for our backpressure.
+		s.handleInferenceError(providerID, provider, &protocol.InferenceErrorMessage{
+			Type:       protocol.TypeInferenceError,
+			RequestID:  msg.RequestID,
+			Error:      "request cancelled: consumer stream stalled (chunk buffer overflow)",
+			StatusCode: 499,
+		})
 	}
 }
 
-func decryptTextResponseChunk(provider *registry.Provider, pr *registry.PendingRequest, msg *protocol.InferenceResponseChunkMessage) (string, error) {
+// chunkOverflowGrace is how long handleChunk will block the provider read loop
+// waiting for a full ChunkCh to free one slot before failing the request. It
+// trades a bounded head-of-line stall for this provider's OTHER streams
+// against killing a healthy consumer that is merely catching up after a TCP
+// burst (WS stall recovery, engine batch flush, slow mobile links). A stuck
+// consumer costs one grace window and is then failed; a consumer that drains
+// at least one chunk per window keeps its stream alive.
+const chunkOverflowGrace = 250 * time.Millisecond
+
+// sendChunkWithGrace blocks up to chunkOverflowGrace for a slot on pr.ChunkCh
+// and reports whether the chunk was delivered. The recover guard mirrors
+// registry.Disconnect's own channel idiom: Disconnect can close ChunkCh from
+// another goroutine while we are blocked in the send, and a closed channel
+// here simply means the request is already torn down (delivered=false; the
+// caller's terminal path degrades to a no-op warn).
+func sendChunkWithGrace(pr *registry.PendingRequest, chunk string) (delivered bool) {
+	defer func() {
+		if recover() != nil {
+			delivered = false
+		}
+	}()
+	wait := time.NewTimer(chunkOverflowGrace)
+	defer wait.Stop()
+	select {
+	case pr.ChunkCh <- chunk:
+		return true
+	case <-wait.C:
+		return false
+	}
+}
+
+func (s *Server) decryptTextResponseChunk(provider *registry.Provider, pr *registry.PendingRequest, msg *protocol.InferenceResponseChunkMessage) (string, error) {
 	if msg.EncryptedData == nil {
 		return "", errTextChunkViolation("plaintext text chunk")
 	}
@@ -1543,8 +1600,14 @@ func decryptTextResponseChunk(provider *registry.Provider, pr *registry.PendingR
 		EphemeralPublicKey: msg.EncryptedData.EphemeralPublicKey,
 		Ciphertext:         msg.EncryptedData.Ciphertext,
 	}
-	session := &e2e.SessionKeys{PrivateKey: *pr.SessionPrivKey}
-	plaintext, err := e2e.Decrypt(payload, session)
+	// The X25519 shared key is derived once per request and memoized; the
+	// per-chunk cost is a single symmetric open. The sender-key check above
+	// guarantees the cached key matches this chunk's ephemeral key.
+	shared, err := s.chunkKeys.sharedKey(pr.SessionPrivKey, provider.PublicKey)
+	if err != nil {
+		return "", err
+	}
+	plaintext, err := e2e.DecryptWithSharedKey(payload, shared)
 	if err != nil {
 		return "", err
 	}
@@ -1602,6 +1665,8 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 		s.logger.Warn("complete for unknown request", "provider_id", providerID, "request_id", msg.RequestID)
 		return
 	}
+	// The request is terminal — drop its memoized chunk-decryption key.
+	s.chunkKeys.forget(pr.SessionPrivKey)
 	// A parked record means the consumer handler already returned: there is no
 	// channel reader, and registry.Disconnect may have already CLOSED the
 	// channels (park-before-remove leaves a window where the record is in both
@@ -2096,6 +2161,8 @@ func (s *Server) handleInferenceError(providerID string, provider *registry.Prov
 		s.logger.Warn("error for unknown request", "provider_id", providerID, "request_id", msg.RequestID)
 		return
 	}
+	// The request is terminal — drop its memoized chunk-decryption key.
+	s.chunkKeys.forget(pr.SessionPrivKey)
 	consumerGone := parked != nil
 
 	// Record a job failure, but not for capacity rejections or consumer
