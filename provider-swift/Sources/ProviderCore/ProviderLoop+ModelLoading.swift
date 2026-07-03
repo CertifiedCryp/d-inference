@@ -90,7 +90,17 @@ extension ProviderLoop {
         )
     }
 
-    internal func ensureModelLoaded(modelId: String) async throws {
+    /// Load `modelId` if it is not already resident.
+    ///
+    /// `allowEviction` (default true) gates BOTH eviction points — the
+    /// slot-cap LRU eviction and `evictUntilAvailable`'s memory reclamation.
+    /// The startup preload passes `false`: a later preload candidate must
+    /// never churn out an earlier one (it is skipped with a WARN and left to
+    /// the lazy-load path instead). Live traffic keeps the default. The
+    /// checks run INSIDE the `isLoadingAny` critical section, so an
+    /// interleaved local-endpoint load cannot make the no-evict verdict
+    /// stale.
+    internal func ensureModelLoaded(modelId: String, allowEviction: Bool = true) async throws {
         if isShuttingDown {
             throw CancellationError()
         }
@@ -115,7 +125,7 @@ extension ProviderLoop {
                 if isShuttingDown { throw CancellationError() }
             }
             if modelSlots[modelId] != nil { return }
-            try await ensureModelLoaded(modelId: modelId)
+            try await ensureModelLoaded(modelId: modelId, allowEviction: allowEviction)
             return
         }
 
@@ -154,11 +164,15 @@ extension ProviderLoop {
             let evictable = modelSlots.filter {
                 !modelsWithInflight.contains($0.key) && !hasLocalReservation($0.key) && !modelsUnloading.contains($0.key)
             }
-            if evictable.isEmpty {
+            if evictable.isEmpty || !allowEviction {
                 isLoadingAny = false
                 releaseLoadGateWaiters()
+                // Both messages contain "slot" so loadErrorStatusCode maps
+                // them to 503 (transient capacity, coordinator reroutes).
                 throw InferenceError.invalidModelDirectory(
-                    "All \(maxModelSlots) model slot(s) are active; cannot load '\(modelId)'"
+                    allowEviction
+                        ? "All \(maxModelSlots) model slot(s) are active; cannot load '\(modelId)'"
+                        : "All \(maxModelSlots) model slot(s) are occupied and eviction is disabled for this load; cannot load '\(modelId)'"
                 )
             }
             if let lru = evictable.min(by: { $0.value.lastInferenceAt < $1.value.lastInferenceAt }) {
@@ -190,7 +204,7 @@ extension ProviderLoop {
                 weightsGb: modelInfo.estimatedMemoryGb,
                 headroomGb: Self.loadHeadroomGb)
             do {
-                try await evictUntilAvailable(requiredGb: requiredGb)
+                try await evictUntilAvailable(requiredGb: requiredGb, allowEviction: allowEviction)
             } catch let InferenceError.modelLoadFailed(message) {
                 // Record for diagnostics so `doctor` shows the operator the exact
                 // "Insufficient memory …" reason, then rethrow unchanged.
@@ -304,16 +318,39 @@ extension ProviderLoop {
             let tokenizer: TokenizerHandle = await container.perform { ctx in
                 TokenizerHandle(ctx.tokenizer)
             }
-            modelSlots[modelId] = ModelSlot(
-                scheduler: scheduler,
+
+            // ContinuousBatchingV2 (flag-gated, additive): when EngineV2Config
+            // selects the v2 engine for this model, build the real CBv2 engine
+            // over the SAME loaded container, wrap it in an EngineV2Bridge, and
+            // register it with the runtime so capacity/cancel fan-out works
+            // from the first request. nil on every legacy path — flag off,
+            // non-allowlisted model, VLM slot, or v2 init failure (which emits
+            // WARN engine_health telemetry and falls back to the scheduler
+            // below).
+            let slotIsVLM = Self.modelIsVLM(at: modelPath)
+            let engineV2Bridge = await makeEngineV2BridgeForSlot(
+                modelId: modelId,
+                modelType: modelInfo.modelType,
+                isVLM: slotIsVLM,
                 container: container,
                 tokenizer: tokenizer,
-                isVLM: Self.modelIsVLM(at: modelPath),
+                scheduler: scheduler
+            )
+
+            modelSlots[modelId] = ModelSlot(
+                scheduler: scheduler,
+                engineV2: engineV2Bridge,
+                container: container,
+                tokenizer: tokenizer,
+                isVLM: slotIsVLM,
                 modelType: modelInfo.modelType,
                 lastInferenceAt: .now
             )
 
             syncWarmModelState()
+            // Remember the serving set across restarts: the persisted file is
+            // the default startup preload plan (ProviderLoop+StartupPreload).
+            persistLoadedModelSet()
             await updateAggregateCapacity()
             logger.info("Model loaded: \(modelId) (\(modelSlots.count) model(s) in memory)")
 
@@ -356,6 +393,14 @@ extension ProviderLoop {
     internal func unloadModel(_ modelId: String) async {
         guard let slot = modelSlots[modelId], !modelsUnloading.contains(modelId) else { return }
         modelsUnloading.insert(modelId)
+        // ContinuousBatchingV2: retire the slot's v2 bridge first — unregister
+        // so heartbeats/cancellation stop fanning out to it, then drain the
+        // engine gracefully (running requests finish, new submissions are
+        // rejected). No-op for legacy-only slots (engineV2 == nil).
+        if let bridge = slot.engineV2 {
+            await engineV2Runtime.unregister(modelId: modelId)
+            await bridge.shutdown()
+        }
         await slot.scheduler.unloadModel()
         modelSlots.removeValue(forKey: modelId)
         modelsUnloading.remove(modelId)
@@ -366,6 +411,13 @@ extension ProviderLoop {
         let waiters = unloadingWaiters.removeValue(forKey: modelId) ?? []
         for waiter in waiters { waiter.resume() }
         syncWarmModelState()
+        // A NON-shutdown unload (idle timeout, eviction, retirement) drops the
+        // model from the persisted serving set. Shutdown teardown skips this on
+        // purpose: a stop/update/restart must remember what was being served so
+        // the next boot's startup preload can re-warm it.
+        if !isShuttingDown {
+            persistLoadedModelSet()
+        }
         await updateAggregateCapacity()
         logger.info("Unloaded model: \(modelId) (\(modelSlots.count) model(s) remaining)")
     }
@@ -420,7 +472,11 @@ extension ProviderLoop {
     /// `doctor`'s model-fit check shares the SAME arithmetic via
     /// `ModelLoadAdmission`, so the operator-facing verdict can never drift from
     /// what this method enforces at load time.
-    private func availableMemoryGb() async -> Double {
+    ///
+    /// `internal` (not `private`): also the admission probe for the startup
+    /// preload (`ProviderLoop+StartupPreload`), which must skip — never evict
+    /// for — a preload candidate that doesn't fit.
+    internal func availableMemoryGb() async -> Double {
         let outstanding = await kvBudget.outstandingReservedBytes()
         // Hold back enough to honor the 90% unified cap: max(configured reserve,
         // physical − cap). Without this the free-memory gate would load models
@@ -458,12 +514,19 @@ extension ProviderLoop {
     /// no more idle models remain. Re-checks in-flight state before each
     /// eviction since `await unloadModel` is a suspension point.
     /// Throws if the memory target cannot be met after exhausting evictable models.
-    private func evictUntilAvailable(requiredGb: Double) async throws {
+    ///
+    /// `allowEviction: false` (startup preload) never considers a candidate:
+    /// it degrades to a pure availability check (with the clearCache
+    /// self-heal) that throws instead of reclaiming — a later preload must
+    /// not churn out an earlier one.
+    private func evictUntilAvailable(requiredGb: Double, allowEviction: Bool = true) async throws {
         while await availableMemoryGb() < requiredGb {
             let modelsWithInflight = Set(requestToModel.values)
-            let candidate = modelSlots
-                .filter { !modelsWithInflight.contains($0.key) && !hasLocalReservation($0.key) && !modelsUnloading.contains($0.key) }
-                .min(by: { $0.value.lastInferenceAt < $1.value.lastInferenceAt })
+            let candidate = allowEviction
+                ? modelSlots
+                    .filter { !modelsWithInflight.contains($0.key) && !hasLocalReservation($0.key) && !modelsUnloading.contains($0.key) }
+                    .min(by: { $0.value.lastInferenceAt < $1.value.lastInferenceAt })
+                : nil
 
             guard let (modelId, _) = candidate else {
                 // Nothing idle to evict — drop the reclaimable pool and resample
@@ -475,7 +538,9 @@ extension ProviderLoop {
                 let available = String(format: "%.1f", retried)
                 let required = String(format: "%.1f", requiredGb)
                 throw InferenceError.modelLoadFailed(
-                    "Insufficient memory (\(available) GB free, need \(required) GB) and all loaded models are actively serving"
+                    allowEviction
+                        ? "Insufficient memory (\(available) GB free, need \(required) GB) and all loaded models are actively serving"
+                        : "Insufficient memory (\(available) GB free, need \(required) GB) to load without evicting resident models"
                 )
             }
 
