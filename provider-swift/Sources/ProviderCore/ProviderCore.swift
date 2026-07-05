@@ -95,5 +95,5 @@ public enum ProviderCore {
     // a dead model; and GlobalKVCacheBudget audits + drops stale
     // reservations under sustained full-rejection (defense in depth). No
     // protocol changes.
-    public static let version = "0.7.3"
+    public static let version = "0.7.4"
 }
