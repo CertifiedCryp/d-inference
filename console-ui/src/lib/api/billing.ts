@@ -1,4 +1,5 @@
 import { proxyHeaders } from "../http/proxy-client";
+import { apiErrorFromBody } from "./errors";
 import type {
   BalanceResponse,
   UsageEntry,
@@ -56,7 +57,7 @@ export async function startStripeOnboarding(returnURL?: string, country?: string
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data?.error?.message || data?.error || `Stripe onboarding failed (${res.status})`);
+    throw apiErrorFromBody(data, res.status, `Stripe onboarding failed (${res.status})`);
   }
   return res.json();
 }
@@ -69,7 +70,7 @@ export async function withdrawStripe(amountUsd: string, method: "standard" | "in
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
-    throw new Error(data?.error?.message || data?.error || `Withdrawal failed (${res.status})`);
+    throw apiErrorFromBody(data, res.status, `Withdrawal failed (${res.status})`);
   }
   return res.json();
 }
@@ -79,6 +80,21 @@ export async function fetchStripeWithdrawals(limit = 20): Promise<StripeWithdraw
   if (!res.ok) throw new Error(`Failed to fetch withdrawals: ${res.status}`);
   const data = await res.json();
   return data.withdrawals || [];
+}
+
+// Detach the linked Stripe Connect account so a fresh one can be onboarded.
+// Escape hatch for wedged accounts (closed on Stripe, stuck onboarding,
+// wrong country). In-flight withdrawals are unaffected.
+export async function unlinkStripeAccount(): Promise<{ unlinked: boolean }> {
+  const res = await fetch("/api/payments/stripe/account", {
+    method: "DELETE",
+    headers: proxyHeaders(),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw apiErrorFromBody(data, res.status, `Unlink failed (${res.status})`);
+  }
+  return res.json();
 }
 
 // computeStripeFeeUsd mirrors billing.FeeForMethodMicroUSD on the server so
