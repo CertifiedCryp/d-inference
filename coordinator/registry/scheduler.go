@@ -66,22 +66,38 @@ const (
 )
 
 type routingSnapshot struct {
-	provider           *Provider
-	model              string
-	chipFamily         string // hardware chip family (e.g. "M3"); keys the TTFT calibrator
-	slotState          string
-	hasHeadroom        bool
-	totalPending       int
-	pendingForModel    int
-	pendingMaxTokens   int
-	backendRunning     int
-	backendWaiting     int
-	maxTokensPotential int64
-	decodeTPS          float64
-	prefillTPS         float64
-	systemMetrics      protocol.SystemMetrics
-	gpuMemoryActiveGB  float64
-	totalMemoryGB      float64
+	provider         *Provider
+	model            string
+	chipFamily       string // hardware chip family (e.g. "M3"); keys the TTFT calibrator
+	slotState        string
+	hasHeadroom      bool
+	totalPending     int
+	pendingForModel  int
+	pendingMaxTokens int
+	// pendingMaxTokensAllModels is pendingMaxTokens WITHOUT the model filter:
+	// the token budgets of every coordinator-pending request on this provider,
+	// any model. Feeds the pooled-budget admission check (pooledBudgetAdmits)
+	// so co-resident models cannot double-spend the one shared KV pool inside
+	// the heartbeat gap.
+	pendingMaxTokensAllModels int
+	// pendingMaxBytesAllModels is the byte-normalized analog: each pending
+	// request's token budget × its model's reported KVBytesPerToken. Valid
+	// only when pendingBytesKnown. A cold request without a reported model rate
+	// is charged at the bounded conservative default (see
+	// fillSnapshotPendingAndPool), so it cannot disable byte accounting for a
+	// reconstructable pool. Co-resident models spend the ONE shared pool at
+	// different per-token byte rates, so tokens are not a common unit across
+	// models (pooled_admission.go).
+	pendingMaxBytesAllModels int64
+	pendingBytesKnown        bool
+	backendRunning           int
+	backendWaiting           int
+	maxTokensPotential       int64
+	decodeTPS                float64
+	prefillTPS               float64
+	systemMetrics            protocol.SystemMetrics
+	gpuMemoryActiveGB        float64
+	totalMemoryGB            float64
 	// freeForLoadGB is the provider-reported max additional model-weight (GB) it
 	// can load right now (net of cap/reserve/headroom, idle models reclaimed).
 	// When non-nil it is the authoritative cold-load gate; nil = legacy provider
@@ -97,6 +113,11 @@ type routingSnapshot struct {
 	activeTokenBudgetUsed int64
 	activeTokenBudgetMax  int64
 	queuedTokenBudget     int64
+	// pooledTokenBudget is the provider's reconstructed whole-box token budget
+	// (all budget slots; shared headroom counted once — providerPooledTokenBudget).
+	// Zero value when the provider reports no backend capacity / no budget
+	// slots, which disables the pooled admission check.
+	pooledTokenBudget pooledTokenBudget
 	// budgetClamped means the gray-box budget clamp (budget_clamp.go) is
 	// active for this (provider, model) pair: a capacity-shaped 503 proved the
 	// provider's LIVE admission gate is rejecting, so the heartbeat budget
@@ -1097,20 +1118,16 @@ func (r *Registry) snapshotProviderLockedEx(p *Provider, model string, traits Re
 		minRAMGb:      r.catalogMinRAMGbLocked(model),
 	}
 
-	for _, pr := range p.pendingReqs {
-		if pr.Model != model {
-			continue
-		}
-		snap.pendingForModel++
-		snap.pendingMaxTokens += pendingTokenBudget(pr)
-	}
+	fillSnapshotPendingAndPool(&snap, p, model)
 	// Concurrency headroom with the quality-concurrency cap: a slow model whose
-	// quality batch is below the flat fallback (e.g. Gemma at ~23 tok/s solo →
+	// quality batch is below the flat fallback (e.g. Gemma at ~14 tok/s solo →
 	// batch 1-2) stops being admittable once it is at its quality cap, so load
-	// spreads across boxes instead of collapsing a few. Uses the static
-	// single-stream decode rate (snap.decodeTPS = resolvedDecodeTPS), not the
-	// observed-under-load value. No-op (legacy flat cap) when the cap is disabled.
-	snap.hasHeadroom = r.hasConcurrencyHeadroomForModelCapLocked(p, model, snap.decodeTPS)
+	// spreads across boxes instead of collapsing a few. The cap resolves the
+	// model's own static solo rate internally (solo median / seed → provider
+	// benchmark fallback) — NOT snap.decodeTPS, which stays the provider-level
+	// rate for TTFT/cost estimation, and NOT the observed-under-load value.
+	// No-op (legacy flat cap) when the cap is disabled.
+	snap.hasHeadroom = r.hasConcurrencyHeadroomForModelCapResolvedLocked(p, model)
 	snap.hasBackendCapacity = p.BackendCapacity != nil
 
 	if p.BackendCapacity != nil {
@@ -1132,7 +1149,7 @@ func (r *Registry) snapshotProviderLockedEx(p *Provider, model string, traits Re
 			snap.activeTokenBudgetUsed = slot.ActiveTokenBudgetUsed
 			snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
 			snap.queuedTokenBudget = slot.QueuedTokenBudget
-			snap.kvBytesPerToken = slot.KVBytesPerToken
+			snap.kvBytesPerToken = clampKVBytesPerToken(slot.KVBytesPerToken)
 			snap.stepsExecuted = slot.StepsExecuted
 			snap.admits = slot.Admits
 			snap.firstTokensEmitted = slot.FirstTokensEmitted
@@ -1217,8 +1234,16 @@ func freeMemoryAdmits(snap routingSnapshot, reqPromptTokens, reqMaxTokens int) b
 	if snap.budgetClamped {
 		return false
 	}
+	requestTokens := int64(reqPromptTokens) + int64(reqMaxTokens)
+	// Engine V2 keeps reporting a positive KV rate when its live fleet clamp
+	// drives this model's budget to zero. That is authoritative known-full
+	// capacity, not the legacy "budget unavailable" shape (both fields absent).
+	// Bind it before consulting co-resident pooled headroom: another model's
+	// positive budget cannot widen this model-local zero.
+	if knownZeroTokenBudget(snap.activeTokenBudgetMax, snap.kvBytesPerToken) {
+		return false
+	}
 	if snap.activeTokenBudgetMax > 0 {
-		requestTokens := int64(reqPromptTokens) + int64(reqMaxTokens)
 		// Include coordinator-side pending tokens not yet reflected in the
 		// provider's heartbeat. Avoid double-counting active/queued backend
 		// budgets that are still present in the coordinator pending set until
@@ -1227,7 +1252,35 @@ func freeMemoryAdmits(snap routingSnapshot, reqPromptTokens, reqMaxTokens int) b
 		if coordinatorExtra < 0 {
 			coordinatorExtra = 0
 		}
-		return snap.activeTokenBudgetUsed+snap.queuedTokenBudget+coordinatorExtra+requestTokens <= snap.activeTokenBudgetMax
+		if snap.activeTokenBudgetUsed+snap.queuedTokenBudget+coordinatorExtra+requestTokens > snap.activeTokenBudgetMax {
+			return false
+		}
+		// The per-slot max still encodes this model's own context/KV ceiling, but
+		// it is NOT a private budget: co-resident slots share the box's ONE KV
+		// pool (each slot's max = own committed + the SAME shared headroom), so a
+		// burst admitted against model A within the heartbeat gap is invisible to
+		// model B's slot max until the next heartbeat. The request must therefore
+		// also fit the reconstructed whole-box pool with EVERY model's
+		// coordinator-pending tokens charged — byte-normalized per slot KV rate
+		// when reported, since co-resident models spend the pool at different
+		// bytes/token (see pooled_admission.go). Reduces exactly to the per-slot
+		// check for single-model providers.
+		return pooledBudgetAdmits(snap, requestTokens)
+	}
+
+	// Cold-slot pooled gate: this model reports no budget slot (not loaded
+	// here), but when ANY resident slot reports a token budget the box still
+	// has its ONE shared KV pool, and this request lands in it after the
+	// load — so in-gap pending on a resident model must not be double-spendable
+	// by a cold request that skips the budget branch above. The reconstructed
+	// pool charges all-models coordinator pending plus this request; a cold
+	// model has no reported KV rate (snap.kvBytesPerToken == 0), so on a
+	// byte-reconstructable pool it is priced conservatively in bytes at the
+	// bounded unknown-model default (resolvedPooledKVBytesPerToken),
+	// falling to token units only when the pool is not byte-reconstructable.
+	// No-op for legacy providers with neither budget nor KV-rate reports.
+	if !pooledBudgetAdmits(snap, requestTokens) {
+		return false
 	}
 
 	if !snap.modelLoaded {
@@ -1283,6 +1336,38 @@ func freeMemoryAdmits(snap routingSnapshot, reqPromptTokens, reqMaxTokens int) b
 
 	free := snap.totalMemoryGB - snap.gpuMemoryActiveGB
 	return free >= required
+}
+
+// fillSnapshotPendingAndPool populates snap's reconstructed pooled budget and
+// its coordinator-pending aggregates — the per-model filtered pair
+// (pendingForModel / pendingMaxTokens) and the all-models totals in token and,
+// when normalizable, byte units. Byte normalization uses each resident model's
+// reported KVBytesPerToken and the same bounded conservative default as
+// incoming/capacity math for a cold model with no resident slot. Only a legacy
+// pool that cannot be reconstructed in bytes leaves pendingBytesKnown false.
+// Shared by the dispatch
+// snapshot (snapshotProviderLockedEx) and the queue preflight
+// (QuickCapacityCheck…) so the two admission paths cannot drift. Caller holds
+// p.mu.
+func fillSnapshotPendingAndPool(snap *routingSnapshot, p *Provider, model string) {
+	if p.BackendCapacity != nil {
+		snap.pooledTokenBudget = providerPooledTokenBudget(p.BackendCapacity.Slots)
+	}
+	bytesKnown := snap.pooledTokenBudget.byteMode
+	for _, pr := range p.pendingReqs {
+		tokens := pendingTokenBudget(pr)
+		snap.pendingMaxTokensAllModels += tokens
+		if bytesKnown {
+			rate := resolvedPooledKVBytesPerToken(snap.pooledTokenBudget, snap.pooledTokenBudget.kvBytesPerToken[pr.Model])
+			snap.pendingMaxBytesAllModels = addPooledKVByteCharge(snap.pendingMaxBytesAllModels, int64(tokens), rate)
+		}
+		if pr.Model != model {
+			continue
+		}
+		snap.pendingForModel++
+		snap.pendingMaxTokens += tokens
+	}
+	snap.pendingBytesKnown = bytesKnown
 }
 
 func pendingTokenBudget(pr *PendingRequest) int {
@@ -2032,10 +2117,10 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 		}
 
 		// Concurrency gate (with the quality-concurrency cap, same as the dispatch
-		// snapshot — uses the static single-stream decode rate so routing and the
-		// shed preflight stay consistent and a slow model's quality cap counts a
-		// saturated box as a capacity rejection here too).
-		if !r.hasConcurrencyHeadroomForModelCapLocked(p, model, resolvedDecodeTPS(p)) {
+		// snapshot — resolves the model's own static solo rate internally so
+		// routing and the shed preflight stay consistent and a slow model's
+		// quality cap counts a saturated box as a capacity rejection here too).
+		if !r.hasConcurrencyHeadroomForModelCapResolvedLocked(p, model) {
 			p.mu.Unlock()
 			capacityRejections++
 			continue
@@ -2056,13 +2141,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 			minRAMGb:           r.catalogMinRAMGbLocked(model),
 			hasBackendCapacity: p.BackendCapacity != nil,
 		}
-		for _, pending := range p.pendingReqs {
-			if pending.Model != model {
-				continue
-			}
-			snap.pendingForModel++
-			snap.pendingMaxTokens += pendingTokenBudget(pending)
-		}
+		fillSnapshotPendingAndPool(&snap, p, model)
 		if snap.hasBackendCapacity {
 			snap.gpuMemoryActiveGB = p.BackendCapacity.GPUMemoryActiveGB
 			snap.freeForLoadGB = p.BackendCapacity.FreeForLoadGB
@@ -2082,7 +2161,7 @@ func (r *Registry) quickCapacityCheck(model string, estimatedPromptTokens, reque
 				snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
 				snap.queuedTokenBudget = slot.QueuedTokenBudget
 				snap.maxTokensPotential = slot.MaxTokensPotential
-				snap.kvBytesPerToken = slot.KVBytesPerToken
+				snap.kvBytesPerToken = clampKVBytesPerToken(slot.KVBytesPerToken)
 				snap.stepsExecuted = slot.StepsExecuted
 				snap.admits = slot.Admits
 				snap.firstTokensEmitted = slot.FirstTokensEmitted

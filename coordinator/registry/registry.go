@@ -2729,9 +2729,35 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	p.BackendCapacity = msg.BackendCapacity
 	if p.BackendCapacity != nil {
 		chipFamily := p.Hardware.ChipFamily
+		// Solo samples are keyed by chip CLASS (family+tier, chipClassKey) so a
+		// fast tier (M4 Max) never lends its rate to a slow one (M4 Pro); the
+		// load-inclusive Record stays family-keyed (fleetMedianTPS semantics).
+		chipClass := chipClassKey(p.Hardware)
+		// Solo gate: a slot EWMA is additionally recorded as a SOLO sample only
+		// when the whole box is uncontended at heartbeat time (Σ running+waiting
+		// ≤ 1 across ALL slots — the one allowance is the sample-generating
+		// request itself) AND the slot has an actual RUNNING decode
+		// (NumRunning > 0). Both halves matter. Requiring NumRunning (not
+		// running+waiting) excludes a purely-QUEUED box: the provider reports
+		// NumWaiting from its pending set while ObservedDecodeTPS is a retained
+		// EWMA (BatchScheduler+Telemetry.swift), so a box with one queued-but-
+		// not-yet-decoding request would otherwise mint that stale EWMA as a
+		// fresh solo sample every ~30s heartbeat and, once the min-sample floor
+		// is reached, base the model's quality cap on traffic no running request
+		// produced. It also keeps the prior round's owner-slot-only rule: an
+		// idle co-resident slot with a decayed EWMA is NumRunning == 0, so it is
+		// never re-sampled, and a fully idle box records nothing. The
+		// unconditional Record keeps its
+		// load-inclusive semantics for TTFT estimation (fleetMedianTPS); the
+		// gated RecordSolo feeds the quality-concurrency cap's per-model static
+		// rate (resolvedSoloModelTPSLocked). See solo_tps.go.
+		soloEligible := soloSampleEligible(p.BackendCapacity)
 		for _, slot := range p.BackendCapacity.Slots {
 			if slot.ObservedDecodeTPS > 0 {
 				r.tpsRegistry.Record(slot.Model, chipFamily, slot.ObservedDecodeTPS)
+				if soloEligible && slot.NumRunning > 0 {
+					r.tpsRegistry.RecordSolo(slot.Model, chipClass, slot.ObservedDecodeTPS)
+				}
 			}
 		}
 	}
@@ -4473,6 +4499,18 @@ type providerCapSnap struct {
 	activeTokenBudgetMax  int64
 	activeTokenBudgetUsed int64
 	queuedTokenBudget     int64
+	// tokenBudgetKnownZero distinguishes an Engine V2 model whose positive KV
+	// rate makes max==0 authoritative from a legacy model that omitted both.
+	tokenBudgetKnownZero bool
+	// pooledBudgetRemaining is the provider's whole-box pooled token budget
+	// left after charging ALL models' coordinator-pending tokens — the same
+	// pool the admission gate (pooledBudgetAdmits) enforces, so this public
+	// capacity feed cannot advertise per-slot headroom dispatch would reject:
+	// co-resident slots each re-report the ONE shared KV headroom, and an
+	// in-gap burst to model A is invisible to model B's slot fields until the
+	// next heartbeat. -1 = provider reports no pooled budget (legacy), which
+	// leaves the per-slot numbers unclamped.
+	pooledBudgetRemaining int64
 }
 
 // publiclyRoutableLocked reports whether a provider passes the public routing
@@ -4511,6 +4549,21 @@ func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
 		decodeTPS := resolvedDecodeTPS(p)
 		prefillTPS := resolvedPrefillTPS(p)
 
+		// Reconstruct the whole-box pooled budget and its all-models
+		// coordinator-pending charges (token and, when every pending request
+		// normalizes, byte) ONCE per provider — the SAME accumulation the
+		// admission gate uses (fillSnapshotPendingAndPool). The per-model
+		// remaining differs only by that model's KV rate in byte mode, so it is
+		// finalized inside the model loop via pooledRemainingTokens, keeping this
+		// feed's verdict identical to pooledBudgetAdmits' on a mixed-KV box (a
+		// pool exhausted in BYTES by a small-KV burst must not surface token
+		// headroom for a big-KV co-resident). Token units out; byte
+		// normalization stays internal.
+		var poolSnap routingSnapshot
+		if p.BackendCapacity != nil {
+			fillSnapshotPendingAndPool(&poolSnap, p, "")
+		}
+
 		// Enumerate every model this provider serves.
 		for _, m := range p.Models {
 			if !r.modelAllowedByCatalogLocked(m) {
@@ -4531,12 +4584,28 @@ func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
 				}
 			}
 
+			// Per-model pooled remaining: byte-aware when the box is byte-
+			// reconstructable, else token accounting — exactly pooledBudgetAdmits'
+			// branch. Cold/absent slots have no rate (map miss ⇒ 0); on a byte-
+			// reconstructable pool they are priced at the greater of the
+			// conservative coordinator default and the box's max resident rate
+			// (the same cold-rate resolver the gate uses), so this feed stays
+			// equivalent to the gate on the cold path too. Inert for legacy boxes.
+			pooledRemaining := pooledRemainingTokens(
+				poolSnap.pooledTokenBudget,
+				poolSnap.pendingMaxTokensAllModels,
+				poolSnap.pendingMaxBytesAllModels,
+				poolSnap.pendingBytesKnown,
+				poolSnap.pooledTokenBudget.kvBytesPerToken[m.ID],
+			)
+
 			snap := providerCapSnap{
-				model:          m.ID,
-				hasHeadroom:    hasHeadroom,
-				effectiveTPS:   decodeTPS,
-				prefillTPS:     prefillTPS,
-				activeRequests: modelPending,
+				model:                 m.ID,
+				hasHeadroom:           hasHeadroom,
+				effectiveTPS:          decodeTPS,
+				prefillTPS:            prefillTPS,
+				activeRequests:        modelPending,
+				pooledBudgetRemaining: pooledRemaining,
 			}
 
 			// Check backend capacity for this model's slot.
@@ -4563,6 +4632,7 @@ func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
 					snap.activeTokenBudgetMax = slot.ActiveTokenBudgetMax
 					snap.activeTokenBudgetUsed = slot.ActiveTokenBudgetUsed
 					snap.queuedTokenBudget = slot.QueuedTokenBudget
+					snap.tokenBudgetKnownZero = knownZeroTokenBudget(slot.ActiveTokenBudgetMax, slot.KVBytesPerToken)
 					snap.backlogTokens = float64(slot.MaxTokensPotential)
 					break
 				}
@@ -4613,14 +4683,25 @@ func (r *Registry) ModelCapacitySnapshot() []ModelCapacity {
 			if headroom < 0 {
 				headroom = 0
 			}
+			// Per-slot headroom cannot exceed the provider's pooled remaining:
+			// each co-resident slot re-reports the ONE shared KV headroom, so
+			// in-gap pending to another model already spent it. Without the
+			// clamp this surface advertises capacity pooledBudgetAdmits rejects.
+			if s.pooledBudgetRemaining >= 0 && headroom > s.pooledBudgetRemaining {
+				headroom = s.pooledBudgetRemaining
+			}
 			a.budgetRemaining += headroom
 			a.budgetTotal += s.activeTokenBudgetMax
 		}
 		// Routable providers require both concurrency headroom AND token-budget
 		// headroom. A provider with exhausted token budget should not make the
-		// model appear immediately ready.
-		hasBudgetHeadroom := s.activeTokenBudgetMax <= 0 ||
-			s.activeTokenBudgetUsed+s.queuedTokenBudget < s.activeTokenBudgetMax
+		// model appear immediately ready. An exhausted POOLED budget (0 — not
+		// the -1 no-budget sentinel) counts as exhausted for every model on the
+		// box, cold ones included: the admission gate charges those against the
+		// shared pool too (freeMemoryAdmits' cold-slot pooled gate).
+		hasBudgetHeadroom := !s.tokenBudgetKnownZero && (s.activeTokenBudgetMax <= 0 ||
+			s.activeTokenBudgetUsed+s.queuedTokenBudget < s.activeTokenBudgetMax) &&
+			s.pooledBudgetRemaining != 0
 		if s.hasHeadroom && hasBudgetHeadroom {
 			a.routable++
 			a.anyImmediateSlot = true
