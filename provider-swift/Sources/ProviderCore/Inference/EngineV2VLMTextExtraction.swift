@@ -26,7 +26,7 @@
 //      wrapper allocates but the MLXLLM model does not), and
 //      `update(parameters:verify:[.all])` — missing/extra/mis-shaped keys
 //      all THROW, which the engine factory catches as the standard
-//      `engine_v2_fallback` WARN + legacy path (never silent wrongness);
+//      `engine_v2_refusal` ERROR + load failure (never silent wrongness);
 //   4. run a tiny forward through BOTH the wrapper's text path and the
 //      extracted model and require cross-containment of each side's greedy
 //      argmax in the other side's top-5, plus a bounded max |Δlogit| — a
@@ -51,7 +51,7 @@ import MLXNN
 import MLXVLM
 
 /// Failure modes of VLM text-model extraction. Every case lands in
-/// `EngineV2Factory.makeBridgeIfSelected`'s catch → WARN `engine_v2_fallback`
+/// `EngineV2Factory.makeBridge`'s catch → ERROR `engine_v2_refusal`
 /// telemetry + legacy serving. The messages are operator-facing (they ride
 /// the telemetry `error` field), so they say exactly what to look at.
 enum EngineV2VLMTextExtractionError: Error, CustomStringConvertible {
@@ -150,7 +150,7 @@ enum EngineV2VLMTextExtraction {
         // verify: [.all] — a missing model key, an unused weight key, or a
         // shape mismatch all throw here. That is the design: any drift
         // between the wrapper's parameter tree and the MLXLLM architecture
-        // must fail LOUDLY at load (→ engine_v2_fallback WARN + legacy),
+        // must fail LOUDLY at load (→ engine_v2_refusal ERROR + 503),
         // never produce a silently wrong serving model.
         try skeleton.update(
             parameters: ModuleParameters.unflattened(textWeights), verify: [.all])
@@ -172,6 +172,38 @@ enum EngineV2VLMTextExtraction {
         }
 
         return Extraction(model: skeleton, parityMaxAbsLogitDiff: parityDiff)
+    }
+
+    // MARK: - Adoption bound (config-only, no weights)
+
+    /// The checkpoint's prefix-cache adoption bound derived from its
+    /// `text_config` ALONE — the same `cbv2LayerKinds` the extracted text
+    /// model would report, but without running the (parity-gated, forward-
+    /// pass) extraction. Used by the slot factory's per-model funding gate
+    /// (`PrefixCachePolicy.shouldFund`) BEFORE the carve, where only the
+    /// VLM wrapper is loaded. nil when the config is unreadable/undecodable
+    /// — the caller treats that as bound 0 (fund; the extraction inside
+    /// engine construction will throw on the same config moments later, so
+    /// no cache is ever actually built for a broken checkpoint).
+    static func adoptionBoundTokens(modelDirectory: URL) -> Int? {
+        cbv2LayerKinds(modelDirectory: modelDirectory)
+            .map { PrefixCachePolicy.adoptionBoundTokens(layerKinds: $0) }
+    }
+
+    /// A VLM checkpoint's CBv2 layer kinds from `config.json`'s
+    /// `text_config` ALONE — identical to what the extracted text model
+    /// reports (the drift tests pin config-derived shape == engine truth).
+    /// Used by the slot factory to construct the SSD prefix cache for VLM
+    /// slots (layout-epoch + adoption-bound binding) BEFORE the extraction
+    /// runs inside engine construction. nil when the config is
+    /// unreadable/undecodable — no cache is built (the extraction will
+    /// throw on the same config moments later).
+    static func cbv2LayerKinds(modelDirectory: URL) -> [CBv2LayerKind]? {
+        let configURL = modelDirectory.appendingPathComponent("config.json")
+        guard let configData = try? Data(contentsOf: configURL),
+            let textConfig = try? decodeTextConfiguration(configData: configData)
+        else { return nil }
+        return textConfig.cbv2LayerKinds
     }
 
     // MARK: - Steps

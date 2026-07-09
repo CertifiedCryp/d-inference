@@ -10,11 +10,10 @@
 // (`MultiModelBatchSchedulerEngineError.fromSchedulerMessage` → 429/503),
 // billing extraction, and cancellation therefore work unchanged.
 //
-// Strictly additive: nothing constructs this type unless
-// `EngineV2Factory.makeBridgeIfSelected` picked the v2 engine (env
-// `DARKBLOOM_ENGINE_V2=1` / config `engine_v2` + per-model allowlist —
-// see `EngineV2Config.swift`). Flag off ⇒ this file is dead code and the
-// legacy path is byte-identical.
+// v0.7.5 ONE ENGINE: every model slot serves through this bridge —
+// `EngineV2Factory.makeBridge` (fail-loud, no selection gate; see
+// `EngineV2Config.swift`) constructs it at model load, and a load whose
+// bridge cannot be built fails with a 503 instead of falling back.
 //
 // Companion files:
 //   * `EngineV2Bridge+Translation.swift` — pure ChatRequest → CBv2Request
@@ -24,8 +23,8 @@
 //     `BackendSlotCapacity` mapping + the `engine_v2.step_wedge` signal.
 //   * `EngineV2Runtime.swift`            — process-wide bridge registry the
 //     ProviderLoop capacity/cancellation hooks fan out through.
-//   * `EngineV2Config.swift`             — flag/allowlist selection + the
-//     safe-fallback factory.
+//   * `EngineV2Config.swift`             — the fail-loud factory + the
+//     engine_v2_refusal telemetry.
 
 import Foundation
 import MLXLMCommon
@@ -68,21 +67,45 @@ public actor EngineV2Bridge {
     let maxConcurrentRequests: Int
     /// Per-token KV byte cost for bytes→tokens capacity derivation
     /// (0 = unknown; capacity then falls back to the engine's token counts).
-    /// This is the UNQUANTIZED (fp16) rate: engine_v2 builds fp16 caches even
-    /// when the provider's `kv_quant` is on (KV-quant unsupported by v2), so
-    /// heartbeat token budgets AND the shared-budget reservation below are
+    /// This is the unquantized fp16 rate: v0.7.5 rejects `kv_quant` intent with
+    /// a warning and EngineV2 builds only fp16 caches, so heartbeat budgets and
+    /// the shared-budget reservation below are
     /// sized to the caches actually built — see `EngineV2KVSizing`.
     let kvBytesPerToken: Int
-    /// Process-wide KV reservation ledger shared with the legacy schedulers.
+    /// Process-wide KV reservation ledger shared by every EngineV2 slot.
     /// When set (production), each v2 submission must RESERVE its worst-case
     /// KV footprint here BEFORE it is handed to the engine — the reservation
     /// both GATES v2 admission against the process-wide unified-memory cap
     /// (the engine's private byte ledger only knows its own slot; with
     /// another slot's live KV already reserved, this shared pool is the only
     /// gate that sees the whole process) and is the accounting entry the
-    /// model-LOAD gate and the legacy live-KV gate subtract. nil in unit
+    /// model-load gate subtracts. nil in unit
     /// tests ⇒ no shared gating/accounting.
     let kvBudget: GlobalKVCacheBudget?
+    /// Byte budget carved out of this slot's KV grant for the opt-in RAM
+    /// prefix cache (`PrefixCachePolicy.carve`). Zero means no RAM carve and
+    /// includes both cache-off and the default SSD mode. The engine's
+    /// `kvBytesCapacity` was REDUCED by this amount at construction, so the
+    /// engine ledger, the heartbeat budget, and the cache jointly never
+    /// exceed the slot's grant. Fleet sizing reads it back via
+    /// `slotKVBytesClaim()` — the bytes are claimed even though the engine's
+    /// own capacity no longer shows them (T-041). `nonisolated`: immutable
+    /// and Sendable, so heartbeat/test readers need no actor hop.
+    public nonisolated let prefixCacheBudgetBytes: Int
+    /// Encrypted SSD offload tier (v0.7.5, default for CBv2-supported models
+    /// when Secure Enclave KEK construction succeeds):
+    /// the SAME instance handed to the engine as its `CBv2PrefixCache`.
+    /// The bridge holds it for the pre-submit staging hook (read-through
+    /// adoption: probe index → reserve staging bytes → read+decrypt off
+    /// the engine threads → seed the staging map so the engine's
+    /// synchronous `lookup()` hits), the per-request release backstop
+    /// (`completeStaging`), and shutdown. nil means the slot selected RAM,
+    /// caching is off, or SSD initialization was unavailable.
+    let ssdPrefixCache: SSDPrefixCache?
+    /// Periodic prefix-cache stats logger (v2 analog of the legacy
+    /// checkpoint-tier logger). Started by the slot factory when an active
+    /// cache exists; cancelled in `shutdown()`.
+    var prefixCacheStatsTask: Task<Void, Never>?
     /// Injectable telemetry sink (tests); nil ⇒ `TelemetryClient.shared`.
     let emitTelemetry: (@Sendable (TelemetryEvent) -> Void)?
 
@@ -145,8 +168,30 @@ public actor EngineV2Bridge {
     var wedgeMonitor = WedgeMonitor()
     var observedDecodeTpsEwma: Double = 0
     var ewmaInitialized = false
+    /// Cold-prefill EWMA (`observed_prefill_tps` heartbeat field), fed per
+    /// successful finish from the bridge's own timing: prefill window =
+    /// first-token time − submit; rate = prompt tokens / window. Absorbs
+    /// PR #454's measurement approach for the v2 engine (that PR added an
+    /// engine prefill-start marker for the LEGACY engine; the v2 bridge
+    /// already owns both timestamps, so no engine change is needed) with
+    /// the same plausibility bounds — see `recordPrefillSample`.
+    var observedPrefillTpsEwma: Double = 0
+    var prefillEwmaInitialized = false
+    /// Cold-start model load time (ms) for this slot, recorded by
+    /// `ProviderLoop.ensureModelLoaded` once the load completes (the
+    /// bridge exists before the load finishes, so this arrives post-init).
+    /// Reported per-slot as `model_load_time_ms`.
+    var modelLoadTimeMs: Int64 = 0
     /// Last wedge verdict emitted, for transition-edge telemetry.
     var lastWedgeSuspectedEmitted = false
+    /// True while a wedge-recovery rebuild is in flight for this slot
+    /// (`ProviderLoop+EngineV2Liveness`). The heartbeat then reports
+    /// slot state "reloading" — the legacy `isReloadingForRecovery`
+    /// semantic — so the coordinator deroutes the model for the whole
+    /// window instead of seeing "crashed" flap or a healthy-looking slot.
+    /// Set on the OLD bridge being drained; the recovered slot's fresh
+    /// bridge starts clean.
+    var recoveryReloading = false
 
     public init(
         engine: any CBv2Engine,
@@ -158,6 +203,8 @@ public actor EngineV2Bridge {
         maxConcurrentRequests: Int = 4,
         kvBytesPerToken: Int = 0,
         kvBudget: GlobalKVCacheBudget? = nil,
+        prefixCacheBudgetBytes: Int = 0,
+        ssdPrefixCache: SSDPrefixCache? = nil,
         emitTelemetry: (@Sendable (TelemetryEvent) -> Void)? = nil
     ) {
         self.engine = engine
@@ -173,6 +220,8 @@ public actor EngineV2Bridge {
         self.maxConcurrentRequests = maxConcurrentRequests
         self.kvBytesPerToken = kvBytesPerToken
         self.kvBudget = kvBudget
+        self.prefixCacheBudgetBytes = max(0, prefixCacheBudgetBytes)
+        self.ssdPrefixCache = ssdPrefixCache
         self.emitTelemetry = emitTelemetry
     }
 
@@ -224,22 +273,40 @@ public actor EngineV2Bridge {
     /// `cacheScope` is the per-tenant prefix-cache scope
     /// (`SHA256(prompt_cache_key)`/`SHA256(user)`, "" ⇒ unscoped) — the
     /// same value the legacy `BatchScheduler.submitTokenized(cacheScope:)`
-    /// receives. It maps onto `CBv2Request.cacheSalt` (TB-007): non-empty
-    /// scopes can never share cached KV across tenants; "" maps to nil
-    /// (cache-level salt fallback). Inert in production today — the v2
-    /// prefix cache is constructed OFF (`prefixCache: nil` in
-    /// `EngineV2Factory.makeProductionEngine`).
+    /// receives. It maps onto `CBv2Request.cacheSalt` (TB-007/T-041):
+    /// non-empty scopes can never share cached KV across tenants; "" maps
+    /// to nil (cache-level salt fallback). LIVE as of v0.7.5 — the
+    /// production engine runs with `PrefixCacheV2` when
+    /// `PrefixCachePolicy` funds it.
+    ///
+    /// `usageSignal`, when non-nil, receives the engine's terminal usage
+    /// detail (`prefixCacheHitTokens`) so the coordinator frames loop can
+    /// splice `prompt_tokens_details.cached_tokens` into the trailing SSE
+    /// usage chunk (same out-of-band pattern as `logprobsChannel`).
     ///
     /// `logprobsChannel`, when non-nil, receives OpenAI-shaped logprob
     /// entries for every engine delta that carries them (requires
     /// `request.logprobs == true` so the translated sampling params ask
     /// the engine to capture them).
+    ///
+    /// `multimodal` (v0.7.5, image + video) is the precomputed
+    /// media-prefill input for an image/video request
+    /// (`EngineV2VisionPrefill.PreparedSubmission.multimodalInput()` —
+    /// spans over `promptTokens`' placeholder runs, embeddings already
+    /// evaluated). nil ⇒ text request, byte-identical to the pre-multimodal
+    /// path. Submit-time `CBv2MultimodalError` rejections surface as
+    /// `multimodal_rejected: …` stream errors (→ 400). `mediaKind`
+    /// (image/video/mixed) tags the engagement telemetry only — it never
+    /// affects submission behavior.
     public func submitTokenized(
         promptTokens: [Int],
         request: ChatCompletionRequest,
         requestId: String? = nil,
         cacheScope: String = "",
-        logprobsChannel: EngineV2LogprobsChannel? = nil
+        logprobsChannel: EngineV2LogprobsChannel? = nil,
+        usageSignal: EngineV2RequestUsageSignal? = nil,
+        multimodal: CBv2MultimodalInput? = nil,
+        mediaKind: EngineV2MediaKind? = nil
     ) async -> AsyncStream<GenerationEvent> {
         // Validate the caller-supplied id before it becomes a dictionary key /
         // cancel-correlation handle: a nil / empty / over-long / non-printable
@@ -260,6 +327,32 @@ public actor EngineV2Bridge {
             return stream
         }
 
+        // PRE-SUBMIT SSD STAGING (v0.7.5 read-through adoption): probe the
+        // SSD tier's index for this prompt's chain prefix and, on a hit
+        // that clears the benefit gate, reserve the staged bytes in the
+        // shared KV budget and rehydrate the blocks OFF the engine/submit
+        // threads — so the engine's synchronous `lookup()` (inside
+        // `engine.submit` below) finds them in the RAM staging map. A
+        // false return is indistinguishable from a cache miss (silent
+        // recompute). Every staged=true is balanced by the engine's own
+        // `endAdoption` (fires on every adoption outcome, incl. abandon)
+        // with `completeStaging` as the idempotent backstop on the paths
+        // where lookup never ran (rejections below, pump terminals).
+        // Vision requests never stage (engine policy symmetry).
+        var ssdStaged = false
+        if let ssd = ssdPrefixCache, multimodal == nil {
+            ssdStaged = await ssd.stage(
+                requestID: id, promptTokens: promptTokens, cacheScope: cacheScope)
+            // `stage` suspended this actor — re-check the duplicate guard
+            // (same discipline as the shared-budget gate below).
+            guard active[id] == nil else {
+                if ssdStaged { ssd.completeStaging(requestID: id) }
+                continuation.yield(.error("token_budget_exhausted: duplicate request ID"))
+                continuation.finish()
+                return stream
+            }
+        }
+
         // Translate with a PLACEHOLDER engine id — the real id is minted
         // below, AFTER the shared-budget await, in the same synchronous
         // stretch as `engine.submit` and the `idMap` registration. Minting
@@ -272,7 +365,8 @@ public actor EngineV2Bridge {
             request: request,
             defaultMaxTokens: defaultMaxTokens,
             stopTokenIds: stopTokenIds,
-            cacheScope: cacheScope
+            cacheScope: cacheScope,
+            multimodal: multimodal
         )
 
         // SHARED-BUDGET ADMISSION GATE: reserve this request's worst-case KV
@@ -301,6 +395,7 @@ public actor EngineV2Bridge {
             sharedKVReserved = await kvBudget.reserve(
                 requestID: id, kvBytesPerToken: kvBytesPerToken, tokenCount: worstCaseTokens)
             guard sharedKVReserved else {
+                if ssdStaged { ssdPrefixCache?.completeStaging(requestID: id) }
                 continuation.yield(.error(
                     "token_budget_exhausted: request requires \(worstCaseTokens) tokens "
                         + "but the shared KV budget has no headroom"))
@@ -316,6 +411,7 @@ public actor EngineV2Bridge {
             // on this id's existing entry.)
             guard active[id] == nil else {
                 await kvBudget.release(requestID: id)
+                if ssdStaged { ssdPrefixCache?.completeStaging(requestID: id) }
                 continuation.yield(.error("token_budget_exhausted: duplicate request ID"))
                 continuation.finish()
                 return stream
@@ -347,7 +443,10 @@ public actor EngineV2Bridge {
         } catch {
             // Engine rejected AFTER the shared reservation was taken — release
             // it before surfacing the error (no pump will ever finish it).
+            // A rejected submit also never ran the prefix-cache lookup, so
+            // the engine can never balance the staging ticket — backstop it.
             if sharedKVReserved { await kvBudget?.release(requestID: id) }
+            if ssdStaged { ssdPrefixCache?.completeStaging(requestID: id) }
             // Admission failure. The message keeps the canonical
             // `token_budget_exhausted:` prefix contract so
             // `fromSchedulerMessage` classifies it as a retryable capacity
@@ -366,10 +465,20 @@ public actor EngineV2Bridge {
         // Wedge instrumentation: the request is now in the engine's hands.
         wedgeMonitor.recordAdmit(now: .now)
 
+        // Media-through-v2 engagement signal (v0.7.5; media-kind tagged
+        // since v0.7.5): one INFO per media request the engine ACCEPTED,
+        // tagged `multimodal=true` + `media_kind` on the existing engine_v2
+        // fields so prod adoption per media shape is observable next to the
+        // `engine_v2_vision_refusal` ERRORs. Allowlisted fields only.
+        if multimodal != nil {
+            emitVisionSubmitTelemetry(requestId: id, mediaKind: mediaKind)
+        }
+
         runPump(
             id: id, events: events, continuation: continuation,
             holdsSharedReservation: sharedKVReserved,
-            logprobsChannel: logprobsChannel
+            logprobsChannel: logprobsChannel,
+            usageSignal: usageSignal
         )
 
         let bridge = self
@@ -392,6 +501,37 @@ public actor EngineV2Bridge {
         engine.cancel(cbv2Id)
     }
 
+    // MARK: - Runtime KV re-slicing / slot bookkeeping
+
+    /// Update this SLOT's total KV claim (multi-model co-residency
+    /// re-slicing). `bytes` is the slot's re-sliced TOTAL grant; the
+    /// construction-fixed prefix-cache budget (T-041) is netted out here —
+    /// one translation point for every reslice caller — and the ENGINE's
+    /// admission ceiling absorbs the whole delta. Fans out to the engine
+    /// (`AdmissionV2` + backend + capacity gauges — see
+    /// `EngineV2.updateKVBytesCapacity`): shrink leaves in-flight
+    /// reservations untouched and fails new admissions until the pool
+    /// drains; grow admits immediately. The engine's `capacity()` snapshot
+    /// reflects the new ceiling right away, so heartbeats and later
+    /// re-slices (which read `slotKVBytesClaim()` — engine + cache budget)
+    /// see the CURRENT grant. A zero RAM carve, including the default SSD
+    /// mode, makes this the identity mapping.
+    ///
+    /// Callers never hand a total below the cache budget: load-time
+    /// re-slices refuse such targets at the serviceability floor
+    /// (`resliceMeetsServiceabilityFloor(_:fixedCarveBytes:)`), so the
+    /// `max(0, …)` clamp is defensive only.
+    public func updateKVBytesCapacity(_ bytes: Int) {
+        engine.updateKVBytesCapacity(max(0, bytes - prefixCacheBudgetBytes))
+    }
+
+    /// Record the slot's cold-start load time for heartbeat reporting
+    /// (`model_load_time_ms`) — slot-level bookkeeping, previously held by
+    /// the legacy scheduler.
+    public func recordModelLoadTime(ms: Int64) {
+        modelLoadTimeMs = max(0, ms)
+    }
+
     /// Runtime fan-out helper: cancel iff this bridge owns the request-id.
     func cancelIfOwned(requestId: String) -> Bool {
         guard let cbv2Id = idMap[requestId] else { return false }
@@ -411,10 +551,16 @@ public actor EngineV2Bridge {
     /// can't keep a pump (and its KV reservation) alive past shutdown, then
     /// await the engine drain.
     public func shutdown() async {
+        prefixCacheStatsTask?.cancel()
+        prefixCacheStatsTask = nil
         let live = pumpTasks
         pumpTasks.removeAll()
         for task in live.values { task.cancel() }
         await engine.shutdown()
+        // SSD tier teardown AFTER the engine drain: queued donation writes
+        // are dropped, staging pins/reservations released, on-disk files
+        // KEPT — durable warmth across unload/restart is the feature.
+        ssdPrefixCache?.close()
     }
 
     // MARK: - Event pump (CBv2Event → GenerationEvent)
@@ -424,14 +570,16 @@ public actor EngineV2Bridge {
         events: AsyncStream<CBv2Event>,
         continuation: AsyncStream<GenerationEvent>.Continuation,
         holdsSharedReservation: Bool,
-        logprobsChannel: EngineV2LogprobsChannel? = nil
+        logprobsChannel: EngineV2LogprobsChannel? = nil,
+        usageSignal: EngineV2RequestUsageSignal? = nil
     ) {
         let bridge = self
         let task = Task {
             await bridge.pump(
                 id: id, events: events, continuation: continuation,
                 holdsSharedReservation: holdsSharedReservation,
-                logprobsChannel: logprobsChannel
+                logprobsChannel: logprobsChannel,
+                usageSignal: usageSignal
             )
             await bridge.clearPumpTask(id: id)
         }
@@ -449,7 +597,8 @@ public actor EngineV2Bridge {
         events: AsyncStream<CBv2Event>,
         continuation: AsyncStream<GenerationEvent>.Continuation,
         holdsSharedReservation: Bool,
-        logprobsChannel: EngineV2LogprobsChannel? = nil
+        logprobsChannel: EngineV2LogprobsChannel? = nil,
+        usageSignal: EngineV2RequestUsageSignal? = nil
     ) async {
         // NOTE: the shared-budget KV reservation is taken in `submitTokenized`
         // (the pre-engine admission gate), NOT here — the pump only RELEASES
@@ -490,6 +639,15 @@ public actor EngineV2Bridge {
                 }
             case .finished(let reason, let usage):
                 sawTerminal = true
+                // Out-of-band usage detail (logprobs-channel pattern): the
+                // engine's `prefixCacheHitTokens` has no seat in the shared
+                // `GenerationEvent.info` shape, so the frames loop reads it
+                // from this per-request signal and splices
+                // `usage.prompt_tokens_details.cached_tokens` into the
+                // trailing SSE usage chunk. Recorded BEFORE the terminal
+                // events are yielded, so it is set by the time any
+                // downstream consumer sees the usage frame.
+                usageSignal?.record(prefixCacheHitTokens: usage.prefixCacheHitTokens)
                 finishAndEmit(
                     id: id, reason: reason, usage: usage,
                     sawFirstToken: sawFirstToken, continuation: continuation
@@ -499,6 +657,10 @@ public actor EngineV2Bridge {
                 if holdsSharedReservation {
                     await kvBudget?.release(requestID: id)
                 }
+                // SSD staging backstop: usually a no-op (the engine's
+                // endAdoption already balanced the ticket at adoption
+                // time); covers the lookup-missed corner. Idempotent.
+                ssdPrefixCache?.completeStaging(requestID: id)
                 continuation.finish()
                 return
             }
@@ -515,6 +677,7 @@ public actor EngineV2Bridge {
             if holdsSharedReservation {
                 await kvBudget?.release(requestID: id)
             }
+            ssdPrefixCache?.completeStaging(requestID: id)
             continuation.finish()
         }
     }
@@ -610,7 +773,68 @@ public actor EngineV2Bridge {
         if success, tps > 0 {
             updateDecodeTpsEwma(tps)
         }
+        if success {
+            recordPrefillSample(
+                promptTokens: prompt,
+                submittedAt: state.submittedAt,
+                firstTokenAt: state.firstTokenAt)
+        }
         return (prompt, completion, tps)
+    }
+
+    // MARK: - Prefill sampling (observed_prefill_tps)
+
+    /// Minimum submit→first-token window (seconds) for a prefill sample to
+    /// count. A near-zero window (scripted engines, degenerate prompts)
+    /// divides into an absurd rate; 1 ms is far below any real cold
+    /// prefill. Same floor as the legacy classifier (PR #454 lineage).
+    static let minPrefillWindowSeconds = 0.001
+
+    /// Upper plausibility bound (tok/s) for a prefill sample — PR #454's
+    /// raised ceiling: above the MEASURED real-prefill p90 (~17,707 tok/s,
+    /// docs/reports/2026-06-22-live-prefill-tps-check.md) so a legitimately
+    /// fast cold prefill registers, finite so a window-collapse artifact is
+    /// still rejected.
+    static let maxPlausiblePrefillTps = 20_000.0
+
+    /// Classify one prefill sample against the plausibility bounds. Pure —
+    /// mirrors `BatchScheduler.classifyPrefillSample`'s floor/ceiling shape
+    /// with the v2 measurement (window = first token − SUBMIT: the bridge
+    /// owns both timestamps, so no engine prefill-start marker is needed;
+    /// under load the window includes engine queue wait, making this the
+    /// same load-inclusive observed rate the decode EWMA reports).
+    static func classifyPrefillSample(
+        prefilledTokens: Int, prefillSeconds: Double
+    ) -> Double? {
+        guard prefilledTokens > 0 else { return nil }
+        guard prefillSeconds >= minPrefillWindowSeconds else { return nil }
+        let tps = Double(prefilledTokens) / prefillSeconds
+        guard tps.isFinite, tps <= maxPlausiblePrefillTps else { return nil }
+        return tps
+    }
+
+    /// Feed the prefill EWMA (α = 0.3, mirroring the decode EWMA) from a
+    /// successful request's timing. The v2 production engine runs with the
+    /// prefix cache OFF, so every sample is a genuine cold prefill; the
+    /// bounds above still reject degenerate windows.
+    private func recordPrefillSample(
+        promptTokens: Int,
+        submittedAt: ContinuousClock.Instant,
+        firstTokenAt: ContinuousClock.Instant?
+    ) {
+        guard let firstTokenAt else { return }
+        let prefillSeconds = WedgeMonitor.seconds(firstTokenAt - submittedAt)
+        guard
+            let tps = Self.classifyPrefillSample(
+                prefilledTokens: promptTokens, prefillSeconds: prefillSeconds)
+        else { return }
+        let alpha = 0.3
+        if prefillEwmaInitialized {
+            observedPrefillTpsEwma = alpha * tps + (1 - alpha) * observedPrefillTpsEwma
+        } else {
+            observedPrefillTpsEwma = tps
+            prefillEwmaInitialized = true
+        }
     }
 
     /// Stream torn down without a terminal event — drop local state.
@@ -629,6 +853,35 @@ public actor EngineV2Bridge {
             observedDecodeTpsEwma = tps
             ewmaInitialized = true
         }
+    }
+
+    /// Media-through-v2 engagement (v0.7.5; media-kind tagged since
+    /// v0.7.5): INFO per engine-accepted image/video request. PRIVACY:
+    /// allowlisted operational fields only — the request's media/prompt
+    /// content never rides telemetry; `multimodal` is a bare boolean tag
+    /// and `media_kind` is one of image/video/mixed.
+    private func emitVisionSubmitTelemetry(requestId: String, mediaKind: EngineV2MediaKind?) {
+        var event = TelemetryEvent(
+            source: .provider,
+            severity: .info,
+            kind: .engineHealth,
+            message: "engine_v2: media request served via ContinuousBatchingV2"
+        )
+        // Filter-at-source, matching the other engine_health builders —
+        // every key is allowlisted already; the filter enforces it stays so.
+        var fields: [String: AnyCodableValue] = [
+            "component": .string("engine"),
+            "operation": .string("engine_v2_vision"),
+            "backend": .string("engine_v2"),
+            "model": .string(modelId),
+            "multimodal": .bool(true),
+        ]
+        if let mediaKind {
+            fields["media_kind"] = .string(mediaKind.rawValue)
+        }
+        event.fields = TelemetryFieldFilter.filter(fields)
+        event.requestId = requestId
+        emit(event)
     }
 
     /// PRIVACY: engine-error telemetry carries only allowlisted operational
@@ -750,6 +1003,9 @@ public actor EngineV2Bridge {
 
     /// Number of live pump tasks (shutdown-tracking assertions).
     func _testLivePumpCount() -> Int { pumpTasks.count }
+
+    /// Live provider request-ids (live co-residency test cancels by id).
+    func _testActiveRequestIds() -> [String] { Array(active.keys) }
 
     /// Snapshot of internal counters for unit assertions.
     func _testCounters() -> (active: Int, admits: Int, firstTokens: Int) {

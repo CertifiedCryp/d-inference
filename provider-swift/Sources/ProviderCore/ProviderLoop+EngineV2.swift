@@ -1,86 +1,394 @@
 /// ProviderLoop -- ContinuousBatchingV2 (engine v2) slot wiring.
 ///
-/// The single production call site that turns `DARKBLOOM_ENGINE_V2=1` /
-/// `engine_v2 = true` into a running CBv2 engine: at model-load time
-/// `ensureModelLoaded` calls `makeEngineV2BridgeForSlot`, which consults
-/// `EngineV2Config` and — only when the v2 engine is selected for this model
-/// — assembles the real engine over the just-loaded container, wraps it in
-/// an `EngineV2Bridge`, and registers it with the `EngineV2Runtime` so the
-/// capacity/cancellation hooks see it. The bridge is stored on `ModelSlot`
-/// ALONGSIDE the legacy `BatchScheduler` (never replacing it): a v2 init
-/// failure falls back to legacy with WARN telemetry (inside
-/// `EngineV2Factory.makeBridgeIfSelected`), and flag-off providers return
-/// before touching the container, the scheduler, or the runtime.
+/// v0.7.5 ONE-ENGINE: every model slot serves through a v2 bridge — there
+/// is no selection gate and no legacy fallback. At model-load time
+/// `ensureModelLoaded` calls `resliceAndBuildEngineV2Slot`, which:
+///
+///   1. snapshots every existing slot's CURRENT engine KV grant,
+///   2. computes fair-share grants for existing + newcomer against the
+///      fleet KV budget (`EngineV2KVSizing.resliceGrants` — a single-model
+///      box keeps the FULL budget; ≥2 share ∝ fp16 rate × capped context),
+///   3. refuses the load (fail loud, 503) if any share would fall below
+///      the serviceability floor,
+///   4. SHRINKS existing engines via `updateKVBytesCapacity` (engine-safe:
+///      in-flight reservations untouched, new admits fail until drain),
+///   5. builds the newcomer's engine + bridge with its grant
+///      (`EngineV2Factory.makeBridge`, throwing) — and on ANY throw
+///      RESTORES every existing grant exactly before rethrowing,
+///   6. applies any grow-side targets and registers the bridge.
+///
+/// `unloadModel` calls `resliceGrowSurvivors()` after teardown so the
+/// remaining slots grow back to their re-sliced shares.
 
 import Foundation
+import MLX
 import MLXLMCommon
 #if canImport(os)
 import os
 #endif
 
+/// Ownership box for a loading model's container (the "newcomer").
+/// `ensureModelLoaded` routes every container access through this box so
+/// failure unwinds can drop the LAST strong reference to the weights —
+/// `release()` — BEFORE survivor grants are restored or regrown (Codex
+/// review): restoring first would let Σ(engine grants) transiently exceed
+/// the true fleet budget while the failed newcomer's weights are still
+/// resident, over-advertising capacity the shared KV gate then rejects
+/// (the gray-box class). NSLock-guarded and `@unchecked Sendable` only so
+/// test seams can hand it across the ProviderLoop actor boundary; all
+/// production access is ProviderLoop-actor confined.
+final class EngineV2NewcomerBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _container: MLXLMCommon.ModelContainer?
+
+    init(_ container: MLXLMCommon.ModelContainer) {
+        self._container = container
+    }
+
+    /// The container, or nil after `release()`.
+    var container: MLXLMCommon.ModelContainer? {
+        lock.withLock { _container }
+    }
+
+    /// Transient access for a single call. NEVER bind the result to a
+    /// long-lived local — that would keep the weights alive past
+    /// `release()` and defeat the unwind ordering.
+    func borrow() throws -> MLXLMCommon.ModelContainer {
+        guard let container = (lock.withLock { _container }) else {
+            // Only reachable through a wiring bug (use-after-release);
+            // maps to 500 via the existing InferenceError handling.
+            throw InferenceError.noModelLoaded
+        }
+        return container
+    }
+
+    /// Drop the strong reference to the container. The weights become
+    /// reclaimable; pair with `MLX.Memory.clearCache()` so the pool
+    /// returns their buffers before anything re-reads live residency.
+    func release() {
+        lock.withLock { _container = nil }
+    }
+}
+
 extension ProviderLoop {
 
-    /// Whether any live slot serves through the v2 engine. Synchronous and
-    /// actor-isolated — the zero-overhead guard the capacity/cancellation
-    /// hooks check BEFORE hopping to `engineV2Runtime`, so flag-off
-    /// providers never take the (pointless, empty-registry) actor hop.
+    /// Whether any live slot exists. Every slot serves through the v2
+    /// engine as of v0.7.5, so this is a plain occupancy check — the
+    /// capacity/cancellation hooks use it to skip the runtime actor hop
+    /// when nothing is loaded.
     internal var hasEngineV2Slots: Bool {
-        modelSlots.contains { $0.value.engineV2 != nil }
+        !modelSlots.isEmpty
     }
 
     /// Test hooks for the slot factory (`ProviderLoop+Testing`): replace the
-    /// process environment, the container-derived EOS snapshot, and the
-    /// production engine builder so unit tests can drive the full wiring
-    /// path with a scripted `CBv2Engine` — no model weights, no network.
+    /// container-derived EOS snapshot and the production engine builder so
+    /// unit tests can drive the full wiring path with a scripted
+    /// `CBv2Engine` — no model weights, no network. `physicalMemoryBytes`
+    /// additionally overrides the machine memory the re-slice budget is
+    /// computed from, so grant arithmetic is deterministic in tests.
     struct EngineV2SlotHooks: Sendable {
+        /// Environment the prefix-cache gate/budget/carve policy reads
+        /// (`DARKBLOOM_PREFIX_CACHE*`). An empty environment selects the SSD
+        /// default; scripted test engines suppress real cache construction,
+        /// while carve tests inject an explicit RAM-tier environment.
         let environment: [String: String]
         let eosTokenIds: Set<Int>
         let extraEOSTokens: [String]
         let emitTelemetry: (@Sendable (TelemetryEvent) -> Void)?
+        /// Machine-memory override for the re-slice fleet budget (nil ⇒
+        /// real physical memory).
+        let physicalMemoryBytes: UInt64?
         /// Scripted engine builder: (modelId, kvBytesCapacity) — the second
-        /// argument is the FLEET-SIZED admission ceiling the production path
-        /// would hand `makeProductionEngine`, exposed so tests can assert the
-        /// multi-slot capacity derivation without building a real engine.
+        /// argument is the RE-SLICED, POST-CARVE admission ceiling the
+        /// production path would hand `makeProductionEngine`, exposed so
+        /// tests can assert the multi-slot grant + carve derivation without
+        /// building a real engine.
         let makeEngine: @Sendable (String, Int) throws -> any CBv2Engine
 
         init(
-            environment: [String: String],
+            environment: [String: String] = [:],
             eosTokenIds: Set<Int> = [],
             extraEOSTokens: [String] = [],
             emitTelemetry: (@Sendable (TelemetryEvent) -> Void)? = nil,
+            physicalMemoryBytes: UInt64? = nil,
             makeEngine: @escaping @Sendable (String, Int) throws -> any CBv2Engine
         ) {
             self.environment = environment
             self.eosTokenIds = eosTokenIds
             self.extraEOSTokens = extraEOSTokens
             self.emitTelemetry = emitTelemetry
+            self.physicalMemoryBytes = physicalMemoryBytes
             self.makeEngine = makeEngine
         }
     }
 
-    /// Build + register the v2 bridge for a freshly-loaded model slot, iff
-    /// `EngineV2Config` selects the v2 engine for `modelId`. Returns nil on
-    /// every legacy path:
+    // MARK: - Re-slice orchestration
+
+    /// One existing slot's re-slice bookkeeping: its sizing inputs, its
+    /// engine grant BEFORE this re-slice (the restore point), and the
+    /// bridge whose ceiling gets updated.
+    private struct ExistingSlotGrant {
+        let slot: EngineV2KVSizing.ResliceSlot
+        let previousGrant: Int
+        let bridge: EngineV2Bridge
+    }
+
+    /// Fleet KV budget for a prospective residency set: the unified-memory
+    /// cap minus Σ resident weights (ALL slots, including any mid-unload —
+    /// their weights are still resident — plus the newcomer's), minus the
+    /// activation reserve, honoring the operator `memory_reserve_gb`.
+    private func fleetKVBudgetBytes(extraWeightBytes: Int) -> UInt64 {
+        var totalWeights = UInt64(max(0, extraWeightBytes))
+        for (_, slot) in modelSlots {
+            let (sum, overflow) = totalWeights
+                .addingReportingOverflow(UInt64(max(0, slot.sizing.weightsBytes)))
+            totalWeights = overflow ? .max : sum
+        }
+        let physical = engineV2SlotHooks?.physicalMemoryBytes
+            ?? ProcessInfo.processInfo.physicalMemory
+        return UnifiedMemoryCap.kvBudgetBytes(
+            physicalBytes: physical,
+            residentWeightBytes: totalWeights,
+            configReserveBytes: Self.memoryReserveBytes(
+                forGiB: loopConfig.config.provider.memoryReserveGB))
+    }
+
+    /// Existing v2 slots eligible for re-slicing: live (not mid-unload)
+    /// slots other than `excludingModelId` (a same-id slot present during a
+    /// reload is excluded so its weights/grant are not double-counted).
+    /// Reads each slot's CURRENT TOTAL claim (post-any-earlier-resize):
+    /// engine admission ceiling PLUS the slot's fixed prefix-cache budget
+    /// (`slotKVBytesClaim`, T-041) — counting only the engine ceiling would
+    /// re-grant the cache's bytes to a newcomer. Grants flowing back down
+    /// (`updateKVBytesCapacity`) are totals too; the bridge nets out its
+    /// own cache budget before touching the engine.
+    private func existingSlotGrants(excludingModelId: String) async -> [ExistingSlotGrant] {
+        var existing: [ExistingSlotGrant] = []
+        for (slotModelId, slot) in modelSlots
+        where slotModelId != excludingModelId && !modelsUnloading.contains(slotModelId) {
+            let currentGrant = await slot.engineV2.slotKVBytesClaim()
+            existing.append(
+                ExistingSlotGrant(
+                    slot: EngineV2KVSizing.ResliceSlot(
+                        modelId: slotModelId,
+                        fp16KVBytesPerToken: slot.sizing.fp16KVBytesPerToken,
+                        maxContextLength: slot.sizing.maxContextLength),
+                    previousGrant: currentGrant,
+                    bridge: slot.engineV2))
+        }
+        return existing
+    }
+
+    /// Acquire the KV-grant re-slice gate (see the `isReslicing` doc in
+    /// ProviderLoop.swift): only one grant-mutating section — a load's
+    /// re-slice-through-install or an unload's regrow — runs at a time, so
+    /// a snapshot of current grants can never go stale under a concurrent
+    /// mutation. Internal: `ensureModelLoaded` holds it across the WHOLE
+    /// shrink → build → guard → install-slot sequence — releasing at the
+    /// end of `resliceAndBuildEngineV2Slot` would let a parked regrow run
+    /// in the gap before the newcomer's slot is installed, recompute
+    /// without it, and re-inflate the survivors past the fleet budget.
+    internal func acquireResliceGate() async {
+        while isReslicing {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                resliceGateWaiters.append(cont)
+            }
+        }
+        isReslicing = true
+    }
+
+    internal func releaseResliceGate() {
+        isReslicing = false
+        let waiters = resliceGateWaiters
+        resliceGateWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    /// Re-slice KV grants for the newcomer + existing slots, shrink
+    /// existing engines, and build the newcomer's bridge. On ANY throw —
+    /// re-slice floor, extraction failure, engine construction — the
+    /// newcomer's weights are RELEASED (box + clearCache) and only THEN is
+    /// every existing engine's grant RESTORED exactly (Codex-review
+    /// ordering: restoring first would let Σ(grants) exceed the true fleet
+    /// budget while the failed newcomer's weights are still resident).
+    /// Returns the bridge, already registered with `engineV2Runtime`.
+    /// CALLER HOLDS the re-slice gate (see `acquireResliceGate`), spanning
+    /// through slot installation, so a concurrent idle-timeout unload's
+    /// regrow cannot interleave with the shrink→build→install sequence
+    /// (Σ(grants) ≤ budget holds at every suspension point).
+    internal func resliceAndBuildEngineV2Slot(
+        modelId: String,
+        modelType: String?,
+        isVLM: Bool,
+        modelDirectory: URL?,
+        newcomer newcomerBox: EngineV2NewcomerBox,
+        tokenizer: TokenizerHandle,
+        sizing: SlotSizingSnapshot
+    ) async throws -> EngineV2Bridge {
+        let existing = await existingSlotGrants(excludingModelId: modelId)
+        let newcomer = EngineV2KVSizing.ResliceSlot(
+            modelId: modelId,
+            fp16KVBytesPerToken: sizing.fp16KVBytesPerToken,
+            maxContextLength: sizing.maxContextLength)
+        let fleetBudget = fleetKVBudgetBytes(extraWeightBytes: sizing.weightsBytes)
+        let targets = EngineV2KVSizing.resliceGrants(
+            existing: existing.map(\.slot),
+            newcomer: newcomer,
+            fleetKVBudgetBytes: fleetBudget)
+
+        // Serviceability floor (fail loud): a slice that would leave ANY
+        // slot below the minimum serveable grant is refused outright —
+        // thrashing every co-resident model below serviceability serves
+        // no one. ERROR telemetry + 503 (the coordinator reroutes).
+        // Existing slots' prefix-cache budgets are construction-FIXED
+        // (T-041): the floor applies to what would remain for their
+        // ENGINE (target − cache budget), never to the raw total. The
+        // newcomer needs only the plain floor — its carve is elastic
+        // (`PrefixCachePolicy.carve` shrinks the cache before the engine).
+        var fixedCarveBytes: [String: Int] = [:]
+        for entry in existing where entry.bridge.prefixCacheBudgetBytes > 0 {
+            fixedCarveBytes[entry.slot.modelId] = entry.bridge.prefixCacheBudgetBytes
+        }
+        guard
+            EngineV2KVSizing.resliceMeetsServiceabilityFloor(
+                targets, fixedCarveBytes: fixedCarveBytes)
+        else {
+            let floorGb = String(
+                format: "%.1f",
+                Double(EngineV2KVSizing.minimumServiceableGrantBytes) / (1024 * 1024 * 1024))
+            let message = "loading '\(modelId)' would re-slice some model's KV grant below "
+                + "the \(floorGb) GB serviceability floor "
+                + "(fleet KV budget \(fleetBudget) B across \(existing.count + 1) slots) — refused"
+            EngineV2Factory.emitRefusalTelemetry(
+                modelId: modelId,
+                reason: .resliceFloor,
+                error: nil,
+                emitTelemetry: engineV2SlotHooks?.emitTelemetry)
+            // Pre-shrink refusal: no grants were mutated, but drop the
+            // newcomer's weights promptly so live residency reflects the
+            // refusal before the caller's error handling runs.
+            newcomerBox.release()
+            MLX.Memory.clearCache()
+            throw InferenceError.modelLoadFailed(message)
+        }
+
+        // Phase 1 — SHRINKS first, so Σ(ceilings) never exceeds the fleet
+        // budget at any instant. Engine-side shrink semantics: in-flight
+        // reservations untouched; new reserves fail until the pool drains.
+        for entry in existing {
+            if let target = targets[entry.slot.modelId], target < entry.previousGrant {
+                await entry.bridge.updateKVBytesCapacity(target)
+            }
+        }
+
+        // Phase 2 — build the newcomer with its grant. Restore-on-throw,
+        // in the Codex-review order: (1) release the newcomer's weights,
+        // (2) clearCache so the pool returns their buffers, (3) grow every
+        // shrunk engine back to its exact previous grant. Restoring before
+        // the weights are gone would let Σ(grants) exceed the true fleet
+        // budget for as long as the failed container stayed resident.
+        // `borrow()` is evaluated inline so the container reference lives
+        // only for the duration of the call — by the time this catch runs,
+        // the box holds the last strong reference and `release()` frees it.
+        let bridge: EngineV2Bridge
+        do {
+            bridge = try await makeEngineV2BridgeForSlot(
+                modelId: modelId,
+                modelType: modelType,
+                isVLM: isVLM,
+                modelDirectory: modelDirectory,
+                container: newcomerBox.borrow(),
+                tokenizer: tokenizer,
+                sizing: sizing,
+                kvBytesCapacity: targets[modelId] ?? 0)
+        } catch {
+            newcomerBox.release()
+            MLX.Memory.clearCache()
+            for entry in existing {
+                await entry.bridge.updateKVBytesCapacity(entry.previousGrant)
+            }
+            throw error
+        }
+
+        // Phase 3 — grow-side targets (rare on load: the budget shrank, so
+        // proportional shares shrink too; kept for self-healing when a
+        // previous state left a slot under-granted).
+        for entry in existing {
+            if let target = targets[entry.slot.modelId], target > entry.previousGrant {
+                await entry.bridge.updateKVBytesCapacity(target)
+            }
+        }
+        return bridge
+    }
+
+    /// Failure unwind AFTER a successful bridge build (the post-bridge
+    /// headroom guard): retire the bridge, RELEASE the aborted newcomer's
+    /// weights, and only then regrow the survivors — in that order (Codex
+    /// review), so the regrow's fleet budget reflects true residency and
+    /// Σ(grants) never exceeds it. Caller holds the re-slice gate.
+    internal func unwindBuiltSlotAndRegrow(
+        modelId: String,
+        bridge: EngineV2Bridge,
+        newcomer: EngineV2NewcomerBox
+    ) async {
+        await engineV2Runtime.unregister(modelId: modelId)
+        await bridge.shutdown()
+        newcomer.release()
+        MLX.Memory.clearCache()
+        await resliceGrowSurvivorsLocked()
+    }
+
+    /// Grow the surviving slots back to their re-sliced shares after an
+    /// unload (a lone survivor gets the FULL fleet budget back). Gated: a
+    /// regrow queued behind an in-flight load's re-slice-through-install
+    /// recomputes AFTER it, over the then-current slots, so the two can
+    /// never interleave.
+    internal func resliceGrowSurvivors() async {
+        await acquireResliceGate()
+        defer { releaseResliceGate() }
+        await resliceGrowSurvivorsLocked()
+    }
+
+    /// Regrow body — caller holds the re-slice gate. Shrink targets, if
+    /// the budget somehow contracted, are applied first so the Σ ≤ budget
+    /// invariant holds throughout. Used directly by `ensureModelLoaded`'s
+    /// post-bridge-guard failure path, which already holds the gate.
+    internal func resliceGrowSurvivorsLocked() async {
+        let survivors = await existingSlotGrants(excludingModelId: "")
+        guard !survivors.isEmpty else { return }
+        let fleetBudget = fleetKVBudgetBytes(extraWeightBytes: 0)
+        let targets = EngineV2KVSizing.resliceGrants(
+            existing: survivors.map(\.slot),
+            newcomer: nil,
+            fleetKVBudgetBytes: fleetBudget)
+        for entry in survivors {
+            if let target = targets[entry.slot.modelId], target < entry.previousGrant {
+                await entry.bridge.updateKVBytesCapacity(target)
+            }
+        }
+        for entry in survivors {
+            if let target = targets[entry.slot.modelId], target > entry.previousGrant {
+                await entry.bridge.updateKVBytesCapacity(target)
+            }
+        }
+    }
+
+    // MARK: - Bridge construction
+
+    /// Build + register the v2 bridge for a freshly-loaded model slot with
+    /// an already-computed KV grant. THROWS on construction failure (the
+    /// factory emits the ERROR `engine_v2_refusal` event first) — the
+    /// caller unloads and maps to 503. There is no legacy path.
     ///
-    ///   * flag off / model not allowlisted — the ZERO-OVERHEAD steady
-    ///     state: no container access, no scheduler reads, no
-    ///     `EngineV2Runtime` hop, no allocations. This also covers
-    ///     NON-allowlisted VLM builds (silent legacy — no WARN spam);
-    ///   * v2 engine construction throws — WARN `engine_health` telemetry
-    ///     (`engine_v2_fallback`) is emitted by the factory and the slot
-    ///     serves through the legacy scheduler exactly as before. For an
-    ///     ALLOWLISTED VLM slot this covers text-model extraction failures
-    ///     (see below) — loud, never silently wrong.
-    ///
-    /// VLM slots (v0.7.2): every production Gemma 4 checkpoint ships a
-    /// vision tower, so its slot loads MLXVLM's wrapper — which has no CBv2
-    /// hooks. Instead of gating the whole slot out (which kept 100% of prod
-    /// Gemma traffic on legacy), an allowlisted VLM slot builds the engine
-    /// over `EngineV2VLMTextExtraction`'s weight-sharing MLXLLM text model:
-    /// TEXT requests then serve through v2 while image/video requests keep
-    /// the legacy VLM path (per-request routing in
-    /// `MultiModelBatchSchedulerEngine.streamChatCompletion`, which peels
-    /// media off to the vision path BEFORE the bridge branch).
+    /// VLM slots: every production Gemma 4 checkpoint ships a vision tower,
+    /// so the loaded module is MLXVLM's wrapper — which has no CBv2 hooks.
+    /// The engine is built over `EngineV2VLMTextExtraction`'s weight-sharing
+    /// MLXLLM text model: TEXT requests serve through v2, and ALL media —
+    /// image, video, mixed — prefills through v2 via `EngineV2VisionPrefill`
+    /// (v0.7.5; media construction failures REFUSE loudly, 503 — see
+    /// `MultiModelBatchSchedulerEngine.streamChatCompletion`).
     ///
     /// On success the bridge is registered with `engineV2Runtime` BEFORE the
     /// caller installs the slot, so a request routed the instant the slot
@@ -92,207 +400,95 @@ extension ProviderLoop {
         modelDirectory: URL? = nil,
         container: ModelContainer,
         tokenizer: TokenizerHandle,
-        scheduler: BatchScheduler
-    ) async -> EngineV2Bridge? {
-        let configEnabled = loopConfig.config.backend.engineV2
-        let environment = engineV2SlotHooks?.environment
-            ?? ProcessInfo.processInfo.environment
-        // Zero-overhead gate: the common (flag-off / non-allowlisted) case
-        // returns here without touching anything else.
-        guard
-            EngineV2Config.selection(
-                modelId: modelId, environment: environment, configEnabled: configEnabled
-            ) == .v2
-        else {
-            return nil
-        }
+        sizing: SlotSizingSnapshot,
+        kvBytesCapacity: Int
+    ) async throws -> EngineV2Bridge {
+        let maxConcurrent = engineV2MaxConcurrent(forModel: modelId)
 
-        // Legacy-comparable knobs, read from the already-loaded scheduler so
-        // v2 heartbeat numbers and max-token defaulting match what the
-        // legacy engine would have reported for the same model.
-        //
-        // KV byte cost: engine_v2 builds UNQUANTIZED (fp16) caches even when
-        // the provider's `kv_quant` is on (KV-quant is not yet composed with
-        // v2). The scheduler's live `kvBytesPerToken` is the QUANTIZED rate in
-        // that case; sizing the bridge with it would overstate v2 token
-        // budgets 2–4× and under-size the shared KV reservation. Pick the fp16
-        // rate for v2 and WARN once that kv_quant is being ignored on this
-        // path — see `EngineV2KVSizing`.
-        let quantizedKVBytesPerToken = await scheduler.kvBytesPerToken
-        let fp16KVBytesPerToken = await scheduler.fp16KVBytesPerToken
-        let kvSizing = EngineV2KVSizing.resolve(
-            quantizedRate: quantizedKVBytesPerToken, fp16Rate: fp16KVBytesPerToken)
-        let kvBytesPerToken = kvSizing.rate
-        let defaultMaxTokens = await scheduler.defaultMaxTokens
-        let weightBytes = await scheduler.modelWeightBytes
-        // FLEET-WIDE ceiling (round-2 PR#499 P2): size this engine's KV
-        // admission cap against ALL resident models' weights plus the
-        // ceilings already granted to co-resident v2 engines — not just this
-        // slot's weights — so Σ(v2 ceilings) can never exceed the
-        // unified-memory KV budget on a multi-slot provider. Snapshot the
-        // slots once (each read awaits an actor hop; `modelSlots` could
-        // mutate across suspensions otherwise). The new model's own slot is
-        // not installed yet at this point; a same-id slot present during a
-        // reload is excluded so its weights are not double-counted against
-        // the fresh scheduler's figure. When nothing is left under the
-        // budget the capacity is 0 and `makeProductionEngine` throws
-        // `noKVHeadroom` → this slot serves via the legacy scheduler (whose
-        // per-request shared-budget gate needs no static ceiling).
-        var coResidentWeightBytes: UInt64 = 0
-        var existingEngineKVCapacities: [Int] = []
-        for (slotModelId, slot) in modelSlots where slotModelId != modelId {
-            let slotWeights = await slot.scheduler.modelWeightBytes
-            let (sum, overflow) = coResidentWeightBytes
-                .addingReportingOverflow(UInt64(max(0, slotWeights)))
-            coResidentWeightBytes = overflow ? .max : sum
-            if let existingBridge = slot.engineV2 {
-                existingEngineKVCapacities.append(
-                    await existingBridge.engineKVBytesCapacity())
-            }
-        }
-        // `memory_reserve_gb` (round-3 PR#499 P2): the shared KV gate and the
-        // load gate hold back max(configReserve, cap-implied reserve); the
-        // static v2 ceiling must be derived under the same effective cap or a
-        // 16/32 GiB box (default 4 GiB reserve > implied reserve) advertises
-        // capacity the shared gate rejects post-acceptance.
-        let kvBytesCapacity = EngineV2KVSizing.engineKVBytesCapacity(
-            newModelWeightBytes: weightBytes,
-            coResidentWeightBytes: coResidentWeightBytes,
-            existingEngineKVCapacities: existingEngineKVCapacities,
-            configReserveBytes: Self.memoryReserveBytes(
-                forGiB: loopConfig.config.provider.memoryReserveGB))
-
-        // Resolve the EOS/stop inputs + engine builder: from the test hooks
-        // when installed, otherwise from the loaded container (production).
-        let eosTokenIds: Set<Int>
-        let extraEOSTokens: [String]
-        let emitTelemetry: (@Sendable (TelemetryEvent) -> Void)?
-        let makeEngine: () throws -> any CBv2Engine
+        // Assembly is shared with the standalone server via
+        // `EngineV2SlotFactory` (one construction path, no drift) —
+        // including THE single prefix-cache carve point (T-041, v0.7.5)
+        // AND the SSD offload tier's construction: the slot's re-slice
+        // grant is split between the engine's admission ceiling and the
+        // opt-in RAM v2 prefix cache INSIDE the factory (order: re-slice
+        // grant → RAM-tier funding-gated carve (SSD/default ⇒ passthrough)
+        // → SSD tier construction (default-on, own kv2/
+        // root, per-donation gate, NO memory carve) → engine construction
+        // with the (possibly carved) grant), so everything downstream
+        // reads engine truth and the coordinator is never told about bytes
+        // the cache will consume. The test hooks, when installed, replace
+        // the container-derived EOS snapshot and the production engine
+        // builder so unit tests can drive the wiring with a scripted
+        // `CBv2Engine` — no weights, no container reads; the hooks path
+        // runs the SAME carve policy (hooks' environment, adoption bound 0)
+        // and hands the builder the REDUCED capacity, and the bridge the
+        // budget bookkeeping, so the claim/heartbeat math is testable
+        // without a real engine (no cache INSTANCE exists under hooks).
+        let bridge: EngineV2Bridge
         if let hooks = engineV2SlotHooks {
-            eosTokenIds = hooks.eosTokenIds
-            extraEOSTokens = hooks.extraEOSTokens
-            emitTelemetry = hooks.emitTelemetry
+            let carve = EngineV2SlotFactory.resolvePrefixCarve(
+                modelId: modelId,
+                isVLM: isVLM,
+                modelDirectory: modelDirectory,
+                model: nil,
+                slotKVBytesCapacity: kvBytesCapacity,
+                kvBytesPerToken: sizing.fp16KVBytesPerToken,
+                environment: hooks.environment
+            ).carve
             let hookBuilder = hooks.makeEngine
-            makeEngine = { try hookBuilder(modelId, kvBytesCapacity) }
-        } else {
-            // Snapshot the model handle + EOS config out of the container.
-            // Handing the module reference to the v2 engine mirrors the
-            // legacy path exactly (`BatchScheduler.makeBatchedEngine` builds
-            // its engine over `ctx.model` the same way): the engine
-            // serializes all forward passes on its own step thread.
-            let snapshot = await container.perform { ctx in
-                EngineV2ModelSnapshot(
-                    model: ctx.model,
-                    eosTokenIds: ctx.configuration.eosTokenIds,
-                    extraEOSTokens: ctx.configuration.extraEOSTokens.sorted())
+            bridge = try EngineV2Factory.makeBridge(
+                modelId: modelId,
+                tokenizer: tokenizer,
+                eosTokenIds: hooks.eosTokenIds,
+                extraEOSTokens: hooks.extraEOSTokens,
+                defaultMaxTokens: sizing.defaultMaxTokens,
+                maxConcurrentRequests: maxConcurrent,
+                kvBytesPerToken: sizing.fp16KVBytesPerToken,
+                kvBudget: kvBudget,
+                prefixCacheBudgetBytes: carve.prefixCacheBudgetBytes,
+                emitTelemetry: hooks.emitTelemetry,
+                makeEngine: { try hookBuilder(modelId, carve.engineKVBytesCapacity) })
+            // WARN once (per load) that kv_quant is ignored on the v2 path
+            // (fp16 caches are what the engine builds).
+            if loopConfig.config.backend.kvQuant {
+                EngineV2Factory.emitKVQuantUnsupportedTelemetry(
+                    modelId: modelId, emitTelemetry: hooks.emitTelemetry)
             }
-            // Same model-specific EOS augmentation as the legacy scheduler
-            // (GPT-OSS/Harmony adds its generation-config action stops).
-            eosTokenIds = BatchScheduler.effectiveEOSTokenIds(
+        } else {
+            let slotLogger = logger
+            bridge = try await EngineV2SlotFactory.makeProductionBridge(
                 modelId: modelId,
                 modelType: modelType,
-                base: snapshot.eosTokenIds,
-                tokenToId: { tokenizer.inner.convertTokenToId($0) }
-            )
-            extraEOSTokens = snapshot.extraEOSTokens
-            emitTelemetry = nil  // production: TelemetryClient.shared
-            let loadedModelDirectory = modelDirectory
-            let slotLogger = logger
-            makeEngine = {
-                // VLM slot: the loaded module is a vision wrapper with no
-                // CBv2 hooks. Extract the CBv2-adapted MLXLLM text model
-                // over the SAME weight arrays (zero extra weight memory) and
-                // build the engine on that; any extraction/verify/parity
-                // failure throws into the factory's engine_v2_fallback WARN.
-                let servingModel: any LanguageModel
-                if isVLM {
-                    guard let loadedModelDirectory else {
-                        throw EngineV2VLMTextExtractionError.missingModelDirectory
-                    }
-                    let extraction = try EngineV2VLMTextExtraction.extractTextModel(
-                        from: snapshot.model, modelDirectory: loadedModelDirectory)
-                    if let parityDiff = extraction.parityMaxAbsLogitDiff {
-                        slotLogger.info(
-                            "engine_v2: \(modelId) VLM text-model extraction passed the "
-                                + "load-time forward parity gate (max |Δlogit| \(parityDiff))")
-                    }
-                    servingModel = extraction.model
-                } else {
-                    servingModel = snapshot.model
-                }
-                return try EngineV2Factory.makeProductionEngine(
-                    model: servingModel,
-                    tokenizer: tokenizer.inner,
-                    kvBytesCapacity: kvBytesCapacity)
-            }
-        }
-
-        guard
-            let bridge = EngineV2Factory.makeBridgeIfSelected(
-                modelId: modelId,
-                configEnabled: configEnabled,
-                environment: environment,
+                isVLM: isVLM,
+                modelDirectory: modelDirectory,
+                container: container,
                 tokenizer: tokenizer,
-                eosTokenIds: eosTokenIds,
-                extraEOSTokens: extraEOSTokens,
-                defaultMaxTokens: defaultMaxTokens,
-                maxConcurrentRequests: EngineV2Factory.productionMaxConcurrentRequests,
-                kvBytesPerToken: kvBytesPerToken,
-                // Shared KV ledger: v2 submissions RESERVE their worst-case
-                // KV here before engine admission (process-wide gate) and the
-                // reservation is what the model-LOAD gate + legacy live-KV
-                // gate subtract. nil ⇒ no shared gating/accounting (unit
-                // tests / the standalone path).
+                sizing: sizing,
+                kvBytesCapacity: kvBytesCapacity,
+                maxConcurrentRequests: maxConcurrent,
                 kvBudget: kvBudget,
-                emitTelemetry: emitTelemetry,
-                makeEngine: makeEngine)
-        else {
-            // Selection said v2, so a nil bridge here is the init-failure
-            // fallback (the factory already emitted the WARN event).
-            logger.warning(
-                "engine_v2: init failed for \(modelId) — serving via the legacy engine")
-            return nil
-        }
-
-        // WARN once (per load) that kv_quant is being ignored on the v2 path.
-        // Emitted ONLY after the v2 bridge actually built (below the guard):
-        // if v2 init failed and the model fell back to the legacy engine,
-        // legacy DOES honor kv_quant, so a "kv_quant unsupported" WARN there
-        // would be untruthful.
-        if kvSizing.warnKVQuantUnsupported {
-            EngineV2Factory.emitKVQuantUnsupportedTelemetry(
-                modelId: modelId, emitTelemetry: emitTelemetry)
+                kvQuantConfigured: loopConfig.config.backend.kvQuant,
+                // SSD-tier metadata binding: the verified hash for the bytes
+                // this slot loaded (nil ⇒ model-id binding degradation).
+                weightHash: liveModelHashes[modelId],
+                logInfo: { slotLogger.info($0) },
+                logWarning: { slotLogger.warning($0) })
         }
 
         // Register before the slot goes live so capacity heartbeats and
         // cancellation fan-out see the bridge from the first request.
+        // (Prefix-cache construction — RAM carve AND the SSD offload tier —
+        // budget bookkeeping, stats loggers, and the cache-state log line
+        // all live inside the shared slot factory.)
         await engineV2Runtime.register(modelId: modelId, bridge: bridge)
         if isVLM {
-            // Distinguish the VLM text-routing mode in prod logs: text
-            // requests serve via v2 over the extracted text model, image/
-            // video requests keep the legacy VLM path.
             logger.info(
                 "engine_v2: serving \(modelId) via ContinuousBatchingV2 "
-                    + "(vlm_text_routing=true: text→v2, image/video→legacy VLM path; "
-                    + "legacy scheduler retained for fallback)")
+                    + "(vlm routing: text→v2, media→v2 multimodal prefill "
+                    + "(image+video, fail-loud))")
         } else {
-            logger.info(
-                "engine_v2: serving \(modelId) via ContinuousBatchingV2 "
-                    + "(legacy scheduler retained for fallback)")
+            logger.info("engine_v2: serving \(modelId) via ContinuousBatchingV2")
         }
         return bridge
     }
-}
-
-/// Model handle + EOS config snapshot pulled out of `ModelContainer.perform`.
-///
-/// `@unchecked Sendable` justification: the module reference crosses the
-/// container's isolation exactly once, at load time, to be handed to the v2
-/// engine — which serializes every use on its own engine thread. This is the
-/// same ownership handoff the legacy `BatchedEngine` performs with
-/// `ctx.model` in `BatchScheduler+EngineFactory`.
-struct EngineV2ModelSnapshot: @unchecked Sendable {
-    let model: any LanguageModel
-    let eosTokenIds: Set<Int>
-    let extraEOSTokens: [String]
 }

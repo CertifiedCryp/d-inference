@@ -272,7 +272,12 @@ func TestIntegration_MultipleRequestsAccounting(t *testing.T) {
 func TestIntegration_E2EEncryptionCorrectness(t *testing.T) {
 	s := startSuite(t)
 
-	resp := postChatCompletions(t, s, "What is 2+2? Answer with just the number.", false, 20)
+	// 256 tokens, not 20: the CBv2 default fixture (gpt-oss-20b) is a
+	// reasoning model — a 20-token cap is consumed entirely by the Harmony
+	// analysis channel and `content` stays empty before the final channel
+	// starts. This test asserts on the decrypted CONTENT, so give the
+	// model room to finish reasoning and answer.
+	resp := postChatCompletions(t, s, "What is 2+2? Answer with just the number.", false, 256)
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
@@ -638,8 +643,10 @@ func TestIntegration_FullNetworkSingleSwiftProviderMultiModelRouting(t *testing.
 		t.Skip("set DARKBLOOM_FULL_NETWORK_SMOKE=1 to run the full coordinator + real Swift provider multi-model smoke")
 	}
 
-	modelA := envOr("DARKBLOOM_FULL_NETWORK_MODEL_A", "mlx-community/Qwen3-0.6B-8bit")
-	modelB := envOr("DARKBLOOM_FULL_NETWORK_MODEL_B", "mlx-community/Qwen2.5-0.5B-Instruct-4bit")
+	// v0.7.5 one-engine: only CBv2-adapted checkpoints can serve, so the
+	// full-network smoke defaults to the production pair.
+	modelA := envOr("DARKBLOOM_FULL_NETWORK_MODEL_A", "mlx-community/gpt-oss-20b-MXFP4-Q8")
+	modelB := envOr("DARKBLOOM_FULL_NETWORK_MODEL_B", "mlx-community/gemma-4-26B-A4B-it-qat-4bit")
 	require.NotEqual(t, modelA, modelB, "full-network smoke requires two distinct model IDs")
 
 	ctx := context.Background()

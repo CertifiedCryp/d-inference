@@ -44,6 +44,13 @@
 /// and use `.withoutEscapingSlashes` so the wire bytes are
 /// deterministic.
 
+// PRESERVED through the v0.7.5 legacy-engine deletion (with `KVCacheKEK`
+// and the Keychain/SE key-wrapping cluster): the encrypted SSD KV-offload
+// tier shipping in v0.7.5 (`feat/v075-ssd`) reuses this chunked AES-GCM
+// store verbatim. Only the checkpoint-shaped consumers
+// (PrefixCacheManager, EncryptedPrefixCachePersistence,
+// CheckpointCapturePipeline) were deleted.
+
 import CryptoKit
 import Foundation
 import os
@@ -247,7 +254,9 @@ public enum EncryptedKVStore {
     /// Synchronous variant of `write` for callers that hold an
     /// already-unwrapped KEK `SymmetricKey` and cannot await the
     /// `KVCacheKEK` actor — notably the engine-step-loop persistence
-    /// backend (`EncryptedPrefixCachePersistence`). Produces an
+    /// backend (the deleted `EncryptedPrefixCachePersistence`;
+    /// the v0.7.5 encrypted SSD KV-offload tier is the successor
+    /// consumer). Produces an
     /// identical on-disk file format; the only difference is the DEK is
     /// wrapped with `kekKey` via synchronous AES-GCM rather than through
     /// the actor.

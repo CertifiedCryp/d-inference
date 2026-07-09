@@ -1,11 +1,12 @@
 /// ProviderLoop -- the main event loop that ties all subsystems together.
 ///
-/// Owns the CoordinatorClient, BatchScheduler, NodeKeyPair, and
+/// Owns the CoordinatorClient, per-model EngineV2 bridges, NodeKeyPair, and
 /// SecureEnclaveIdentity. Processes coordinator events: inference requests,
 /// cancellations, attestation challenges, and connection lifecycle.
 ///
 /// Each inference request spawns its own Task for concurrent processing.
-/// The BatchScheduler manages admission control and model loading.
+/// EngineV2Runtime coordinates capacity and cancellation across model slots;
+/// ProviderLoop owns model loading and lifecycle policy.
 /// Responses are encrypted with the consumer's ephemeral public key
 /// and streamed back through the coordinator.
 
@@ -162,19 +163,16 @@ public actor ProviderLoop {
     internal let cancellationRegistry: InferenceCancellationRegistry
     internal let kvBudget: GlobalKVCacheBudget
     /// Phase 3: global disk accountant (process-wide, shared across models).
-    internal let diskAccountant: GlobalDiskAccountant
     internal let powerAssertion: InferencePowerAssertion
     internal let preloadTaskStarted: (@Sendable (String) -> Void)?
     internal let beforeModelLoad: (@Sendable (String) async -> Void)?
 
-    /// Per-model inference slots. Each loaded model gets its own
-    /// BatchScheduler and worker task. Keyed by model ID.
+    /// Per-model inference slots. Each loaded model gets one EngineV2Bridge.
+    /// Keyed by model ID.
     internal var modelSlots: [String: ModelSlot] = [:]
 
-    /// ContinuousBatchingV2 bridge registry consulted by the capacity and
-    /// cancellation hooks — but ONLY when at least one v2 slot exists (see
-    /// the `hasEngineV2Slots` guards in `ProviderLoop+Capacity` /
-    /// `+Cancellation`), so flag-off providers never pay the actor hop.
+    /// ContinuousBatchingV2 bridge registry consulted by capacity and
+    /// cancellation hooks. It is the sole inference-engine registry in v0.7.5.
     /// Defaults to the process-global instance; tests inject an isolated one.
     internal var engineV2Runtime: EngineV2Runtime = .shared
 
@@ -259,6 +257,27 @@ public actor ProviderLoop {
     /// reentrant loads cannot start against memory that has not been freed yet.
     internal var modelsUnloading: Set<String> = []
     internal var unloadingWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    /// Serializes KV-GRANT mutations: the load-side re-slice
+    /// (`resliceAndBuildEngineV2Slot` — snapshot grants → shrink → build →
+    /// grow/restore) and the unload-side regrow (`resliceGrowSurvivors`).
+    /// Loads are already serialized by `isLoadingAny`, but unloads are NOT
+    /// (the idle monitor calls `unloadModel` from its own task) — without
+    /// this gate an idle-timeout regrow could interleave between a load's
+    /// shrink and its newcomer construction, transiently pushing
+    /// Σ(grants) past the fleet budget or overwriting a restore-on-throw.
+    /// Same waiter idiom as `loadGateWaiters`. Deadlock-free: neither
+    /// gated section calls the other (the eviction-path `unloadModel`
+    /// inside `ensureModelLoaded` runs BEFORE the load's re-slice section).
+    internal var isReslicing: Bool = false
+    internal var resliceGateWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Wedge self-recovery bookkeeping (`ProviderLoop+EngineV2Liveness`):
+    /// per-model timestamp of the last recovery ATTEMPT (the legacy
+    /// `lastSelfRestartAt` cooldown anchor — a second confirmed wedge
+    /// inside `engineV2RecoveryCooldown` unloads the slot instead of
+    /// thrashing rebuilds).
+    internal var engineV2LastRecoveryAt: [String: ContinuousClock.Instant] = [:]
 
     /// Tracks in-flight inference tasks by request ID so they can be cancelled.
     internal var inflightTasks: [String: Task<Void, Never>] = [:]
@@ -459,9 +478,23 @@ public actor ProviderLoop {
         beforeModelLoad: (@Sendable (String) async -> Void)? = nil
     ) throws {
         self.loopConfig = config
+        // Architecture-derived supported set (v0.7.5 fail-loud): the v2
+        // engine is the ONLY engine, so a model whose family has no CBv2
+        // adapter can never serve — advertising it would invite requests
+        // that always 5xx. Drop unsupported families here (the single
+        // chokepoint: registration filters through this set, and the local
+        // /v1/models reads it), and WARN so the operator sees why a model
+        // on disk isn't advertised. A stale-catalog load request for a
+        // dropped id then 404s at the advertised-set guard in
+        // `ensureModelLoaded` — never a silent degrade.
         var advertised: [String: ModelInfo] = [:]
+        var unsupportedModelIds: [String] = []
         for model in config.models where advertised[model.id] == nil {
-            advertised[model.id] = model
+            if EngineV2SupportedModels.isSupported(modelType: model.modelType) {
+                advertised[model.id] = model
+            } else {
+                unsupportedModelIds.append(model.id)
+            }
         }
         self.advertisedModels = advertised
         self.modelHashes = config.modelHashes
@@ -489,19 +522,22 @@ public actor ProviderLoop {
         // loaded. No-op when the configured reserve is ≤ the cap's implied reserve.
         self.kvBudget = GlobalKVCacheBudget(
             configReserveBytes: Self.memoryReserveBytes(forGiB: config.config.provider.memoryReserveGB))
-        // Phase 3: construct the global disk accountant (one per host).
-        let kvRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("darkbloom/kv", isDirectory: true)
-            ?? FileManager.default.temporaryDirectory.appendingPathComponent("darkbloom/kv")
-        self.diskAccountant = GlobalDiskAccountant(
-            kvRoot: kvRoot,
-            configuredCeiling: BatchScheduler.prefixCacheGlobalDiskCeiling(),
-            sweepOnInit: true)  // wipe stale KV from a prior crash before any load
+        // Sweep only the retired checkpoint tier's `darkbloom/kv` directory.
+        // The v0.7.5 EngineV2 SSD tier uses the separate `darkbloom/kv2` root,
+        // so this cleanup cannot delete current cache data.
+        LegacyKVCacheSweeper.sweep()
         self.powerAssertion = InferencePowerAssertion(reason: "Darkbloom inference job active")
         self.preloadTaskStarted = preloadTaskStarted
         self.beforeModelLoad = beforeModelLoad
         self.liveModelHashes = config.modelHashes
         self.modelHashFingerprints = config.modelHashFingerprints
+        // Phase-1 complete — safe to touch self.logger now.
+        if !unsupportedModelIds.isEmpty {
+            logger.warning(
+                "Not advertising \(unsupportedModelIds.count) model(s) without a CBv2 adapter "
+                    + "(v0.7.5 serves everything through engine v2): "
+                    + unsupportedModelIds.sorted().joined(separator: ", "))
+        }
     }
 
     static func memoryReserveBytes(forGiB gb: UInt64) -> UInt64 {
@@ -529,18 +565,20 @@ public actor ProviderLoop {
     }
 
     internal struct ModelSlot {
-        let scheduler: BatchScheduler
-        /// ContinuousBatchingV2 bridge for this slot — non-nil ONLY when
-        /// `EngineV2Config` selected the v2 engine at load time AND its
-        /// construction succeeded. Stored ALONGSIDE (never replacing) the
-        /// legacy scheduler: requests route through the bridge when present,
-        /// and every fallback path (flag off, non-allowlisted model, v2 init
-        /// failure) leaves this nil and serves via `scheduler` unchanged.
-        let engineV2: EngineV2Bridge?
+        /// ContinuousBatchingV2 bridge — the ONE engine this slot serves
+        /// through (v0.7.5): every chat request routes here; there is no
+        /// legacy scheduler on the slot anymore. Construction failure means
+        /// the slot never exists (`ensureModelLoaded` unloads + 503s).
+        let engineV2: EngineV2Bridge
+        /// Retained for VLM vision preprocessing (the tower shares weights
+        /// with the extracted text model) and for liveness rebuilds.
         let container: MLXLMCommon.ModelContainer
         let tokenizer: TokenizerHandle
-        /// Vision-language model (config has `vision_config`). Multimodal
-        /// requests are served from `container` via the non-batched path.
+        /// Scheduler-free sizing facts (weights, fp16 KV rate, context) —
+        /// feeds re-slicing, heartbeat fleet context, and the vision gate.
+        let sizing: SlotSizingSnapshot
+        /// Vision-language model (config has `vision_config`). The container
+        /// supplies vision preprocessing before multimodal EngineV2 prefill.
         let isVLM: Bool
         /// Model type (e.g. "gemma"), captured at load. Authoritative for the
         /// reasoning-parser choice for as long as the model can serve — read
@@ -549,6 +587,32 @@ public actor ProviderLoop {
         /// otherwise fall back to the qwen3 parser and leak <think> tokens).
         let modelType: String?
         var lastInferenceAt: ContinuousClock.Instant
+
+        /// Per-slot memory gate for VLM media decode and generation KV against
+        /// the shared `GlobalKVCacheBudget`.
+        func visionGate(kvBudget: GlobalKVCacheBudget?) -> VisionMemoryGate {
+            VisionMemoryGate(
+                kvBudget: kvBudget,
+                fp16KVBytesPerToken: sizing.fp16KVBytesPerToken,
+                contextLength: sizing.maxContextLength
+            )
+        }
+    }
+
+    /// Effective concurrent-request cap for a v2 engine slot: the
+    /// per-model override when configured, else the box-wide
+    /// `engine_v2_max_concurrent`, clamped to [1, 8] (the CBv2 product
+    /// ceiling — see `BackendSettings.engineV2MaxConcurrent`).
+    internal func engineV2MaxConcurrent(forModel modelId: String) -> Int {
+        let backend = loopConfig.config.backend
+        let raw = backend.engineV2MaxConcurrentByModel[modelId]
+            ?? backend.engineV2MaxConcurrent
+        return Self.clampEngineV2Concurrency(raw)
+    }
+
+    /// Pure clamp for the configured concurrency (unit-testable).
+    internal static func clampEngineV2Concurrency(_ raw: UInt64) -> Int {
+        Int(min(max(raw, 1), 8))
     }
 
     /// Try persistent keychain-backed SE key first; fall back to ephemeral CryptoKit key.
@@ -595,7 +659,8 @@ public actor ProviderLoop {
     //   - ProviderLoop+Capacity.swift            capacity refresh + updateAggregateCapacity
     //   - ProviderLoop+AutoUpdate.swift          background self-update + phase transitions
     //   - ProviderLoop+ModelLoading.swift        ensureModelLoaded/unload + memory admission
-    //   - ProviderLoop+EngineV2.swift            ContinuousBatchingV2 slot wiring (flag-gated)
+    //   - ProviderLoop+EngineV2.swift            ContinuousBatchingV2 slot wiring
+    //   - ProviderLoop+EngineV2Liveness.swift    wedge self-recovery (drain → rebuild → swap)
     //   - ProviderLoop+Cancellation.swift        cancellation + in-flight drain
     //   - ProviderLoop+AttestationChallenge.swift attestation + APNs code challenge
     //   - ProviderLoop+LocalEndpoint.swift       unified local HTTP endpoint
@@ -610,4 +675,3 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXVLM
-

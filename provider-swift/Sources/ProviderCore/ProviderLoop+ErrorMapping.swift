@@ -28,6 +28,18 @@ extension ProviderLoop {
     /// capacity-timeout = 503, invalid role = 400, model not found =
     /// 404).
     static func mapInferenceErrorToStatus(_ error: Error) -> UInt16 {
+        // Task cancellation is the CALLER going away (consumer cancel /
+        // coordinator disconnect propagated via handleCancellation's
+        // task.cancel()), never a provider fault: 499 (client closed
+        // request), matching the mid-stream cancel terminal's wire shape.
+        // The coordinator-path pre-stream catch special-cases this before
+        // mapping (canonical "request cancelled" + the cancellations stat);
+        // this entry is defense-in-depth for every other mapper call site
+        // (the standalone --local HTTP path) so a cancel can never surface
+        // as a 500 provider error anywhere.
+        if error is CancellationError {
+            return 499
+        }
         if let svcErr = error as? MLXOpenAIServiceError {
             switch svcErr {
             case .invalidResponseFormatOutput:
@@ -58,6 +70,17 @@ extension ProviderLoop {
                 // Client fault: media sent to a non-VLM model. Fails
                 // identically on retry, so 400 (not a 5xx/retry signal).
                 return 400
+            case .multimodalRejected:
+                // v2 engine rejected the media submission at submit time
+                // (bad spans / embedding mismatch / block over the per-step
+                // budget / non-multimodal model or backend), or the routing
+                // engine's deterministic no-consumable-media shape (every
+                // media part on a non-user role). Deterministic for this
+                // request/engine pairing — 400, never a retry signal.
+                // (Other provider-side construction failures refuse loudly
+                // as `.requestRejected` → 503 so the coordinator reroutes;
+                // the pre-release legacy fallback is gone.)
+                return 400
             case .generationFailed:
                 return 500
             }
@@ -65,9 +88,9 @@ extension ProviderLoop {
         // VLM inline-media decode errors. All but the temp-file write are
         // client faults (a malformed/oversized/non-`data:` payload the caller
         // controls) → 400. `videoWriteFailed` is a provider-side IO failure
-        // → 500. These propagate up from `VLMRequestInference.stream`'s
+        // → 500. These propagate up from `MediaIngest.stream`'s
         // `continuation.finish(throwing:)` through the engine wrapper.
-        if let mediaErr = error as? VLMRequestInference.MediaError {
+        if let mediaErr = error as? MediaIngest.MediaError {
             switch mediaErr {
             case .malformedDataURI,
                 .base64DecodeFailed,

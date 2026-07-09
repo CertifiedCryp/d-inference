@@ -2,12 +2,12 @@
 //
 // Production CBv2 engine construction over an ALREADY-LOADED model.
 //
-// `EngineV2Factory.makeBridgeIfSelected` takes the engine as a closure so
-// selection/fallback logic stays engine-agnostic and unit-testable with a
+// `EngineV2Factory.makeBridge` takes the engine as a closure so the
+// refusal/telemetry logic stays engine-agnostic and unit-testable with a
 // scripted stub. This file supplies the closure's production body: assemble
 // the real `MLXLMCommon.EngineV2` from the model the provider just loaded
 // (no re-download, no second weight copy — the engine retains the same
-// module instance the legacy `BatchedEngine` serves) plus the v2 runtime
+// module instance retained by the loaded model container) plus the runtime
 // pieces:
 //
 //   * layer kinds + per-layer attending caches from the model's own
@@ -20,17 +20,17 @@
 //   * `CBv2DefaultSampler` + `CBv2TextDetokenizerFactory` (real incremental
 //     detokenization with stop-string holdback).
 //
-// Any throw here lands in `makeBridgeIfSelected`'s catch: WARN
-// `engine_health` telemetry (`operation=engine_v2_fallback`) + silent
-// legacy fallback — a provider can never lose serving capacity to a v2
-// construction failure.
+// Any throw here lands in `makeBridge`'s catch (v0.7.5 fail-loud): ERROR
+// `engine_health` telemetry (`operation=engine_v2_refusal`) + rethrow —
+// the load fails with a 503 and the coordinator reroutes. There is no
+// legacy engine to fall back to.
 
 import Foundation
 import MLXLLM
 import MLXLMCommon
 
 /// Failure modes of production v2-engine construction. Each maps to the
-/// factory's safe-fallback path (WARN telemetry + legacy engine).
+/// factory's REFUSAL path (ERROR `engine_v2_refusal` telemetry + throw).
 enum EngineV2ProductionError: Error, CustomStringConvertible {
     /// The loaded module is not a CBv2-adapted family (an unexpected
     /// architecture). Allowlisted Gemma 4 VLM wrappers do NOT land here —
@@ -38,8 +38,8 @@ enum EngineV2ProductionError: Error, CustomStringConvertible {
     /// (`EngineV2VLMTextExtraction`) and hands THAT to this factory.
     case unsupportedModel(String)
     /// No KV byte budget is left under the unified-memory cap — an engine
-    /// admitted with a zero ceiling would reject every request, so fall
-    /// back to the legacy scheduler's shared-budget path instead.
+    /// admitted with a zero ceiling would reject every request, so the
+    /// load is refused (503; the coordinator reroutes).
     case noKVHeadroom
 
     var description: String {
@@ -71,7 +71,40 @@ extension EngineV2Factory {
     /// follows the CBv2 product target (4, max 8) rather than the legacy
     /// scheduler's 24-way ceiling — the v2 rollout is deliberately
     /// conservative and the coordinator sees the true value in heartbeats.
-    static let productionMaxConcurrentRequests = 4
+    public static let productionMaxConcurrentRequests = 4
+
+    /// The model's prefix-cache adoption bound (`PrefixCachePolicy
+    /// .adoptionBoundTokens` over the model's own `cbv2LayerKinds`), kept
+    /// NEXT TO the authoritative family switch in `makeProductionEngine` so
+    /// the two can never drift. Unknown families return 0 — treated as
+    /// "fund" by the gate (pure-full-attention semantics; such a model
+    /// throws `unsupportedModel` before any cache matters anyway).
+    static func adoptionBoundTokens(model: any LanguageModel) -> Int {
+        switch model {
+        case let gemma as Gemma4TextModel:
+            return PrefixCachePolicy.adoptionBoundTokens(layerKinds: gemma.cbv2LayerKinds)
+        case let gptoss as GPTOSSModel:
+            return PrefixCachePolicy.adoptionBoundTokens(layerKinds: gptoss.cbv2LayerKinds)
+        default:
+            return 0
+        }
+    }
+
+    /// The model's CBv2 layer kinds, or nil for a non-adapted family
+    /// (which throws `unsupportedModel` at engine construction anyway).
+    /// Needed by the SSD prefix cache's construction (layout-epoch
+    /// binding + adoption bound) — kept NEXT TO the authoritative family
+    /// switch, like `adoptionBoundTokens`, so the two can never drift.
+    static func cbv2LayerKinds(model: any LanguageModel) -> [CBv2LayerKind]? {
+        switch model {
+        case let gemma as Gemma4TextModel:
+            return gemma.cbv2LayerKinds
+        case let gptoss as GPTOSSModel:
+            return gptoss.cbv2LayerKinds
+        default:
+            return nil
+        }
+    }
 
     /// Build the real `EngineV2` over a loaded model.
     ///
@@ -80,12 +113,37 @@ extension EngineV2Factory {
     ///     engine serves — weights are shared, never duplicated).
     ///   - tokenizer: the model's tokenizer, for incremental detokenization.
     ///   - kvBytesCapacity: admission ceiling for sequence KV, in bytes
-    ///     (derive from `UnifiedMemoryCap.kvBudgetBytes`).
+    ///     (derive from `UnifiedMemoryCap.kvBudgetBytes`). When a prefix
+    ///     cache is supplied, the caller has ALREADY carved that cache's
+    ///     byte budget out of this figure (`PrefixCachePolicy.carve`) so
+    ///     cached KV + live-request KV can never jointly exceed the slot's
+    ///     grant under the unified-memory cap.
+    ///   - prefixCache: v2 prefix cache — either the RAM `PrefixCacheV2`
+    ///     (`PrefixCachePolicy.makePrefixCache`, opt-in-experimental) or
+    ///     the provider's `SSDPrefixCache` (the v0.7.5 encrypted SSD
+    ///     offload tier, default for supported models with per-donation
+    ///     benefit gating and zero memory carve).
+    ///     Widened to the existential (`any CBv2PrefixCache`) so
+    ///     provider-side conformers plug in with ZERO mlx-swift-lm
+    ///     changes (the engine already stores the cache existentially).
+    ///     Gate + budget + carve + tier selection are the caller's job.
+    ///     Non-nil ⇒ the engine runs with `enablePrefixCache: true`
+    ///     (lookup/adopt on submit, donate on finish, per-request
+    ///     `cacheSalt` tenant scoping live). nil means cache unavailable or
+    ///     disabled. Threat model: T-041 (SSD tier: at-rest
+    ///     artifacts with HMAC-keyed names — leak #2 closed; the in-process
+    ///     cross-tenant TTFT oracle stays the SEC-035 accepted risk).
     ///   - maxConcurrentRequests: concurrent-decode row cap.
-    static func makeProductionEngine(
+    /// PUBLIC: the perf-gate benchmark harness (`ProviderBenchmark`'s
+    /// `ThroughputSweep`/`SchedulerPrefillBenchmark`) builds its engines
+    /// through this exact production entry point so the numbers it reports
+    /// are the engine the fleet serves with — never a parallel construction
+    /// that could drift.
+    public static func makeProductionEngine(
         model: any LanguageModel,
         tokenizer: any MLXLMCommon.Tokenizer,
         kvBytesCapacity: Int,
+        prefixCache: (any CBv2PrefixCache)? = nil,
         maxConcurrentRequests: Int = EngineV2Factory.productionMaxConcurrentRequests
     ) throws -> any CBv2Engine {
         guard kvBytesCapacity > 0 else {
@@ -136,10 +194,13 @@ extension EngineV2Factory {
             sampler: CBv2DefaultSampler(),
             detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: tokenizer),
             schedulerConfig: CBv2SchedulerConfig(
-                maxConcurrentRequests: max(1, maxConcurrentRequests)),
-            // TB-007: the v2 prefix cache stays OFF until it has its own
-            // threat-model review (cross-tenant prefix sharing channel).
-            prefixCache: nil
+                maxConcurrentRequests: max(1, maxConcurrentRequests),
+                enablePrefixCache: prefixCache != nil),
+            // TB-007 / T-041 (v0.7.5): this CBv2 cache is either the
+            // default-on encrypted SSD tier or the opt-in RAM PrefixCacheV2
+            // tier. Both use per-request cacheSalt scoping; selection and
+            // budgets live in PrefixCachePolicy.
+            prefixCache: prefixCache
         )
     }
 }

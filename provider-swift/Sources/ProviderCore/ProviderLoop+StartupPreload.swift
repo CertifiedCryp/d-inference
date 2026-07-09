@@ -8,8 +8,8 @@
 ///
 /// Now `run()` calls `runStartupPreloadGate()` BEFORE the coordinator client
 /// is created: the previously-served (or operator-configured) model set is
-/// loaded via the normal `ensureModelLoaded` path (weights + legacy scheduler
-/// + v2 bridge/warmup when flagged), optionally followed by a 1-token greedy
+/// loaded via the normal `ensureModelLoaded` path (weights + EngineV2 bridge),
+/// optionally followed by a 1-token greedy
 /// decode through the real serving path so Metal JIT, compiled buckets, and
 /// the chat-template render are warm before the first routed request.
 ///
@@ -245,7 +245,7 @@ extension ProviderLoop {
         return try await withThrowingTaskGroup(of: Duration.self) { group in
             group.addTask { try await me.runStartupSelfTestDecode(modelId: modelId) }
             group.addTask {
-                try await Task.sleep(for: Self.startupSelfTestTimeout)
+                try await taskSleep( Self.startupSelfTestTimeout)
                 throw InferenceError.generationFailed(
                     "startup self-test timed out after \(Self.startupSelfTestTimeout.components.seconds)s")
             }
@@ -281,8 +281,7 @@ extension ProviderLoop {
     // MARK: - Self-test decode (the serving path)
 
     /// One-token greedy decode through the SAME path a routed request takes:
-    /// `MultiModelBatchSchedulerEngine` over the loaded slot (v2 bridge when
-    /// the slot carries one, else the legacy scheduler) via
+    /// `MultiModelBatchSchedulerEngine` over the loaded slot's EngineV2 bridge via
     /// `MLXOpenAIService.streamChatCompletionFrames`. Forces end-to-end
     /// warmth — Metal JIT, compiled decode buckets, chat-template render —
     /// with a tiny prompt. Holds a local reservation so eviction can't pull
@@ -297,12 +296,12 @@ extension ProviderLoop {
             modelSlots[modelId]?.lastInferenceAt = .now
         }
 
-        let sched = slot.scheduler
         let tokenizer = slot.tokenizer
         let modelType = slot.modelType
         let slotContainer = slot.container
         let slotIsVLM = slot.isVLM
         let slotEngineV2 = slot.engineV2
+        let slotVisionGate = slot.visionGate(kvBudget: kvBudget)
 
         let request = OpenAIChatCompletionRequest(
             model: modelId,
@@ -316,9 +315,10 @@ extension ProviderLoop {
         let engine = MultiModelBatchSchedulerEngine(
             registryProvider: { @Sendable in
                 [modelId: .init(
-                    scheduler: sched, tokenizer: tokenizer, modelType: modelType,
+                    tokenizer: tokenizer, modelType: modelType,
                     container: slotContainer, isVLM: slotIsVLM,
-                    engineV2Bridge: slotEngineV2)]
+                    engineV2Bridge: slotEngineV2,
+                    visionGate: slotVisionGate)]
             },
             defaultMaxTokens: Self.schedulerDefaultMaxTokens
         )

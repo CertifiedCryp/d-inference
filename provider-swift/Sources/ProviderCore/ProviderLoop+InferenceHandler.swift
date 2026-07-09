@@ -176,12 +176,10 @@ extension ProviderLoop {
         let cacheScope = Self.extractCacheScope(from: decryptedData)
         // OpenAI `logprobs` / `top_logprobs` (also absent from the upstream
         // request shape). Non-nil only when the request asked for logprobs;
-        // honored on the v2 engine path (the legacy engine never emitted
-        // logprobs — see EngineV2Logprobs.swift).
+        // honored by the EngineV2 path (see EngineV2Logprobs.swift).
         let logprobsSpec = Self.extractLogprobsSpec(from: decryptedData)
         // OpenAI `logit_bias` / `seed` (also absent from the upstream request
-        // shape). Overlaid onto the v2 engine translation; the legacy path
-        // never honored either knob and is untouched.
+        // shape). Overlaid onto the EngineV2 translation.
         let samplingOverrides = Self.extractSamplingOverrides(from: decryptedData)
 
         // 3. Fast pre-accept admission check. The coordinator accepts fast and
@@ -267,7 +265,6 @@ extension ProviderLoop {
         // 7. Capture values for the spawned task
         let responsePublicKeyData: Data = senderKey
         let kp = self.keyPair
-        let sched = slot.scheduler
         let providerStats = self.stats
         let registry = self.cancellationRegistry
         let signingIdentity = self.signer
@@ -281,22 +278,22 @@ extension ProviderLoop {
         let modelType = slot.modelType
         let slotContainer = slot.container
         let slotIsVLM = slot.isVLM
-        // ContinuousBatchingV2 (flag-gated): non-nil only when the slot was
-        // loaded with a v2 bridge. The engine below routes text generation
-        // through it; nil keeps the legacy scheduler path byte-identical.
+        // ONE ENGINE (v0.7.5): the slot's v2 bridge serves every request;
+        // the scheduler-free vision gate covers media decode and generation
+        // memory reservations.
         let slotEngineV2 = slot.engineV2
-        // Logprobs passthrough (v2 only): a per-request channel the bridge
-        // pump fills with OpenAI-shaped entries and the frames loop below
-        // drains into content-bearing SSE chunks. nil (request didn't ask,
-        // or the slot serves via legacy) ⇒ frames pass through untouched.
+        let slotVisionGate = slot.visionGate(kvBudget: kvBudget)
+        // Logprobs passthrough: a per-request channel the bridge pump fills
+        // with OpenAI-shaped entries and the frames loop below drains into
+        // content-bearing SSE chunks. nil (request didn't ask) ⇒ frames
+        // pass through untouched.
         let logprobsChannel: EngineV2LogprobsChannel? =
-            (logprobsSpec != nil && slotEngineV2 != nil)
-            ? EngineV2LogprobsChannel() : nil
+            logprobsSpec != nil ? EngineV2LogprobsChannel() : nil
 
         // 8. Spawn inference task. The streaming pipeline now flows through
         // the upstream `MLXLMServer` library:
-        //   - `MultiModelBatchSchedulerEngine` adapts our `BatchScheduler` to
-        //     the `MLXServerEngine` contract.
+        //   - `MultiModelBatchSchedulerEngine` adapts the selected slot's
+        //     EngineV2 bridge to the `MLXServerEngine` contract.
         //   - `MLXOpenAIService.streamChatCompletionFrames` formats SSE
         //     frames (matching the wire shape the coordinator already parses).
         // We encrypt each frame and forward it via `inferenceChunk` exactly
@@ -373,6 +370,13 @@ extension ProviderLoop {
                 return true
             }
 
+            // Per-request v2 usage-detail signal (prefixCacheHitTokens):
+            // written by the bridge pump at the engine terminal, read below
+            // when the trailing usage chunk arrives so cached_tokens can be
+            // spliced into it. Every slot serves through v2 (v0.7.5), so
+            // the signal always exists.
+            let v2UsageSignal = EngineV2RequestUsageSignal()
+
             // Build a single-model engine view bound to the scheduler we
             // already resolved. This keeps the engine constructor's
             // "model not loaded" path unreachable on this code path while
@@ -380,9 +384,10 @@ extension ProviderLoop {
             let providerEngine = MultiModelBatchSchedulerEngine(
                 registryProvider: { @Sendable in
                     [chatRequest.model: .init(
-                        scheduler: sched, tokenizer: tokenizer, modelType: modelType,
+                        tokenizer: tokenizer, modelType: modelType,
                         container: slotContainer, isVLM: slotIsVLM,
-                        engineV2Bridge: slotEngineV2)]
+                        engineV2Bridge: slotEngineV2,
+                        visionGate: slotVisionGate)]
                 },
                 ensureLoaded: { _ in },
                 reserveModel: { _ in },
@@ -394,7 +399,8 @@ extension ProviderLoop {
                     EngineV2LogprobsPlumbing(
                         topLogprobs: logprobsSpec?.topLogprobs, channel: $0)
                 },
-                engineV2Sampling: samplingOverrides
+                engineV2Sampling: samplingOverrides,
+                engineV2Usage: v2UsageSignal
             )
 
             // Force-stream so we get SSE frames even if the original request
@@ -433,6 +439,29 @@ extension ProviderLoop {
                     request: streamingRequest
                 )
             } catch {
+                // A cancel that lands while the stream is STARTING — the
+                // consumer cancelled during prompt templating or the v0.7.5
+                // vision-feature construction (`handleCancellation` cancels
+                // this detached task, and the vision seam rethrows
+                // CancellationError instead of falling back to legacy) — is
+                // not a provider fault. Report it exactly like the
+                // established "cancelled with nothing delivered" terminal
+                // below (499 + "request cancelled", cancellations-before-
+                // output stat), never a mapped 500 .inferenceError, which
+                // would count as a provider error and trip the
+                // (provider, model) 5xx routing cooldown for a client's own
+                // cancel.
+                if error is CancellationError || token.isCancelled {
+                    log.info("[\(requestId)] Request cancelled while starting the stream")
+                    providerStats.incrementCancellationsBeforeOutput()
+                    send.send(.inferenceError(
+                        requestId: requestId,
+                        error: "request cancelled",
+                        statusCode: 499,
+                        errorReason: nil
+                    ))
+                    return
+                }
                 log.error("[\(requestId)] Failed to start stream: \(error)")
                 let statusCode = Self.mapInferenceErrorToStatus(error)
                 // Classify HERE, where the real `Error` (and its rich
@@ -589,6 +618,21 @@ extension ProviderLoop {
                                 )
                                 frameToEmit = Self.injectReasoningTokens(
                                     into: frame, reasoningTokens: reasoningTokens
+                                )
+                            }
+                            // v2 prefix cache (T-041): splice OpenAI-standard
+                            // `prompt_tokens_details.cached_tokens` into the
+                            // trailing usage chunk. The bridge pump recorded
+                            // the signal BEFORE yielding its terminal, which
+                            // happens-before this usage frame was encoded, so
+                            // the read is never racy. Operates on frameToEmit
+                            // (composes with the reasoning splice above);
+                            // absent/zero hits leave the frame untouched.
+                            // Billing is unaffected — the coordinator settles
+                            // from inference_complete, not from this field.
+                            if let hits = v2UsageSignal.prefixCacheHitTokens, hits > 0 {
+                                frameToEmit = Self.injectCachedTokens(
+                                    into: frameToEmit, cachedTokens: hits
                                 )
                             }
                         }

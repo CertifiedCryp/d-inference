@@ -1,8 +1,8 @@
 // Copyright © 2026 Eigen Labs.
 //
 // Typed errors emitted by ``MultiModelBatchSchedulerEngine`` and the
-// scheduler-message parser that promotes BatchScheduler `.error(...)`
-// payloads into those typed cases.
+// generation-message parser that promotes structured `.error(...)` payloads
+// into those typed cases.
 //
 // Split out of `MultiModelBatchSchedulerEngine.swift` so the error
 // surface and its message-prefix dictionary stay self-contained and
@@ -14,8 +14,8 @@ import Foundation
 /// Errors surfaced by ``MultiModelBatchSchedulerEngine`` that map to
 /// HTTP-status-bearing OpenAI error responses upstream.
 ///
-/// The scheduler emits `.error(String)` events with structured message
-/// prefixes (see ``BatchScheduler``); the engine translates those into
+/// EngineV2Bridge emits `.error(String)` events with structured message
+/// prefixes; the adapter translates those into
 /// typed cases here so ``ProviderLoop/mapInferenceErrorToStatus(_:)``
 /// can return retry/backoff-bearing status codes (429/503) instead of
 /// collapsing every admission failure into a generic 500.
@@ -56,6 +56,13 @@ public enum MultiModelBatchSchedulerEngineError: Error, LocalizedError, Equatabl
     /// will fail identically on retry, so it surfaces as 400 — never let
     /// media silently fall through to the text-only path.
     case mediaUnsupportedByModel(String)
+    /// The v2 engine rejected a vision (multimodal) submission at submit
+    /// time (`CBv2MultimodalError` → the canonical `multimodal_rejected:`
+    /// message, see `EngineV2Translation.admissionErrorMessage`). Every
+    /// such rejection is deterministic for the request/engine pairing —
+    /// never transient capacity — so it surfaces as 400, not a retry
+    /// signal.
+    case multimodalRejected(String)
 
     public var errorDescription: String? {
         switch self {
@@ -78,12 +85,14 @@ public enum MultiModelBatchSchedulerEngineError: Error, LocalizedError, Equatabl
         case .mediaUnsupportedByModel(let id):
             return
                 "Model '\(id)' does not support image or video input on this provider"
+        case .multimodalRejected(let message):
+            return message
         }
     }
 
-    /// Map a `BatchScheduler` `.error(message)` payload into a typed
-    /// engine error. Recognises the structured prefixes that
-    /// ``BatchScheduler`` and its planner emit; anything else stays
+    /// Map a generation `.error(message)` payload into a typed engine error.
+    /// Recognises the structured prefixes emitted by EngineV2 translation and
+    /// admission; anything else stays
     /// as ``generationFailed`` so the operator-facing message is
     /// preserved verbatim.
     ///
@@ -93,6 +102,13 @@ public enum MultiModelBatchSchedulerEngineError: Error, LocalizedError, Equatabl
     /// `token_budget_exhausted: request queue full`.
     static func fromSchedulerMessage(_ message: String) -> MultiModelBatchSchedulerEngineError {
         let lowercased = message.lowercased()
+        // v2 vision submit rejections (`EngineV2Translation
+        // .admissionErrorMessage` for `CBv2MultimodalError`). Checked first:
+        // deterministic 400s that must never be mistaken for retryable
+        // capacity by the broader substring checks below.
+        if lowercased.hasPrefix(EngineV2Translation.multimodalRejectedPrefix) {
+            return .multimodalRejected(message)
+        }
         // Planner validation failures share the `token_budget_exhausted:`
         // prefix but are request-shape errors, NOT transient capacity
         // exhaustion. Map them to 400 (`.requestRejected`) so clients

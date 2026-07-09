@@ -20,68 +20,80 @@ extension ProviderLoop {
     internal func startCapacityRefreshMonitor() {
         capacityRefreshTask?.cancel()
         let heartbeatInterval = max(1, loopConfig.config.coordinator.heartbeatIntervalSecs)
-        let pollInterval = Duration.seconds(Int64(max(1, heartbeatInterval / 2)))
+        let pollIntervalNs = UInt64(max(1, heartbeatInterval / 2)) * 1_000_000_000
         let me = self
         capacityRefreshTask = Task {
             // Write once immediately so `status`/`doctor` have a fresh file soon
             // after the daemon starts, before the first poll interval elapses.
             await me.writeDaemonState()
             while !Task.isCancelled {
-                try? await Task.sleep(for: pollInterval)
+                // `Task.sleep(nanoseconds:)` — NOT the Duration/Clock
+                // overload. Under -O (Swift 6.3, macOS 26) the generic
+                // `taskSleep(tolerance:clock:)` inlined into this loop
+                // aborted the process ~2 s after startup with the task
+                // allocator's "freed pointer was not the last allocation"
+                // (swift_task_dealloc LIFO violation) — reproduced 100% in
+                // the E2E harness from the v0.7.5 integration head and
+                // absent in debug builds. The non-generic nanoseconds
+                // overload takes a different codegen path and is stable.
+                // See the v0.7.5 integration report; revisit on a toolchain
+                // bump.
+                try? await Task.sleep(nanoseconds: pollIntervalNs)
                 if Task.isCancelled { break }
-                await me.updateAggregateCapacity()
-                // Refresh the diagnostics state file on the same cadence so
-                // `status`/`doctor` see current model, stats, and capacity.
-                await me.writeDaemonState()
+                // One actor hop per tick: capacity snapshot, wedge
+                // self-recovery (ProviderLoop+EngineV2Liveness — the
+                // capacity snapshot is where the v2 wedge verdict
+                // surfaces and this is what ACTS on a confirmed one),
+                // then the diagnostics state file for `status`/`doctor`.
+                await me.capacityRefreshTick()
             }
         }
     }
 
+    /// One capacity-monitor tick, isolated on the loop actor.
+    internal func capacityRefreshTick() async {
+        await updateAggregateCapacity()
+        await recoverWedgedEngineV2Slots()
+        writeDaemonState()
+    }
+
     internal func updateAggregateCapacity() async {
+        // ONE ENGINE (v0.7.5): `EngineV2Runtime.capacitySummary` is the ONLY
+        // slot source — every loaded model serves through a v2 bridge; the
+        // legacy scheduler fold is gone. Same `BackendSlotCapacity` wire
+        // shape, same slot-state strings ("idle"/"running"/"crashed").
         var allSlots: [BackendSlotCapacity] = []
         var totalActive = 0
-        let slots = modelSlots.filter { !modelsUnloading.contains($0.key) }
-        for (_, slot) in slots {
-            // A v2-served slot reports through its bridge (folded in below via
-            // the runtime). Its legacy scheduler is a dormant fallback that
-            // serves no requests while the bridge exists — reporting BOTH
-            // would advertise the same model's capacity twice and over-admit.
-            if slot.engineV2 != nil { continue }
-            let cap = await slot.scheduler.backendCapacity()
-            allSlots.append(contentsOf: cap.slots)
-            let schedCap = await slot.scheduler.capacity()
-            totalActive += schedCap.activeRequests
-        }
-
-        // ContinuousBatchingV2 (flag-gated, additive): fold any active v2
-        // bridge slots into the SAME heartbeat payload — identical protocol
-        // fields, truthful bytes-derived token numbers (see
-        // `EngineV2Bridge+Capacity`). Guarded on the slot set so the flag-off
-        // steady state pays ZERO extra cost here — no runtime actor hop, no
-        // allocations; legacy behavior is byte-identical.
         if hasEngineV2Slots {
-            // Fleet context for the v2 budget clamp (round-3 PR#499 P2): v2
-            // ceilings are construction-fixed, so a model loaded AFTER a
-            // bridge (legacy or v2) would otherwise leave that bridge's
-            // heartbeat advertising a stale `activeTokenBudgetMax` — the
-            // coordinator keeps routing what the shared KV gate then rejects
-            // post-acceptance. Snapshot the CURRENT resident set (ALL slots'
-            // weights — v2 and legacy, including slots mid-unload whose
-            // weights are still resident) + the operator reserve so the
-            // runtime can recompute each bridge's live budget and clamp the
-            // reported max. Heartbeat cadence only — never the submit path.
+            // Fleet context for the v2 budget clamp: engine grants are now
+            // RE-SLICED at load/unload, so between re-slices this clamp is a
+            // near-inert safety net — but it stays: it recomputes each
+            // bridge's live budget from CURRENT fleet residency (weights of
+            // ALL slots, including mid-unload ones whose bytes are still
+            // resident) so the reported max can never advertise capacity the
+            // shared KV gate would reject. The runtime reads each engine's
+            // CURRENT (post-re-slice) grant per heartbeat — never a stale
+            // construction-time figure. Heartbeat cadence only.
             var totalResidentWeightBytes: UInt64 = 0
             for (_, slot) in modelSlots {
-                let weights = await slot.scheduler.modelWeightBytes
                 let (sum, overflow) = totalResidentWeightBytes
-                    .addingReportingOverflow(UInt64(max(0, weights)))
+                    .addingReportingOverflow(UInt64(max(0, slot.sizing.weightsBytes)))
                 totalResidentWeightBytes = overflow ? .max : sum
             }
+            // Physical memory MUST come from the same source the re-slice
+            // grant arithmetic uses (`fleetKVBudgetBytes`): the test hooks'
+            // override when installed, the machine's real memory otherwise.
+            // Mixing sources makes the clamp bind spuriously on any box
+            // smaller than the hooked figure (grants computed against the
+            // override, clamp against real RAM) — nil hooks ⇒ production
+            // behavior unchanged.
             let engineV2 = await engineV2Runtime.capacitySummary(
                 fleetKV: EngineV2Runtime.FleetKVContext(
                     totalResidentWeightBytes: totalResidentWeightBytes,
                     configReserveBytes: Self.memoryReserveBytes(
-                        forGiB: loopConfig.config.provider.memoryReserveGB)))
+                        forGiB: loopConfig.config.provider.memoryReserveGB),
+                    physicalBytes: engineV2SlotHooks?.physicalMemoryBytes
+                        ?? ProcessInfo.processInfo.physicalMemory))
             allSlots.append(contentsOf: engineV2.slots)
             totalActive += engineV2.activeRequests
         }

@@ -19,16 +19,26 @@ extension ProviderLoop {
     // MARK: - Main Run Loop
 
     public func run() async throws {
-        // FIRST, before any engine/model code can latch the library's
-        // `CompiledDecode.isEnabled` static: force the legacy engine's
-        // compiled decode OFF unless the operator opted in via config
-        // (`legacy_compiled_decode = true`) or set the env var explicitly
-        // (which always wins). Keeps release behavior identical to prod
-        // v0.6.30 — see `LegacyCompiledDecodeGate`.
-        if LegacyCompiledDecodeGate.apply(
-            configEnabled: loopConfig.config.backend.legacyCompiledDecode)
-        {
-            logger.info("Legacy compiled decode disabled (legacy_compiled_decode=false, env unset)")
+        // v0.7.5 one-engine: the v2 selection knobs are retired — warn
+        // operators still setting them so nobody believes a kill switch
+        // exists that doesn't. Selection is unconditional; rollback is
+        // release-level.
+        for retired in EngineV2Config.retiredEnvironmentKeysSet() {
+            logger.warning(
+                "\(retired) is retired and IGNORED as of v0.7.5 — the v2 engine serves "
+                    + "everything; rollback is release-level, not a per-box switch")
+        }
+        for retired in loopConfig.config.backend.retiredKeysPresent {
+            logger.warning(
+                "provider.toml sets [backend] \(retired), which is retired and IGNORED as "
+                    + "of v0.7.5 (one engine) — remove the key")
+        }
+        if loopConfig.config.backend.kvQuant {
+            logger.warning(
+                "provider.toml sets kv_quant = true, which is REJECTED as of v0.7.5 — the "
+                    + "v2 engine serves fp16-only KV caches (the legacy KV-quant schemes "
+                    + "died with the legacy engine; a CBv2-native KV-quant fast-follow is "
+                    + "planned). The value is NOT silently honored.")
         }
 
         logger.info("darkbloom \(ProviderCore.version) starting")
@@ -317,8 +327,6 @@ extension ProviderLoop {
             await cancelAllInflight()
         }
         await coordinator.shutdown()
-        // Phase 3: shutdown the global disk accountant.
-        await diskAccountant.shutdown()
         while !modelSlots.isEmpty {
             if let unloading = modelsUnloading.first {
                 await waitForModelUnload(unloading)

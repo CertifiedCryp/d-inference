@@ -3,6 +3,7 @@ import ProviderCore
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXVLM
 
 /// Prefill-throughput + per-batch decode-throughput sweep for a loaded MLX
 /// model. Produces a `ThroughputSweepReport` (JSON).
@@ -10,8 +11,9 @@ import MLXLMCommon
 /// Reuses the provider's real inference stack — it loads the model with the
 /// same `LLMModelFactory` + `LocalTokenizerLoader` the serve path uses, runs
 /// prefill through `model.callAsFunction(_:cache:)`, and runs decode through
-/// `MLXLMCommon.BatchedEngine` (the exact continuous-batching engine
-/// `BatchScheduler` wraps in production). It does **not** reimplement any
+/// the PRODUCTION ContinuousBatchingV2 engine, constructed via
+/// `EngineV2Factory.makeProductionEngine` — the exact one-engine entry point
+/// every serving slot uses as of v0.7.5. It does **not** reimplement any
 /// inference numerics; it only drives the engine and times it.
 ///
 /// The decode-vs-batch curve is the point: a memory-bandwidth-bound dense model
@@ -49,10 +51,22 @@ public enum ThroughputSweep {
         log("loading model \(modelID)")
         log("  path: \(modelDirectory.path)")
 
-        let container = try await LLMModelFactory.shared.loadContainer(
-            from: modelDirectory,
-            using: LocalTokenizerLoader()
-        )
+        // VLM checkpoints (config declares `vision_config`) load through the
+        // VLM factory and serve through the weight-sharing extracted text
+        // model — the same construction every production slot performs.
+        let isVLM = readHasVisionConfig(modelDirectory: modelDirectory)
+        let container: ModelContainer
+        if isVLM {
+            container = try await VLMModelFactory.shared.loadContainer(
+                from: modelDirectory,
+                using: LocalTokenizerLoader()
+            )
+        } else {
+            container = try await LLMModelFactory.shared.loadContainer(
+                from: modelDirectory,
+                using: LocalTokenizerLoader()
+            )
+        }
 
         let facts = try await container.perform { ctx -> ModelFacts in
             let params = ctx.model.parameters().flattened()
@@ -74,7 +88,10 @@ public enum ThroughputSweep {
             baseTokens: baseTokens,
             batchSizes: batchSizes,
             decodeTokens: decodeTokens,
-            decodePromptTokens: decodePromptTokens
+            decodePromptTokens: decodePromptTokens,
+            weightBytes: facts.weightBytes,
+            isVLM: isVLM,
+            modelDirectory: modelDirectory
         )
 
         let derived = ThroughputSweepReport.makeDerived(
@@ -171,7 +188,10 @@ public enum ThroughputSweep {
         baseTokens: [Int],
         batchSizes: [Int],
         decodeTokens: Int,
-        decodePromptTokens: Int
+        decodePromptTokens: Int,
+        weightBytes: Int,
+        isVLM: Bool,
+        modelDirectory: URL?
     ) async -> [ThroughputSweepReport.DecodeSample] {
         let sizes = batchSizes.filter { $0 > 0 }.sorted()
         guard !sizes.isEmpty else { return [] }
@@ -179,16 +199,19 @@ public enum ThroughputSweep {
         let genTokens = max(1, decodeTokens)
         log("decode sweep: batch sizes \(sizes), \(genTokens) tok/seq, prompt \(promptLen) tok/seq")
 
-        // Warm-up at B=1 with a short generation to compile decode kernels.
+        // Warm-up at B=1 with a short generation to compile decode kernels
+        // (CBv2 compiled decode pays its cold start here, not in a sample).
         await runDecodeBatch(
             container: container, modelID: modelID, baseTokens: baseTokens,
-            batchSize: 1, decodeTokens: 4, promptLen: promptLen)
+            batchSize: 1, decodeTokens: 4, promptLen: promptLen, weightBytes: weightBytes,
+            isVLM: isVLM, modelDirectory: modelDirectory)
 
         var samples: [ThroughputSweepReport.DecodeSample] = []
         for batchSize in sizes {
             let (totalTokens, maxElapsed) = await runDecodeBatch(
                 container: container, modelID: modelID, baseTokens: baseTokens,
-                batchSize: batchSize, decodeTokens: genTokens, promptLen: promptLen)
+                batchSize: batchSize, decodeTokens: genTokens, promptLen: promptLen,
+                weightBytes: weightBytes, isVLM: isVLM, modelDirectory: modelDirectory)
             let secs = seconds(maxElapsed)
             let aggregate = secs > 0 ? Double(totalTokens) / secs : 0
             let perSeq = aggregate / Double(batchSize)
@@ -204,9 +227,11 @@ public enum ThroughputSweep {
         return samples
     }
 
-    /// Build + start a `BatchedEngine`, run `batchSize` rows to completion, stop
-    /// the engine, and return `(totalDecodedTokens, maxRowElapsed)` where the
-    /// clock starts after each row's first token (prefill excluded).
+    /// Build the production CBv2 engine (`EngineV2Factory.makeProductionEngine`
+    /// — the same construction every serving slot uses), run `batchSize`
+    /// greedy rows to completion, shut the engine down, and return
+    /// `(totalDecodedTokens, maxRowElapsed)` where the clock starts after each
+    /// row's first token (prefill excluded).
     @discardableResult
     private static func runDecodeBatch(
         container: ModelContainer,
@@ -214,35 +239,45 @@ public enum ThroughputSweep {
         baseTokens: [Int],
         batchSize: Int,
         decodeTokens: Int,
-        promptLen: Int
+        promptLen: Int,
+        weightBytes: Int,
+        isVLM: Bool,
+        modelDirectory: URL?
     ) async -> (totalTokens: Int, maxElapsed: Duration) {
-        let engine = await container.perform { ctx -> BatchedEngine in
-            let scheduler = Scheduler(
-                model: ctx.model,
-                tokenizer: ctx.tokenizer,
-                config: SchedulerConfig(
-                    maxNumSeqs: max(batchSize, 1),
-                    maxNumBatchedTokens: 8192,
-                    prefillStepSize: 2048,
-                    streamInterval: 1
-                ),
-                eosTokenIds: ctx.configuration.eosTokenIds,
-                prefixCache: nil
-            )
-            return BatchedEngine(
-                scheduler: scheduler,
-                tokenizer: ctx.tokenizer,
-                modelName: modelID,
-                config: ContinuousBatchingConfig(
-                    schedulerConfig: scheduler.config,
-                    stepInterval: 0.001,
-                    prefixCacheConfig: nil,
-                    mtpEnabled: false
-                ),
-                externalChatTemplate: nil
-            )
+        // The engine's KV admission ceiling: the same unified-memory budget a
+        // single-model provider slot would be granted. Far above what these
+        // short rows need — admission never binds in the sweep.
+        let kvCapacity = Int(min(
+            UnifiedMemoryCap.kvBudgetBytes(
+                physicalBytes: ProcessInfo.processInfo.physicalMemory,
+                residentWeightBytes: UInt64(max(0, weightBytes)),
+                configReserveBytes: 0),
+            UInt64(Int.max)))
+        struct EngineParts: @unchecked Sendable {
+            let engine: any CBv2Engine
+            let eosTokenIds: Set<Int>
         }
-        await engine.start()
+        let parts: EngineParts
+        do {
+            parts = try await container.perform { ctx -> EngineParts in
+                // Serving-model resolution: VLM checkpoints run the
+                // weight-sharing text extraction, exactly like a slot build.
+                let servingModel = try EngineV2Factory.benchmarkServingModel(
+                    model: ctx.model, isVLM: isVLM, modelDirectory: modelDirectory)
+                return EngineParts(
+                    engine: try EngineV2Factory.makeProductionEngine(
+                        model: servingModel,
+                        tokenizer: ctx.tokenizer,
+                        kvBytesCapacity: kvCapacity,
+                        maxConcurrentRequests: max(batchSize, 1)),
+                    eosTokenIds: ctx.configuration.eosTokenIds)
+            }
+        } catch {
+            log("  engine construction failed: \(error)")
+            return (0, .zero)
+        }
+        let engine = parts.engine
+        let eosTokenIds = parts.eosTokenIds
 
         let result = await withTaskGroup(of: RowMeasure.self) { group -> (Int, Duration) in
             for i in 0 ..< batchSize {
@@ -250,24 +285,35 @@ public enum ThroughputSweep {
                 // different mix of experts (otherwise identical prompts would
                 // all hit the same top-K experts and understate expert traffic).
                 let prompt = Self.tile(baseTokens, to: promptLen, offset: i * 7 + 1)
-                let id = "sweep-\(batchSize)-\(i)-\(UUID().uuidString.prefix(6))"
                 group.addTask { [engine] in
-                    _ = await engine.core.addRequest(Request(
-                        requestId: id,
-                        prompt: prompt as AnyHashable,
-                        samplingParams: SamplingParams(maxTokens: decodeTokens + 1, temperature: 0.0)
-                    ))
+                    let stream: AsyncStream<CBv2Event>
+                    do {
+                        stream = try engine.submit(CBv2Request(
+                            id: CBv2RequestID(UInt64(i + 1)),
+                            promptTokens: prompt,
+                            sampling: CBv2SamplingParams(temperature: 0.0),
+                            maxTokens: decodeTokens + 1,
+                            stopTokens: eosTokenIds
+                        ))
+                    } catch {
+                        Self.log("  submit failed: \(error)")
+                        return RowMeasure(produced: 0, elapsed: .zero)
+                    }
                     var sawFirst = false
                     var start = ContinuousClock.now
                     var produced = 0
-                    for await output in engine.core.streamOutputs(requestId: id) {
-                        if !sawFirst {
-                            sawFirst = true
-                            start = ContinuousClock.now
-                        } else {
-                            produced += output.newTokenIds.count
+                    loop: for await event in stream {
+                        switch event {
+                        case .delta(_, let tokens, _):
+                            if !sawFirst {
+                                sawFirst = true
+                                start = ContinuousClock.now
+                            } else {
+                                produced += tokens.count
+                            }
+                        case .finished:
+                            break loop
                         }
-                        if output.finished || output.error != nil { break }
                     }
                     return RowMeasure(produced: produced, elapsed: ContinuousClock.now - start)
                 }
@@ -281,7 +327,7 @@ public enum ThroughputSweep {
             return (total, maxElapsed)
         }
 
-        await engine.stop()
+        await engine.shutdown()
         return result
     }
 
@@ -315,6 +361,16 @@ public enum ThroughputSweep {
     static func seconds(_ duration: Duration) -> Double {
         Double(duration.components.seconds)
             + Double(duration.components.attoseconds) / 1e18
+    }
+
+    /// Whether the checkpoint's config.json declares a `vision_config`
+    /// (VLM — load via the VLM factory, serve via the text extraction).
+    static func readHasVisionConfig(modelDirectory: URL) -> Bool {
+        let url = modelDirectory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        return obj["vision_config"] != nil
     }
 
     /// Best-effort read of the quantization bit width from config.json.

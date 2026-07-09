@@ -95,5 +95,48 @@ public enum ProviderCore {
     // a dead model; and GlobalKVCacheBudget audits + drops stale
     // reservations under sustained full-rejection (defense in depth). No
     // protocol changes.
-    public static let version = "0.7.4"
+    // 0.7.5 is the ONE-ENGINE release: every request — text, image, video,
+    // mixed — on every slot serves through ContinuousBatchingV2, and the
+    // legacy BatchScheduler engine is DELETED from the binary (~15k lines
+    // across provider + mlx-swift-lm: scheduler, v1 BatchedEngine, batched
+    // KV caches, legacy compiled decode, B=1 fast paths, adaptive prefill,
+    // KV-quant schemes, checkpoint capture + encrypted on-disk KV tier).
+    // What replaced each piece:
+    //   * Multi-model co-residency: KV grants are RE-SLICED at every
+    //     load/unload (EngineV2KVSizing.resliceGrants over runtime-resizable
+    //     engine ceilings; single-model boxes keep the full budget) —
+    //     the postmortem's silent-legacy-fallback-at-batch-4 class is
+    //     structurally impossible.
+    //   * Fail loud, never fall back: engine construction failure or
+    //     media-prefill failure is an ERROR engine_v2_refusal /
+    //     engine_v2_vision_refusal + retriable 503; the coordinator's
+    //     pre-content failover reroutes invisibly. The supported set is
+    //     architecture-derived at scan time (EngineV2SupportedModels) —
+    //     unsupported models are never advertised.
+    //   * Media: image + video prefill through CBv2 multimodal
+    //     (EngineV2VisionPrefill spans per image / per sampled video frame),
+    //     media_kind-tagged telemetry.
+    //   * Prefix cache: encrypted SSD offload ships default-on with no serving
+    //     memory carve; the RAM PrefixCacheV2 tier remains experimental and
+    //     opt-in. Both are salt-scoped; RAM uses the per-model funding gate,
+    //     while SSD applies the adoption bound and effective-token floor to
+    //     each donation. DARKBLOOM_PREFIX_CACHE=0 is the master kill switch and
+    //     DARKBLOOM_PREFIX_CACHE_SSD=0 disables only SSD.
+    //   * Liveness: wedge self-recovery rebuilds the engine over the
+    //     retained container with the same grant+carve (drain → rebuild →
+    //     swap; 120s cooldown), replacing the legacy self-restart.
+    //   * Standalone `darkbloom start --local` serves through the same v2
+    //     slot factory; local chat body ceiling raised to 32 MiB.
+    //   * Retired knobs WARN loudly: DARKBLOOM_ENGINE_V2(+_MODELS),
+    //     DARKBLOOM_COMPILED_DECODE, B=1 fast-path + KV-quant + adaptive-
+    //     prefill envs; [backend] engine_v2 /
+    //     continuous_batching / adaptive_prefill / legacy_compiled_decode
+    //     parse-and-WARN as retired; kv_quant is REJECTED-with-WARN (a
+    //     CBv2-native KV-quant fast-follow is planned).
+    // Rollback is release-level (re-point latest to 0.7.4) — there is no
+    // in-binary legacy engine to fall back to. No protocol changes: same
+    // WebSocket message types, same BackendSlotCapacity wire shape;
+    // max_concurrency now truthfully reports the engine cap (≤ 8, default
+    // 4) instead of legacy's 24.
+    public static let version = "0.7.5"
 }

@@ -226,6 +226,10 @@ extension ProviderLoop {
             await kvBudget.reservePendingLoad(requestID: pendingLoadID, bytes: pendingLoadBytes)
 
             logger.info("Loading model: \(modelId) from \(modelPath.path)")
+            // Cold-start load timing (slot-level `model_load_time_ms`): from
+            // here to slot install — covering the weight load, sizing, and
+            // engine build the coordinator's cold-load routing pays for.
+            let loadStartedAt = ContinuousClock.now
 
             // Re-hash the weights about to be loaded. Refreshing BEFORE the slot
             // goes active guarantees a challenge arriving mid-serve reports the
@@ -238,7 +242,13 @@ extension ProviderLoop {
                 try Task.checkCancellation()
                 if isShuttingDown { throw CancellationError() }
             }
-            let container = try await loadModelContainer(from: modelPath)
+            // Ownership box (Codex-review unwind ordering): every later
+            // access to the loading container goes through this box so
+            // failure paths can drop the LAST strong reference to the
+            // weights BEFORE survivor grants are restored/regrown. Never
+            // bind `borrow()` to a long-lived local — that would keep the
+            // weights alive past `release()`.
+            let newcomer = EngineV2NewcomerBox(try await loadModelContainer(from: modelPath))
             try Task.checkCancellation()
             if isShuttingDown { throw CancellationError() }
 
@@ -259,28 +269,39 @@ extension ProviderLoop {
                     "Snapshot fingerprint drifted between hash and load for \(modelId) — recomputing weight hash for the bytes actually loaded")
                 _ = try await refreshWeightHash(modelId: modelId, modelPath: modelPath)
             }
-            let scheduler = BatchScheduler(
-                maxConcurrentRequests: Self.schedulerMaxConcurrent,
-                pendingTimeout: Self.schedulerPendingTimeout,
-                defaultMaxTokens: Self.schedulerDefaultMaxTokens,
-                kvBudget: kvBudget,
-                diskAccountant: diskAccountant,
-                kvQuantEnabled: loopConfig.config.backend.kvQuant,
-                adaptivePrefillEnabled: loopConfig.config.backend.adaptivePrefill,
-                hardwareInfo: loopConfig.hardware
-            )
-            await scheduler.loadModel(
-                container: container,
-                modelId: modelId,
-                weightHash: liveModelHashes[modelId] ?? modelInfo.weightHash
-            )
+            // Hard-fail without Metal (moved from the legacy scheduler's
+            // loadModel): CPU inference is not acceptable, and with no
+            // legacy engine left this is a load failure, not a log line.
+            do {
+                _ = try GPUEnforcement.requireMetal()
+            } catch {
+                let message = "Cannot load model '\(modelId)': \(error)"
+                recordModelLoadError(model: modelId, message: message)
+                throw InferenceError.modelLoadFailed(message)
+            }
+            // Pin MLX's memory ceiling below physical RAM (idempotent). MLX's
+            // default (1.5× working set) otherwise allows a jetsam OOM.
+            MLXMemoryGuard.configureOnce(log: { limits in
+                FileHandle.standardError.write(Data(
+                    "[mlx] memory ceiling set: limit=\(limits.memoryLimitBytes / (1024*1024*1024))GB cache=\(limits.cacheLimitBytes / (1024*1024*1024))GB\n".utf8
+                ))
+            })
+
+            // Scheduler-free sizing snapshot (v0.7.5): weight bytes + the
+            // engine-truth fp16 KV rate + context window — everything the
+            // re-slice, bridge, heartbeat, and vision gate need.
+            let sizing = try await SlotSizingSnapshot.build(
+                container: newcomer.borrow(),
+                modelPath: modelPath,
+                fallbackDefaultMaxTokens: Self.schedulerDefaultMaxTokens)
+
             // Weights are resident now (reflected in MLX active/cache), so hand
             // off from the pending-load reservation to the live mlxUsed view —
             // concurrent KV reservations see the weights from here on. (Also
             // released in catch for the error paths above.)
             await kvBudget.release(requestID: pendingLoadID)
             if isShuttingDown || Task.isCancelled {
-                await scheduler.unloadModel()
+                newcomer.release()
                 MLX.Memory.clearCache()
                 throw CancellationError()
             }
@@ -301,13 +322,15 @@ extension ProviderLoop {
             // serveable model. Mirrors evictUntilAvailable / fastAdmissionReject's
             // clearCache-then-measure self-heal.
             MLX.Memory.clearCache()
-            if !(await scheduler.hasServeableKVHeadroom()) {
+            if !KVHeadroomProbe.hasServeableKVHeadroom() {
                 let headroomGb = String(
                     format: "%.1f",
-                    Double(await scheduler.measuredLiveKVHeadroomBytes) / (1024.0 * 1024.0 * 1024.0))
+                    Double(KVHeadroomProbe.measuredLiveKVHeadroomBytes) / (1024.0 * 1024.0 * 1024.0))
                 let minGb = String(
                     format: "%.1f", Double(UnifiedMemoryCap.minimumLoadKVBytes) / (1024.0 * 1024.0 * 1024.0))
-                await scheduler.unloadModel()
+                // Pre-shrink failure: no grants were mutated, so ordering is
+                // moot — but drop the weights promptly all the same.
+                newcomer.release()
                 MLX.Memory.clearCache()
                 let message = "Model '\(modelId)' loaded but has insufficient KV headroom "
                     + "under the memory cap (\(headroomGb) GB free, need \(minGb) GB to serve) — unloaded"
@@ -315,70 +338,109 @@ extension ProviderLoop {
                 throw InferenceError.modelLoadFailed(message)
             }
 
-            let tokenizer: TokenizerHandle = await container.perform { ctx in
+            let tokenizer: TokenizerHandle = try await newcomer.borrow().perform { ctx in
                 TokenizerHandle(ctx.tokenizer)
             }
 
-            // ContinuousBatchingV2 (flag-gated, additive): when EngineV2Config
-            // selects the v2 engine for this model, build the real CBv2 engine
-            // over the SAME loaded container, wrap it in an EngineV2Bridge, and
-            // register it with the runtime so capacity/cancel fan-out works
-            // from the first request. Allowlisted VLM slots (all prod Gemma 4
-            // checkpoints ship a vision tower) serve TEXT through v2 via the
-            // weight-sharing text-model extraction; the model directory is
-            // threaded through for its config.json. nil on every legacy path —
-            // flag off, non-allowlisted model, or v2 init/extraction failure
-            // (which emits WARN engine_health telemetry and falls back to the
-            // scheduler below).
+            // ONE ENGINE (v0.7.5): re-slice co-resident KV grants (shrink
+            // existing engines to fair shares) and build this model's CBv2
+            // engine + bridge with the newcomer's grant. THROWS on any
+            // construction failure — refusal telemetry has already fired,
+            // existing grants are already restored — and the catch below
+            // maps it to a 503 so the coordinator reroutes (and coordinator
+            // pushes get `load_model_status: failed`). There is no legacy
+            // fallback: a model that cannot build a v2 engine does not load.
             let slotIsVLM = Self.modelIsVLM(at: modelPath)
-            let engineV2Bridge = await makeEngineV2BridgeForSlot(
-                modelId: modelId,
-                modelType: modelInfo.modelType,
-                isVLM: slotIsVLM,
-                modelDirectory: modelPath,
-                container: container,
-                tokenizer: tokenizer,
-                scheduler: scheduler
-            )
-
-            // Post-BRIDGE measured-headroom guard (v0.7.3): the engine build
-            // can retain additional load-time memory beyond the weights the
-            // check above measured. Re-measure AFTER the bridge so a box
-            // whose full load-time footprint leaves no serveable KV unloads
-            // and 503s (coordinator reroutes, telemetry fires) instead of
-            // advertising a model whose every request the shared KV gate
-            // rejects — the v0.7.2 black-hole failure shape. Runs for ANY
-            // VLM slot, not just when the bridge built: an extraction that
-            // failed after materializing load-time state (e.g. a parity
-            // mismatch) has still grown resident memory. Trim the pool
-            // first, mirroring the post-load check. (unregister/shutdown
-            // are safe no-ops on the nil-bridge path.)
-            if engineV2Bridge != nil || slotIsVLM {
+            // The re-slice gate is held across the WHOLE shrink → build →
+            // guard → install-slot sequence: a concurrent idle-timeout
+            // unload's regrow parked on the gate must not run in the gap
+            // between the newcomer's grant being carved out and its slot
+            // appearing in `modelSlots` — it would recompute without the
+            // newcomer and re-inflate survivors past the fleet budget.
+            await acquireResliceGate()
+            let engineV2Bridge: EngineV2Bridge
+            do {
+                engineV2Bridge = try await resliceAndBuildEngineV2Slot(
+                    modelId: modelId,
+                    modelType: modelInfo.modelType,
+                    isVLM: slotIsVLM,
+                    modelDirectory: modelPath,
+                    newcomer: newcomer,
+                    tokenizer: tokenizer,
+                    sizing: sizing
+                )
+            } catch let error as InferenceError {
+                // Already shaped (e.g. the re-slice floor refusal) — record +
+                // rethrow unchanged so loadErrorStatusCode sees the original.
+                // The unwind ordering (release newcomer weights → clearCache
+                // → restore survivor grants) already ran inside
+                // `resliceAndBuildEngineV2Slot`'s catch, before this one.
+                releaseResliceGate()
                 MLX.Memory.clearCache()
-                if !(await scheduler.hasServeableKVHeadroom()) {
-                    let headroomGb = String(
-                        format: "%.1f",
-                        Double(await scheduler.measuredLiveKVHeadroomBytes) / (1024.0 * 1024.0 * 1024.0))
-                    await engineV2Runtime.unregister(modelId: modelId)
-                    await engineV2Bridge?.shutdown()
-                    await scheduler.unloadModel()
-                    MLX.Memory.clearCache()
-                    let message = "Model '\(modelId)' loaded but its engine build left insufficient "
-                        + "KV headroom under the memory cap (\(headroomGb) GB free) — unloaded"
+                if case .modelLoadFailed(let message) = error {
                     recordModelLoadError(model: modelId, message: message)
-                    throw InferenceError.modelLoadFailed(message)
                 }
+                throw error
+            } catch {
+                releaseResliceGate()
+                MLX.Memory.clearCache()
+                let message =
+                    "Model '\(modelId)' loaded but its v2 engine construction failed: \(error) — unloaded"
+                recordModelLoadError(model: modelId, message: message)
+                throw InferenceError.modelLoadFailed(message)
             }
 
+            // Post-BRIDGE measured-headroom re-guard (v0.7.3, kept): the
+            // engine build (and, for VLM slots, the text-model extraction +
+            // parity probe) can retain additional load-time memory beyond
+            // the weights the check above measured. Re-measure so a box
+            // whose full load-time footprint leaves no serveable KV unloads
+            // and 503s instead of advertising a model whose every request
+            // the shared KV gate rejects — the v0.7.2 black-hole shape.
+            MLX.Memory.clearCache()
+            if !KVHeadroomProbe.hasServeableKVHeadroom() {
+                let headroomGb = String(
+                    format: "%.1f",
+                    Double(KVHeadroomProbe.measuredLiveKVHeadroomBytes) / (1024.0 * 1024.0 * 1024.0))
+                // Retire the bridge, release the newcomer's weights, THEN
+                // regrow survivors — in that order (Codex review): regrowing
+                // while the aborted newcomer's weights are still resident
+                // would let Σ(grants) exceed the true fleet budget. Still
+                // holding the re-slice gate; release only after.
+                await unwindBuiltSlotAndRegrow(
+                    modelId: modelId, bridge: engineV2Bridge, newcomer: newcomer)
+                releaseResliceGate()
+                let message = "Model '\(modelId)' loaded but its engine build left insufficient "
+                    + "KV headroom under the memory cap (\(headroomGb) GB free) — unloaded"
+                recordModelLoadError(model: modelId, message: message)
+                throw InferenceError.modelLoadFailed(message)
+            }
+
+            // Slot-level cold-start load time (heartbeat `model_load_time_ms`).
+            let loadElapsed = ContinuousClock.now - loadStartedAt
+            let loadMs = Double(loadElapsed.components.seconds) * 1000.0
+                + Double(loadElapsed.components.attoseconds) / 1e15
+            await engineV2Bridge.recordModelLoadTime(ms: Int64(max(0, loadMs.rounded())))
+
+            guard let installContainer = newcomer.container else {
+                // Unreachable (the box is drained only on failure paths) —
+                // defensive so a wiring bug can never leak the re-slice gate
+                // and wedge every future load.
+                releaseResliceGate()
+                throw InferenceError.modelLoadFailed(
+                    "internal: newcomer container missing at install for '\(modelId)'")
+            }
             modelSlots[modelId] = ModelSlot(
-                scheduler: scheduler,
                 engineV2: engineV2Bridge,
-                container: container,
+                container: installContainer,
                 tokenizer: tokenizer,
+                sizing: sizing,
                 isVLM: slotIsVLM,
                 modelType: modelInfo.modelType,
                 lastInferenceAt: .now
             )
+            // Newcomer installed — parked regrows now see the full slot set.
+            releaseResliceGate()
 
             syncWarmModelState()
             // Remember the serving set across restarts: the persisted file is
@@ -426,21 +488,21 @@ extension ProviderLoop {
     internal func unloadModel(_ modelId: String) async {
         guard let slot = modelSlots[modelId], !modelsUnloading.contains(modelId) else { return }
         modelsUnloading.insert(modelId)
-        // ContinuousBatchingV2: retire the slot's v2 bridge first — unregister
-        // so heartbeats/cancellation stop fanning out to it, then drain the
-        // engine gracefully (running requests finish, new submissions are
-        // rejected). No-op for legacy-only slots (engineV2 == nil).
-        if let bridge = slot.engineV2 {
-            await engineV2Runtime.unregister(modelId: modelId)
-            await bridge.shutdown()
-        }
-        await slot.scheduler.unloadModel()
+        // Retire the slot's v2 bridge: unregister so heartbeats/cancellation
+        // stop fanning out to it, then drain the engine gracefully (running
+        // requests finish, new submissions are rejected).
+        await engineV2Runtime.unregister(modelId: modelId)
+        await slot.engineV2.shutdown()
         modelSlots.removeValue(forKey: modelId)
         modelsUnloading.remove(modelId)
         // Mandatory: freed weights linger in MLX's pool (GPU.cacheMemory), which
         // load-admission counts as used — without this the box 503s every load
         // until restart.
         MLX.Memory.clearCache()
+        // Re-slice GROW the survivors: with this model's weights gone the
+        // fleet KV budget rises, and the remaining engines take their new
+        // fair shares (a lone survivor gets the FULL budget back).
+        await resliceGrowSurvivors()
         let waiters = unloadingWaiters.removeValue(forKey: modelId) ?? []
         for waiter in waiters { waiter.resume() }
         syncWarmModelState()
@@ -682,17 +744,9 @@ extension ProviderLoop {
         // Vision-language models (config declares `vision_config`) load via
         // VLMModelFactory so image/video requests can run the container's
         // prepare/generate vision path. Their text path still works through the
-        // batched engine since VLMModel refines LanguageModel.
-        if Self.modelIsVLM(at: directory) {
-            return try await VLMModelFactory.shared.loadContainer(
-                from: directory,
-                using: LocalTokenizerLoader()
-            )
-        }
-        return try await LLMModelFactory.shared.loadContainer(
-            from: directory,
-            using: LocalTokenizerLoader()
-        )
+        // batched engine since VLMModel refines LanguageModel. Shared with the
+        // standalone server via `ModelContainerLoading`.
+        try await ModelContainerLoading.loadContainer(from: directory)
     }
 
     /// A model is a vision-language model when its `config.json` declares a

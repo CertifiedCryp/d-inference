@@ -108,7 +108,13 @@ extension EngineV2Bridge {
             kvBytesPerToken > 0 ? Int64(reportedKVBytesCapacity / kvBytesPerToken) : 0
 
         let state: String
-        if wedgeMonitor.wedgeSuspected(now: now) {
+        if recoveryReloading {
+            // Recovery self-restart in flight (`EngineV2Bridge+Liveness`):
+            // report "reloading" for the whole drain→rebuild window — the
+            // legacy `heartbeatSlotState` precedence — so the coordinator
+            // deroutes the model without treating it as crashed-forever.
+            state = "reloading"
+        } else if wedgeMonitor.wedgeSuspected(now: now) {
             // Same truthful-derouting contract as the legacy heartbeat: a
             // wedged slot must not keep advertising healthy.
             state = "crashed"
@@ -125,12 +131,17 @@ extension EngineV2Bridge {
             maxTokensPotential: maxTokensPotential,
             maxConcurrency: UInt32(clamping: maxConcurrentRequests),
             observedDecodeTps: observedDecodeTpsEwma,
-            observedPrefillTps: 0,
+            // Bridge-measured cold-prefill EWMA (submit → first token over
+            // prompt tokens; see EngineV2Bridge.recordPrefillSample). Feeds
+            // the coordinator's prefill-honest TTFT estimation.
+            observedPrefillTps: observedPrefillTpsEwma,
             activeTokenBudgetUsed: budgetUsed,
             activeTokenBudgetMax: budgetMax,
             queuedTokenBudget: 0,
             kvBytesPerToken: Int64(kvBytesPerToken),
-            modelLoadTimeMs: 0,
+            // Slot-level bookkeeping (recorded by ensureModelLoaded on
+            // load completion) — previously the legacy scheduler's field.
+            modelLoadTimeMs: modelLoadTimeMs,
             stepsExecuted: Int64(wedgeMonitor.lastStepsSample),
             admits: Int64(wedgeMonitor.admits),
             firstTokensEmitted: Int64(wedgeMonitor.firstTokens),
@@ -146,12 +157,14 @@ extension EngineV2Bridge {
         active.count
     }
 
-    /// This engine's KV admission ceiling in bytes (construction-fixed).
-    /// Read by the slot factory when sizing a LATER v2 engine so that
-    /// Σ(engine ceilings) stays within the process-wide KV budget — see
-    /// `EngineV2KVSizing.engineKVBytesCapacity` — and by the heartbeat
-    /// (`EngineV2Runtime.capacitySummary`) as the grant input to the live
-    /// budget clamp (`EngineV2KVSizing.liveEngineKVBytesBudget`).
+    /// This engine's KV admission ceiling in bytes (construction-fixed;
+    /// already NET of any prefix-cache budget — `PrefixCachePolicy.carve`).
+    /// The heartbeat (`EngineV2Runtime.capacitySummary`) uses it as the
+    /// grant input to the live budget clamp
+    /// (`EngineV2KVSizing.liveEngineKVBytesBudget`); the slot factory sizes
+    /// LATER engines against `slotKVBytesClaim()` — this figure PLUS the
+    /// cache budget — so Σ(engine ceilings + cache budgets) stays within
+    /// the process-wide KV budget (`EngineV2KVSizing.engineKVBytesCapacity`).
     public func engineKVBytesCapacity() -> Int {
         engine.capacity().kvBytesCapacity
     }
@@ -176,7 +189,20 @@ extension EngineV2Bridge {
             message: suspected
                 ? "engine_v2: step wedge suspected"
                 : "engine_v2: step wedge recovered"
-        ).withFields([
+        ).withFields(wedgeHealthFields(operation: operation, now: now))
+        emit(event)
+    }
+
+    /// NON-PRIVATE wedge/engine-health field set — the same shape the
+    /// legacy `BatchScheduler.engineHealthFields` emitted (operational
+    /// counters + timestamps only; keys mirrored in the Go/Swift/TS
+    /// telemetry allowlists), tagged `backend=engine_v2`. Shared by the
+    /// step-wedge transition events above and the self-restart events
+    /// (`EngineV2Bridge+Liveness`).
+    func wedgeHealthFields(
+        operation: String, now: ContinuousClock.Instant
+    ) -> [String: AnyCodableValue] {
+        [
             "component": .string("engine"),
             "operation": .string(operation),
             "backend": .string("engine_v2"),
@@ -190,8 +216,7 @@ extension EngineV2Bridge {
             "seconds_since_last_first_token":
                 .double(wedgeMonitor.secondsSinceLastFirstToken(now: now)),
             "num_running": .int(active.count),
-            "wedge_suspected": .bool(suspected),
-        ])
-        emit(event)
+            "wedge_suspected": .bool(wedgeMonitor.wedgeSuspected(now: now)),
+        ]
     }
 }

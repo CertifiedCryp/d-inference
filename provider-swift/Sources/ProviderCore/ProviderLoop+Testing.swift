@@ -149,55 +149,174 @@ extension ProviderLoop {
         engineV2Runtime = runtime
     }
 
-    /// Test seam: install slot-factory hooks (environment + EOS snapshot +
-    /// engine builder) so `makeEngineV2BridgeForSlot` runs end-to-end with a
-    /// scripted `CBv2Engine` — no model weights, no container reads.
+    /// Test seam: install slot-factory hooks (EOS snapshot + engine builder
+    /// + physical-memory override) so the re-slice + bridge construction
+    /// path runs end-to-end with a scripted `CBv2Engine` — no model
+    /// weights, no container reads.
     func setEngineV2SlotHooksForTesting(_ hooks: EngineV2SlotHooks?) {
         engineV2SlotHooks = hooks
     }
 
-    /// Test seam: drive the model-load slot factory directly (production
-    /// entry point is `ensureModelLoaded`, which needs real weights).
-    func makeEngineV2BridgeForSlotForTesting(
+    /// Test seam: drive the re-slice + slot-build orchestration directly
+    /// (production entry point is `ensureModelLoaded`, which needs real
+    /// weights). Computes fair-share grants against the CURRENT installed
+    /// slots, shrinks them, builds the newcomer via the hooks' engine
+    /// builder, and restores grants on throw — exactly the production path.
+    func resliceAndBuildEngineV2SlotForTesting(
         modelId: String,
         modelType: String?,
         isVLM: Bool = false,
         modelDirectory: URL? = nil,
         container: MLXLMCommon.ModelContainer,
         tokenizer: TokenizerHandle,
-        scheduler: BatchScheduler
-    ) async -> EngineV2Bridge? {
-        await makeEngineV2BridgeForSlot(
+        sizing: SlotSizingSnapshot
+    ) async throws -> EngineV2Bridge {
+        // Convenience shape: box the container the way ensureModelLoaded
+        // does (the test also holds its own reference, so unwind-ordering
+        // assertions need the box variant below instead).
+        try await resliceAndBuildEngineV2Slot(
             modelId: modelId,
             modelType: modelType,
             isVLM: isVLM,
             modelDirectory: modelDirectory,
-            container: container,
+            newcomer: EngineV2NewcomerBox(container),
             tokenizer: tokenizer,
-            scheduler: scheduler
+            sizing: sizing
         )
     }
 
-    /// Test seam: install a fully-formed model slot (optionally carrying a
-    /// v2 bridge) so capacity/cancellation guard tests can exercise the
-    /// slot-dependent paths without loading weights.
-    func installModelSlotForTesting(
+    /// Box variant: the caller hands over container OWNERSHIP, so the
+    /// unwind-ordering regression tests can observe (via a weak reference)
+    /// that a failed build releases the newcomer's weights BEFORE survivor
+    /// grants are restored.
+    func resliceAndBuildEngineV2SlotForTesting(
         modelId: String,
-        scheduler: BatchScheduler,
+        modelType: String?,
+        isVLM: Bool = false,
+        modelDirectory: URL? = nil,
+        newcomer: EngineV2NewcomerBox,
+        tokenizer: TokenizerHandle,
+        sizing: SlotSizingSnapshot
+    ) async throws -> EngineV2Bridge {
+        try await resliceAndBuildEngineV2Slot(
+            modelId: modelId,
+            modelType: modelType,
+            isVLM: isVLM,
+            modelDirectory: modelDirectory,
+            newcomer: newcomer,
+            tokenizer: tokenizer,
+            sizing: sizing
+        )
+    }
+
+    /// Test seam: the post-bridge-guard failure unwind (retire bridge →
+    /// release newcomer weights → regrow survivors, in that order).
+    func unwindBuiltSlotAndRegrowForTesting(
+        modelId: String,
+        bridge: EngineV2Bridge,
+        newcomer: EngineV2NewcomerBox
+    ) async {
+        await unwindBuiltSlotAndRegrow(modelId: modelId, bridge: bridge, newcomer: newcomer)
+    }
+
+    /// Test seam: the unload-side re-slice (grow survivors back to their
+    /// fair shares). Gated exactly like the production idle-unload path.
+    func resliceGrowSurvivorsForTesting() async {
+        await resliceGrowSurvivors()
+    }
+
+    /// Test seams: hold/release the re-slice gate directly, simulating an
+    /// in-flight load's gated stretch — the race regression test parks a
+    /// regrow behind it and asserts nothing mutates until release.
+    func acquireResliceGateForTesting() async {
+        await acquireResliceGate()
+    }
+
+    func releaseResliceGateForTesting() {
+        releaseResliceGate()
+    }
+
+    /// Test seam: the PRODUCTION-shaped load stretch — the re-slice gate
+    /// held across shrink → build → install-slot, exactly as
+    /// `ensureModelLoaded` holds it. The race regression test drives this
+    /// concurrently with `resliceGrowSurvivorsForTesting` to pin the gate
+    /// semantics (a regrow can never interleave before the newcomer's slot
+    /// is installed).
+    func loadV2SlotForTesting(
+        modelId: String,
+        modelType: String?,
         container: MLXLMCommon.ModelContainer,
         tokenizer: TokenizerHandle,
-        engineV2: EngineV2Bridge? = nil,
+        sizing: SlotSizingSnapshot
+    ) async throws -> EngineV2Bridge {
+        await acquireResliceGate()
+        let newcomer = EngineV2NewcomerBox(container)
+        let bridge: EngineV2Bridge
+        do {
+            bridge = try await resliceAndBuildEngineV2Slot(
+                modelId: modelId,
+                modelType: modelType,
+                isVLM: false,
+                modelDirectory: nil,
+                newcomer: newcomer,
+                tokenizer: tokenizer,
+                sizing: sizing
+            )
+            modelSlots[modelId] = ModelSlot(
+                engineV2: bridge,
+                container: try newcomer.borrow(),
+                tokenizer: tokenizer,
+                sizing: sizing,
+                isVLM: false,
+                modelType: modelType,
+                lastInferenceAt: .now
+            )
+        } catch {
+            releaseResliceGate()
+            throw error
+        }
+        releaseResliceGate()
+        return bridge
+    }
+
+    /// Test seam: install a fully-formed v2 model slot so capacity/
+    /// cancellation/re-slice tests can exercise the slot-dependent paths
+    /// without loading weights.
+    func installModelSlotForTesting(
+        modelId: String,
+        container: MLXLMCommon.ModelContainer,
+        tokenizer: TokenizerHandle,
+        engineV2: EngineV2Bridge,
+        sizing: SlotSizingSnapshot = SlotSizingSnapshot(
+            weightsBytes: 0, fp16KVBytesPerToken: 0,
+            maxContextLength: 0, defaultMaxTokens: 4096),
         modelType: String? = nil
     ) {
         modelSlots[modelId] = ModelSlot(
-            scheduler: scheduler,
             engineV2: engineV2,
             container: container,
             tokenizer: tokenizer,
+            sizing: sizing,
             isVLM: false,
             modelType: modelType,
             lastInferenceAt: .now
         )
+    }
+
+    /// Test seam: remove an installed slot without the unload machinery.
+    func removeModelSlotForTesting(modelId: String) {
+        modelSlots.removeValue(forKey: modelId)
+    }
+
+    /// Test seam: a loaded slot's sizing snapshot (live co-residency tests
+    /// recompute the fleet KV budget from real slot weights).
+    func slotSizingForTesting(modelId: String) -> SlotSizingSnapshot? {
+        modelSlots[modelId]?.sizing
+    }
+
+    /// Test seam: the live bridge for a loaded slot.
+    func slotBridgeForTesting(modelId: String) -> EngineV2Bridge? {
+        modelSlots[modelId]?.engineV2
     }
 
     /// Test seam: whether any live slot carries a v2 bridge (the capacity/
@@ -207,4 +326,27 @@ extension ProviderLoop {
     /// Test seam: the current aggregate backend capacity snapshot.
     func backendCapacityForTesting() -> BackendCapacity? { state.backendCapacity }
 
+    // MARK: - Wedge self-recovery seams
+
+    /// Test seam: run one liveness pass with an injectable clock, so the
+    /// 120s confirmed-wedge stall and the 120s recovery cooldown can be
+    /// exercised without waiting (the production entry point is the
+    /// capacity-refresh tick).
+    func recoverWedgedEngineV2SlotsForTesting(now: ContinuousClock.Instant) async {
+        await recoverWedgedEngineV2Slots(now: now)
+    }
+
+    /// Test seam: the last recovery-attempt timestamp for a model (cooldown
+    /// anchor assertions).
+    func engineV2LastRecoveryAtForTesting(modelId: String) -> ContinuousClock.Instant? {
+        engineV2LastRecoveryAt[modelId]
+    }
+
+    /// Test seam: pre-seed the cooldown anchor (drives the second-wedge
+    /// branch without a first full recovery).
+    func setEngineV2LastRecoveryAtForTesting(
+        modelId: String, at instant: ContinuousClock.Instant
+    ) {
+        engineV2LastRecoveryAt[modelId] = instant
+    }
 }
