@@ -171,34 +171,324 @@ struct WatchdogProbeParseTests {
         #expect(!WatchdogProbe.parseRunning("\tpid = 0"))
         #expect(!WatchdogProbe.parseRunning(""))
     }
+
+    @Test("stale heartbeat from the live daemon marks it inactive")
+    func staleLiveDaemonIsInactive() {
+        let state = DaemonState(
+            pid: 42,
+            version: "1.0.0",
+            writtenAt: 100,
+            startedAt: 10
+        )
+        #expect(!WatchdogProbe.providerActive(
+            processRunning: true,
+            daemonState: state,
+            now: 500,
+            processAlive: { $0 == 42 }
+        ))
+    }
+
+    @Test("fresh heartbeat or unrelated old state preserves activity")
+    func freshOrUnrelatedState() {
+        let state = DaemonState(
+            pid: 42,
+            version: "1.0.0",
+            writtenAt: 480,
+            startedAt: 10
+        )
+        #expect(WatchdogProbe.providerActive(
+            processRunning: true,
+            daemonState: state,
+            now: 500,
+            processAlive: { $0 == 42 }
+        ))
+        #expect(WatchdogProbe.providerActive(
+            processRunning: true,
+            daemonState: state,
+            now: 1_000,
+            processAlive: { _ in false }
+        ))
+    }
+
+    @Test("stale record whose PID the kernel reused cannot demote launchd liveness")
+    func pidReuseCannotDemoteLiveness() {
+        let recorded = ProcessIdentity(pid: 42, startTimeMicros: 7)
+        let state = DaemonState(
+            pid: 42,
+            processIdentity: recorded,
+            version: "1.0.0",
+            writtenAt: 100,
+            startedAt: 10
+        )
+        // PID 42 is alive but belongs to a DIFFERENT process (start time
+        // differs): the record came from a dead provider, so the stale
+        // heartbeat must not override launchd's "running" — pre-fix this
+        // returned false and the watchdog could restart or charge a candidate
+        // failure against a healthy provider.
+        #expect(WatchdogProbe.providerActive(
+            processRunning: true,
+            daemonState: state,
+            now: 500,
+            processAlive: { $0 == 42 },
+            readIdentity: { _ in ProcessIdentity(pid: 42, startTimeMicros: 99) }
+        ))
+        // Same kernel identity → the stale record demotes, as before.
+        #expect(!WatchdogProbe.providerActive(
+            processRunning: true,
+            daemonState: state,
+            now: 500,
+            processAlive: { $0 == 42 },
+            readIdentity: { _ in recorded }
+        ))
+        // Fresh record from the matching identity stays active.
+        #expect(WatchdogProbe.providerActive(
+            processRunning: true,
+            daemonState: state,
+            now: 150,
+            processAlive: { $0 == 42 },
+            readIdentity: { _ in recorded }
+        ))
+    }
+}
+
+@Suite("Watchdog re-arm action")
+struct WatchdogRearmActionTests {
+    @Test("auto_restart=true always arms")
+    func armWhenEnabled() {
+        #expect(WatchdogAgent.rearmAction(autoRestartEnabled: true, isLoaded: false) == .arm)
+        #expect(WatchdogAgent.rearmAction(autoRestartEnabled: true, isLoaded: true) == .arm)
+    }
+
+    @Test("auto_restart=false disarms a loaded watchdog instead of leaving the stale job")
+    func disarmWhenOptedOutAndLoaded() {
+        // Pre-fix, an opted-out config left a previously armed watchdog
+        // running on its OLD plist config, which could keep relaunching the
+        // provider after crashes despite the opt-out.
+        #expect(WatchdogAgent.rearmAction(autoRestartEnabled: false, isLoaded: true) == .disarm)
+    }
+
+    @Test("auto_restart=false with nothing loaded does nothing")
+    func noopWhenOptedOutAndUnloaded() {
+        #expect(WatchdogAgent.rearmAction(autoRestartEnabled: false, isLoaded: false) == nil)
+    }
+}
+
+@Suite("Provider launch receipt")
+struct ProviderLaunchSnapshotTests {
+    @Test("launchctl runs and PID produce crash-safe launch proof")
+    func parsesAndCompares() {
+        let identity = ProcessIdentity(pid: 42, startTimeMicros: 7)
+        let baseline = LaunchAgent.parseLaunchSnapshot(
+            label: LaunchAgent.label,
+            output: "runs = 10\npid = 42",
+            identityReader: { _ in identity }
+        )
+        let advanced = LaunchAgent.parseLaunchSnapshot(
+            label: LaunchAgent.label,
+            output: "runs = 11\npid = 42",
+            identityReader: { _ in identity }
+        )
+        #expect(baseline.runs == 10)
+        #expect(baseline.process == identity)
+        #expect(advanced.provesLaunch(after: baseline))
+        #expect(!baseline.provesLaunch(after: baseline))
+    }
+}
+
+@Suite("Watchdog provider identity (PID reuse)")
+struct WatchdogProviderIdentityTests {
+    private func stateWithIdentity(_ identity: ProcessIdentity?) -> DaemonState {
+        DaemonState(
+            pid: 4242,
+            processIdentity: identity,
+            version: "2.0.0",
+            writtenAt: 100,
+            startedAt: 50
+        )
+    }
+
+    @Test("a reused daemon-state PID whose start time differs is NOT the provider identity")
+    func reusedPidIsNotProviderIdentity() {
+        let recorded = ProcessIdentity(pid: 4242, startTimeMicros: 111)
+        let state = stateWithIdentity(recorded)
+        // The PID is live again but with a DIFFERENT start time — the kernel
+        // reused it (e.g. for a manual `darkbloom update` holding the lock). It
+        // must NOT be treated as the provider (which would force-kill it); we
+        // fall back to the launchd snapshot (nil here).
+        let reused = ProcessIdentity(pid: 4242, startTimeMicros: 999)
+        #expect(
+            WatchdogProbe.providerIdentity(
+                daemonState: state,
+                launchSnapshotProcess: nil,
+                readIdentity: { _ in reused }
+            ) == nil
+        )
+        // A MATCHING live start time IS trusted.
+        #expect(
+            WatchdogProbe.providerIdentity(
+                daemonState: state,
+                launchSnapshotProcess: nil,
+                readIdentity: { _ in recorded }
+            ) == recorded
+        )
+    }
+
+    @Test("a dead daemon-state PID falls back to the launchd snapshot")
+    func deadPidFallsBackToSnapshot() {
+        let state = stateWithIdentity(ProcessIdentity(pid: 4242, startTimeMicros: 111))
+        let fallback = ProcessIdentity(pid: 77, startTimeMicros: 3)
+        #expect(
+            WatchdogProbe.providerIdentity(
+                daemonState: state,
+                launchSnapshotProcess: fallback,
+                readIdentity: { _ in nil }
+            ) == fallback
+        )
+    }
+
+    @Test("a daemon-state without a recorded identity uses the launchd snapshot")
+    func missingRecordedIdentityUsesSnapshot() {
+        let state = stateWithIdentity(nil)
+        let fallback = ProcessIdentity(pid: 77, startTimeMicros: 3)
+        #expect(
+            WatchdogProbe.providerIdentity(
+                daemonState: state,
+                launchSnapshotProcess: fallback,
+                readIdentity: { _ in ProcessIdentity(pid: 4242, startTimeMicros: 5) }
+            ) == fallback
+        )
+    }
+
+    @Test("ProcessIdentity.read returns nil for a nonexistent pid")
+    func readReturnsNilForDeadPid() throws {
+        // Deterministic: PIDs never reach Int32.max on macOS; proc_pidinfo
+        // returns a zero-length read, which the size guard rejects.
+        #expect(ProcessIdentity.read(pid: Int32.max) == nil)
+        #expect(ProcessIdentity.read(pid: 0) == nil)
+        #expect(ProcessIdentity.read(pid: -1) == nil)
+
+        // A real, reaped process is the realistic "nonexistent pid" case.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try process.run()
+        process.waitUntilExit()
+        #expect(ProcessIdentity.read(pid: process.processIdentifier) == nil)
+    }
 }
 
 /// The watchdog launchd plist shape.
 @Suite("Watchdog agent plist")
 struct WatchdogAgentPlistTests {
-    @Test("plist runs `darkbloom watchdog` on a one-minute interval at load")
+    @Test("plist keeps one persistent watchdog alive and delegates cadence internally")
     func plistShape() {
         let plist = WatchdogAgent.makeWatchdogPlist(
             label: "io.darkbloom.watchdog",
             programArguments: ["/usr/local/bin/darkbloom", "watchdog"],
-            logPath: "/tmp/watchdog.log",
-            intervalSeconds: 60
+            logPath: "/tmp/watchdog.log"
         )
         #expect(plist["Label"] as? String == "io.darkbloom.watchdog")
         #expect(plist["ProgramArguments"] as? [String] == ["/usr/local/bin/darkbloom", "watchdog"])
-        #expect(plist["StartInterval"] as? Int == 60)
+        #expect(plist["StartInterval"] == nil)
         #expect(plist["RunAtLoad"] as? Bool == true)
-        // Cadence is StartInterval's job; the watchdog must not KeepAlive.
-        #expect(plist["KeepAlive"] as? Bool == false)
+        #expect(plist["KeepAlive"] as? Bool == true)
+        #expect(plist["ThrottleInterval"] as? Int == 10)
         #expect(plist["ProcessType"] as? String == "Background")
         #expect(plist["StandardOutPath"] as? String == "/tmp/watchdog.log")
         #expect(plist["StandardErrorPath"] as? String == "/tmp/watchdog.log")
+    }
+
+    @Test("re-arm preserves the installed plist config when no override is given")
+    func rearmPreservesInstalledConfig() {
+        let installedArguments = [
+            "/opt/darkbloom",
+            "watchdog",
+            "--config",
+            "/tmp/custom-provider.toml",
+        ]
+        let installed = WatchdogAgent.configPathArgument(in: installedArguments)
+        #expect(installed?.path == "/tmp/custom-provider.toml")
+
+        // No explicit --config on `darkbloom restart`: the previously
+        // installed custom config MUST survive the plist rewrite.
+        let preserved = WatchdogAgent.rearmConfigPath(
+            explicit: nil,
+            installed: installed
+        )
+        #expect(preserved?.path == "/tmp/custom-provider.toml")
+
+        // An explicit override wins over the installed value.
+        let overridden = WatchdogAgent.rearmConfigPath(
+            explicit: "/tmp/other.toml",
+            installed: installed
+        )
+        #expect(overridden?.path == "/tmp/other.toml")
+
+        // Short flag parses too; missing value or absent flag yields nil.
+        #expect(
+            WatchdogAgent.configPathArgument(
+                in: ["/opt/darkbloom", "watchdog", "-c", "/tmp/short.toml"]
+            )?.path == "/tmp/short.toml"
+        )
+        #expect(WatchdogAgent.configPathArgument(
+            in: ["/opt/darkbloom", "watchdog", "--config"]
+        ) == nil)
+        #expect(WatchdogAgent.configPathArgument(
+            in: ["/opt/darkbloom", "watchdog"]
+        ) == nil)
+    }
+
+    @Test("plist propagates custom config and update opt-out environment")
+    func configAndEnvironment() {
+        let arguments = [
+            "/opt/darkbloom",
+            "watchdog",
+            "--config",
+            "/tmp/provider.toml",
+        ]
+        let plist = WatchdogAgent.makeWatchdogPlist(
+            label: "io.darkbloom.watchdog",
+            programArguments: arguments,
+            logPath: "/tmp/watchdog.log",
+            environment: [
+                "DARKBLOOM_NO_UPDATE_CHECK": "1",
+                "UNRELATED_SECRET": "no",
+            ]
+        )
+        #expect(plist["ProgramArguments"] as? [String] == arguments)
+        let environment = plist["EnvironmentVariables"] as? [String: String]
+        #expect(environment == ["DARKBLOOM_NO_UPDATE_CHECK": "1"])
     }
 
     @Test("the watchdog label is distinct from the provider label")
     func distinctLabel() {
         #expect(WatchdogAgent.label != LaunchAgent.label)
         #expect(LaunchAgent.supportedLabels.contains(LaunchAgent.label))
+    }
+}
+
+@Suite("Watchdog persistent cadence", .serialized)
+struct WatchdogSchedulerTests {
+    @Test("real monotonic timer repeats and cancels without spinning")
+    func cadenceAndCancellation() async throws {
+        let (stream, continuation) = AsyncStream<Double>.makeStream()
+        let task = Task {
+            await WatchdogScheduler(interval: .milliseconds(20)).run {
+                continuation.yield(ProcessInfo.processInfo.systemUptime)
+            }
+        }
+        var times: [Double] = []
+        for await time in stream {
+            times.append(time)
+            if times.count == 3 { break }
+        }
+        task.cancel()
+        await task.value
+        continuation.finish()
+
+        #expect(times.count == 3)
+        for pair in zip(times, times.dropFirst()) {
+            #expect(pair.1 - pair.0 >= 0.012)
+        }
     }
 }
 

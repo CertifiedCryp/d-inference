@@ -1,5 +1,6 @@
 import ArgumentParser
 import Foundation
+import ProviderCore
 import Testing
 
 @testable import darkbloom
@@ -57,5 +58,94 @@ struct WatchdogCommandTests {
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent("watchdog-missing-\(UUID().uuidString).toml")
         #expect(Watchdog.autoRestartEnabled(configPath: missing.path) == true)
+        #expect(Watchdog.settings(configPath: missing.path).autoUpdate == true)
+    }
+
+    @Test("auto_update = false disables watchdog-owned update checks")
+    func honoursAutoUpdateDisable() {
+        let url = writeTempConfig("""
+        [provider]
+        name = "x"
+        auto_update = false
+        """)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let settings = Watchdog.settings(configPath: url.path)
+        #expect(settings.autoRestart)
+        #expect(!settings.autoUpdate)
+    }
+
+    @Test("DARKBLOOM_NO_UPDATE_CHECK disables only watchdog updates")
+    func environmentUpdateOptOut() {
+        let url = writeTempConfig("""
+        [provider]
+        name = "x"
+        auto_update = true
+        auto_restart = true
+        """)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let settings = Watchdog.settings(
+            configPath: url.path,
+            environment: ["DARKBLOOM_NO_UPDATE_CHECK": "1"]
+        )
+        #expect(settings.autoRestart)
+        #expect(!settings.autoUpdate)
+    }
+
+    @Test("raised startup_preload_timeout_secs raises the candidate timeout")
+    func derivesCandidateTimeoutFromPreloadConfig() {
+        let url = writeTempConfig("""
+        [provider]
+        name = "x"
+
+        [backend]
+        startup_preload_timeout_secs = 420
+        """)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let settings = Watchdog.settings(configPath: url.path)
+        #expect(settings.candidateStartupTimeoutSeconds == 600)
+
+        let defaults = writeTempConfig("""
+        [provider]
+        name = "x"
+        """)
+        defer { try? FileManager.default.removeItem(at: defaults) }
+        #expect(Watchdog.settings(
+            configPath: defaults.path
+        ).candidateStartupTimeoutSeconds == 300)
+    }
+
+    @Test("tick budget exceeds the bounded network whole-transfer timeout")
+    func tickBudgetCoversBoundedDownload() {
+        #expect(
+            Watchdog.tickDeadlineSeconds
+                > SelfUpdater.watchdogResourceTimeoutSeconds
+        )
+    }
+
+    @Test("restart accepts --config for the watchdog re-arm")
+    func restartParsesConfig() throws {
+        let command = try Darkbloom.parseAsRoot([
+            "restart",
+            "--config",
+            "/tmp/custom.toml",
+        ])
+        guard let restart = command as? Restart else {
+            Issue.record("expected Restart command")
+            return
+        }
+        #expect(restart.configOptions.config == "/tmp/custom.toml")
+    }
+
+    @Test("manual quarantine override is explicit and parseable")
+    func manualOverrideParses() throws {
+        let command = try Darkbloom.parseAsRoot([
+            "update",
+            "--override-quarantine",
+        ])
+        guard let update = command as? Update else {
+            Issue.record("expected Update command")
+            return
+        }
+        #expect(update.overrideQuarantine)
     }
 }

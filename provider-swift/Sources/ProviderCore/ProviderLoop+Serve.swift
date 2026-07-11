@@ -99,7 +99,18 @@ extension ProviderLoop {
         // models it hasn't warmed (the v0.6.30 first_chunk_timeout storm).
         // Bounded by startup_preload_timeout_secs — on timeout we register
         // anyway and the remaining loads continue in the background.
+        //
+        // Stamp a minimal daemon state FIRST: a freshly installed candidate
+        // spends its whole preload window with no heartbeat otherwise, and
+        // the watchdog would misread a long (operator-raised) preload as a
+        // hung launch and charge a false start failure. The refresh task keeps
+        // that stamp fresh for the WHOLE preload (a single stamp goes stale
+        // after 90s, but the gate may defer for startup_preload_timeout_secs);
+        // it is cancelled once the gate returns and the capacity loop takes over.
+        writeDaemonState()
+        let preloadLivenessRefresh = startPreloadLivenessRefresh()
         await runStartupPreloadGate()
+        preloadLivenessRefresh.cancel()
 
         // 2. Build attestation blob for registration
         let attestation = buildRegistrationAttestation()

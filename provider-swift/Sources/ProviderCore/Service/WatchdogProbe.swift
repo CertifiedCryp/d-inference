@@ -32,10 +32,76 @@ public enum WatchdogProbe {
         if !running,
            let state = DaemonStateFile.read(),
            !state.isStale(now: now),
-           daemonProcessAlive(pid: state.pid) {
+           recordBelongsToLiveProcess(state) {
             running = true
         }
         return ProviderLiveness(loaded: loaded, running: running)
+    }
+
+    /// A live launchd process becomes inactive only when a daemon-state record
+    /// attributable to that still-live PID has gone stale. No state (normal
+    /// during initial model preload) or a state record from a dead prior PID
+    /// does not override launchd liveness.
+    public static func providerActive(
+        processRunning: Bool,
+        daemonState: DaemonState?,
+        now: Double,
+        processAlive: (Int32) -> Bool = daemonProcessAlive,
+        readIdentity: (Int32) -> ProcessIdentity? = ProcessIdentity.read
+    ) -> Bool {
+        guard processRunning else { return false }
+        guard let daemonState,
+              recordBelongsToLiveProcess(
+                daemonState,
+                processAlive: processAlive,
+                readIdentity: readIdentity
+              )
+        else {
+            return true
+        }
+        return !daemonState.isStale(now: now)
+    }
+
+    /// Whether a daemon-state record is attributable to a currently-live
+    /// process. With a recorded kernel identity the live process at that PID
+    /// must have the SAME start time — a PID the kernel has since reused
+    /// belongs to an unrelated process, so the record came from a DEAD
+    /// provider and must not demote (or add) liveness. Records written before
+    /// `ProcessIdentity` existed keep the PID-alive check.
+    static func recordBelongsToLiveProcess(
+        _ state: DaemonState,
+        processAlive: (Int32) -> Bool = daemonProcessAlive,
+        readIdentity: (Int32) -> ProcessIdentity? = ProcessIdentity.read
+    ) -> Bool {
+        if let recorded = state.processIdentity {
+            guard let live = readIdentity(recorded.pid), live == recorded else {
+                return false
+            }
+            return true
+        }
+        return processAlive(state.pid)
+    }
+
+    /// The provider's process identity for stale-lock-owner attribution.
+    ///
+    /// A daemon-state PID is trusted ONLY when the currently-live process at
+    /// that PID has the SAME kernel start time the daemon recorded. If the PID
+    /// was reused (the recorded process died and the kernel handed its PID to
+    /// an unrelated process — e.g. a manual `darkbloom update` that now holds
+    /// the update lock), the start times differ and we fall back to the launchd
+    /// snapshot's process. This prevents the watchdog from force-killing a live,
+    /// unrelated process that merely inherited the provider's old PID.
+    public static func providerIdentity(
+        daemonState: DaemonState?,
+        launchSnapshotProcess: ProcessIdentity?,
+        readIdentity: (Int32) -> ProcessIdentity? = ProcessIdentity.read
+    ) -> ProcessIdentity? {
+        if let recorded = daemonState?.processIdentity,
+           let live = readIdentity(recorded.pid),
+           live == recorded {
+            return live
+        }
+        return launchSnapshotProcess
     }
 
     /// Parse `launchctl print` for a live process: `state = running` or a

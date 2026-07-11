@@ -30,6 +30,7 @@ struct AutoUpdateControllerTests {
         var checkResult: UpdateCheckResult
         var stageResult: AutoUpdateController.StepOutcome = .completed
         var commitResult: AutoUpdateController.StepOutcome = .completed
+        var prepareRestartResult: AutoUpdateController.StepOutcome = .completed
         var drainReturns = true
         var restartThrows = false
     }
@@ -55,6 +56,10 @@ struct AutoUpdateControllerTests {
             waitForDrain: { _ in recorder.record("waitForDrain"); return fakes.drainReturns },
             forceCancelInflight: { recorder.record("forceCancel") },
             commitInstall: { recorder.record("commit"); return fakes.commitResult },
+            prepareInstalledRestart: {
+                recorder.record("prepareRestart")
+                return fakes.prepareRestartResult
+            },
             restart: {
                 recorder.record("restart")
                 if fakes.restartThrows { throw FakeError.restart }
@@ -145,9 +150,37 @@ struct AutoUpdateControllerTests {
         // Strict order: download/stage happens BEFORE we stop accepting work,
         // and the live-layout commit happens strictly AFTER the drain so no
         // request can observe a half-replaced bundle.
-        #expect(recorder.events == ["claim", "check", "stage", "beginDraining", "waitForDrain", "commit", "restart"])
+        #expect(recorder.events == ["claim", "check", "stage", "beginDraining", "waitForDrain", "commit", "prepareRestart", "restart"])
         #expect(!recorder.events.contains("forceCancel"))
         #expect(!recorder.events.contains("resume")) // restart succeeded → no resume
+    }
+
+    @Test("already-installed candidate drains and restarts without staging or commit")
+    func installedCandidateRestartsWithoutReinstall() async {
+        let recorder = Recorder()
+        let controller = makeController(
+            Fakes(checkResult: .restartRequired(
+                current: "1.0.0",
+                installed: "2.0.0"
+            )),
+            recorder: recorder
+        )
+
+        let outcome = await controller.run()
+
+        #expect(outcome == .restarted(
+            from: "1.0.0",
+            to: "2.0.0",
+            drained: true
+        ))
+        #expect(recorder.events == [
+            "claim",
+            "check",
+            "beginDraining",
+            "waitForDrain",
+            "prepareRestart",
+            "restart",
+        ])
     }
 
     @Test("drain timeout: force-cancels stragglers, then commits and restarts anyway")
@@ -160,7 +193,7 @@ struct AutoUpdateControllerTests {
         let outcome = await controller.run()
 
         #expect(outcome == .restarted(from: "1.0.0", to: "2.0.0", drained: false))
-        #expect(recorder.events == ["claim", "check", "stage", "beginDraining", "waitForDrain", "forceCancel", "commit", "restart"])
+        #expect(recorder.events == ["claim", "check", "stage", "beginDraining", "waitForDrain", "forceCancel", "commit", "prepareRestart", "restart"])
     }
 
     @Test("commit failure: resumes serving on the old binary, never restarts")
@@ -190,6 +223,6 @@ struct AutoUpdateControllerTests {
             Issue.record("expected .restartFailed, got \(outcome)")
             return
         }
-        #expect(recorder.events == ["claim", "check", "stage", "beginDraining", "waitForDrain", "commit", "restart", "resume"])
+        #expect(recorder.events == ["claim", "check", "stage", "beginDraining", "waitForDrain", "commit", "prepareRestart", "restart", "resume"])
     }
 }

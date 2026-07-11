@@ -50,14 +50,26 @@ extension Start {
         )
 
         // Arm the crash-recovery watchdog (relaunches ~5 min after a crash;
-        // `stop` disarms, `auto_restart = false` opts out). Best-effort.
+        // `stop` disarms, `auto_restart = false` opts out — including
+        // disarming a watchdog left loaded by a previous opted-in config).
+        // Best-effort.
         let autoRestartOn = config.provider.autoRestart
-        if autoRestartOn {
+        switch WatchdogAgent.rearmAction(
+            autoRestartEnabled: autoRestartOn,
+            isLoaded: WatchdogAgent.isLoaded()
+        ) {
+        case .arm:
             do {
-                try WatchdogAgent.installAndStart()
+                try WatchdogAgent.installAndStart(
+                    configPath: snapshot.configPath
+                )
             } catch {
                 printError("note: could not install crash-recovery watchdog: \(error)")
             }
+        case .disarm:
+            try? WatchdogAgent.stop()
+        case nil:
+            break
         }
 
         let logPath = LaunchAgent.logPath().path

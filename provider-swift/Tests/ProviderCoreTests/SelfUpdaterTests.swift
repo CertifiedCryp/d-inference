@@ -4,6 +4,117 @@ import Testing
 
 @Suite("SelfUpdater")
 struct SelfUpdaterTests {
+    @Test("production public init always verifies code signatures")
+    func productionInitVerifiesSignatures() {
+        // The only way to disable the signature pin is the internal
+        // `verifyCodeSignatures:` seam used by tests/fixtures; the public
+        // production initializer must never select the unsigned path.
+        #expect(SelfUpdater(coordinatorBaseURL: "https://api.example").verifiesCodeSignatures)
+        #expect(
+            SelfUpdater(
+                coordinatorBaseURL: "https://api.example",
+                urlSession: SelfUpdater.watchdogURLSession()
+            ).verifiesCodeSignatures
+        )
+    }
+
+    @Test("effective installed version prefers the newer of process and durable record")
+    func effectiveInstalledVersionSelection() {
+        // Surviving watchdog: process is older than the promoted disk install.
+        #expect(SelfUpdater.effectiveInstalledVersion(
+            processVersion: "1.0.0",
+            recorded: "2.0.0"
+        ) == "2.0.0")
+        // Manual reinstall bypassed recovery state: process is newer.
+        #expect(SelfUpdater.effectiveInstalledVersion(
+            processVersion: "3.0.0",
+            recorded: "1.0.0"
+        ) == "3.0.0")
+        // No durable record (fresh install) → process version.
+        #expect(SelfUpdater.effectiveInstalledVersion(
+            processVersion: "1.0.0",
+            recorded: nil
+        ) == "1.0.0")
+        // Invalid durable record → process version.
+        #expect(SelfUpdater.effectiveInstalledVersion(
+            processVersion: "1.0.0",
+            recorded: "not-a-version"
+        ) == "1.0.0")
+        // Invalid process version → durable record.
+        #expect(SelfUpdater.effectiveInstalledVersion(
+            processVersion: "dev",
+            recorded: "2.0.0"
+        ) == "2.0.0")
+    }
+
+    @Test("SemVer prerelease ordering is exact")
+    func semverPrereleaseOrdering() {
+        #expect(SelfUpdater.isNewer(
+            latest: "0.8.0-dev.2",
+            current: "0.8.0-dev.1"
+        ))
+        #expect(SelfUpdater.isNewer(
+            latest: "0.8.0",
+            current: "0.8.0-dev.9"
+        ))
+        #expect(!SelfUpdater.isNewer(
+            latest: "0.8.0-dev.1",
+            current: "0.8.0"
+        ))
+        #expect(SelfUpdater.isNewer(
+            latest: "0.8.0-rc.1",
+            current: "0.8.0-beta.11"
+        ))
+        #expect(!SelfUpdater.isNewer(
+            latest: "0.8.0-dev.01",
+            current: "0.8.0-dev.1"
+        ))
+    }
+
+    #if canImport(Darwin)
+    @Test("real packaged code signature is verified and production pin rejects ad hoc signer")
+    func realPackagedSignatureVerification() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "codesign-fixture-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let app = root.appendingPathComponent("Darkbloom.app")
+        let contents = app.appendingPathComponent("Contents")
+        let bin = contents.appendingPathComponent("MacOS")
+        try FileManager.default.createDirectory(
+            at: bin,
+            withIntermediateDirectories: true
+        )
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <plist version="1.0"><dict>
+        <key>CFBundleIdentifier</key><string>io.darkbloom.provider</string>
+        <key>CFBundleExecutable</key><string>darkbloom</string>
+        <key>CFBundlePackageType</key><string>APPL</string>
+        </dict></plist>
+        """
+        try Data(plist.utf8).write(
+            to: contents.appendingPathComponent("Info.plist")
+        )
+        for name in ["darkbloom", "darkbloom-enclave", "mlx.metallib"] {
+            try FileManager.default.copyItem(
+                at: URL(fileURLWithPath: "/usr/bin/true"),
+                to: bin.appendingPathComponent(name)
+            )
+        }
+        try runCodesign(["--force", "--deep", "--sign", "-", app.path])
+
+        try DarkbloomCodeSignature.verify(
+            app,
+            deep: true,
+            policy: .structuralForIsolatedTest
+        )
+        #expect(throws: (any Error).self) {
+            try DarkbloomCodeSignature.verify(app, deep: true)
+        }
+    }
+    #endif
 
     @Test("release endpoint preserves bundle, binary, and metallib hashes")
     func releaseEndpointPreservesAllHashes() async throws {
@@ -26,6 +137,25 @@ struct SelfUpdaterTests {
         #expect(latest.bundleHash == String(repeating: "a", count: 64))
         #expect(latest.binaryHash == String(repeating: "b", count: 64))
         #expect(latest.metallibHash == String(repeating: "c", count: 64))
+    }
+
+    @Test("release endpoint refuses a mismatched platform")
+    func releaseEndpointRefusesWrongPlatform() async throws {
+        let mock = MockCoordinator(release: MockReleaseFixture(
+            version: "99.0.0",
+            platform: "linux-amd64"
+        ))
+        let baseURL = try await mock.start()
+        defer { Task { await mock.shutdown() } }
+
+        let result = await SelfUpdater(
+            coordinatorBaseURL: baseURL.absoluteString
+        ).checkForUpdate()
+        guard case .checkFailed(let reason) = result else {
+            Issue.record("wrong-platform release was accepted")
+            return
+        }
+        #expect(reason.contains("unsupported release platform"))
     }
 
     @Test("ReleaseInfo sha256 compatibility returns bundle hash")
@@ -52,6 +182,11 @@ struct SelfUpdaterTests {
 
         try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: install, withIntermediateDirectories: true)
+        let oldBin = install.appendingPathComponent("bin")
+        try FileManager.default.createDirectory(at: oldBin, withIntermediateDirectories: true)
+        try Data("old darkbloom".utf8).write(to: oldBin.appendingPathComponent("darkbloom"))
+        try Data("old enclave".utf8).write(to: oldBin.appendingPathComponent("darkbloom-enclave"))
+        try Data("old metallib".utf8).write(to: oldBin.appendingPathComponent("mlx.metallib"))
         let darkbloom = bin.appendingPathComponent("darkbloom")
         let enclave = bin.appendingPathComponent("darkbloom-enclave")
         let metallib = bin.appendingPathComponent("mlx.metallib")
@@ -103,6 +238,11 @@ struct SelfUpdaterTests {
         try FileManager.default.createDirectory(at: appMacOS, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: binFlat, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: install, withIntermediateDirectories: true)
+        let oldAppBin = install.appendingPathComponent("Darkbloom.app/Contents/MacOS")
+        try FileManager.default.createDirectory(at: oldAppBin, withIntermediateDirectories: true)
+        try Data("old app darkbloom".utf8).write(to: oldAppBin.appendingPathComponent("darkbloom"))
+        try Data("old app enclave".utf8).write(to: oldAppBin.appendingPathComponent("darkbloom-enclave"))
+        try Data("old app metallib".utf8).write(to: oldAppBin.appendingPathComponent("mlx.metallib"))
 
         // Write Info.plist for the .app bundle.
         let infoDir = stage.appendingPathComponent("Darkbloom.app/Contents")
@@ -192,6 +332,7 @@ struct SelfUpdaterTests {
         try fm.createDirectory(at: liveMacOS, withIntermediateDirectories: true)
         try fm.createDirectory(at: liveBin, withIntermediateDirectories: true)
         try Data("old darkbloom".utf8).write(to: liveMacOS.appendingPathComponent("darkbloom"))
+        try Data("old enclave".utf8).write(to: liveMacOS.appendingPathComponent("darkbloom-enclave"))
         try Data("old metallib".utf8).write(to: liveMacOS.appendingPathComponent("mlx.metallib"))
         try fm.createSymbolicLink(
             atPath: liveBin.appendingPathComponent("mlx.metallib").path,
@@ -256,7 +397,7 @@ struct SelfUpdaterTests {
             return
         }
 
-        let result = updater.commitStagedBundle(staged)
+        let result = updater.commitStagedBundleForTesting(staged)
         guard case .success = result else {
             Issue.record("commitStagedBundle failed: \(result)")
             return
@@ -271,6 +412,41 @@ struct SelfUpdaterTests {
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: install.path)
             .filter { $0.hasPrefix(".update-staging-") || $0.hasPrefix(".update-backup-") }
         #expect(leftovers.isEmpty)
+    }
+
+    @Test("commit refuses a staged tree changed after verification")
+    func commitRefusesPostStageMutation() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "self-updater-stage-mutation-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let (tarball, release, install) = try makeAppBundleFixture(root: root)
+        let updater = SelfUpdater(coordinatorBaseURL: "https://api.example.test")
+        guard case .success(let staged) = updater.stageBundleForTesting(
+            from: tarball,
+            release: release,
+            installDir: install
+        ) else {
+            Issue.record("stageBundleForTesting failed")
+            return
+        }
+        try Data("post-verification tamper".utf8).write(
+            to: staged.stagingRoot
+                .appendingPathComponent("Darkbloom.app/Contents/Info.plist")
+        )
+
+        guard case .failure(let error) = updater.commitStagedBundleForTesting(staged) else {
+            Issue.record("mutated staging tree was installed")
+            return
+        }
+        #expect("\(error)".contains("changed after verification"))
+        #expect(try String(
+            contentsOf: install.appendingPathComponent(
+                "Darkbloom.app/Contents/MacOS/darkbloom"),
+            encoding: .utf8
+        ) == "old darkbloom")
     }
 
     @Test("a later staging pass removes OLD orphaned staging dirs but spares young (possibly live) ones")
@@ -316,6 +492,17 @@ private func runTarCreate(sourceDir: URL, tarball: URL) throws {
     try process.run()
     process.waitUntilExit()
     #expect(process.terminationStatus == 0)
+}
+
+private func runCodesign(_ arguments: [String]) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+    process.arguments = arguments
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw CocoaError(.fileWriteUnknown)
+    }
 }
 
 // MARK: - installRoot derivation (symlink regression)
