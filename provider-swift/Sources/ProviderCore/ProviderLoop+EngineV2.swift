@@ -98,6 +98,13 @@ extension ProviderLoop {
         /// Machine-memory override for the re-slice fleet budget (nil ⇒
         /// real physical memory).
         let physicalMemoryBytes: UInt64?
+        /// Backend kind the hook-built bridge reports per model (default
+        /// `.contiguous`). A `.paged` entry makes the bridge apply the
+        /// production paged semantics — resize clamps to the scripted
+        /// engine's physical `kvBytesBackendCapacity`, no per-request
+        /// shared-gate reserve — so mixed paged+contiguous re-slice
+        /// orchestration is testable without weights.
+        let kvBackendKindByModel: [String: EngineV2KVBackendKind]
         /// Scripted engine builder: (modelId, kvBytesCapacity) — the second
         /// argument is the RE-SLICED, POST-CARVE admission ceiling the
         /// production path would hand `makeProductionEngine`, exposed so
@@ -111,6 +118,7 @@ extension ProviderLoop {
             extraEOSTokens: [String] = [],
             emitTelemetry: (@Sendable (TelemetryEvent) -> Void)? = nil,
             physicalMemoryBytes: UInt64? = nil,
+            kvBackendKindByModel: [String: EngineV2KVBackendKind] = [:],
             makeEngine: @escaping @Sendable (String, Int) throws -> any CBv2Engine
         ) {
             self.environment = environment
@@ -118,6 +126,7 @@ extension ProviderLoop {
             self.extraEOSTokens = extraEOSTokens
             self.emitTelemetry = emitTelemetry
             self.physicalMemoryBytes = physicalMemoryBytes
+            self.kvBackendKindByModel = kvBackendKindByModel
             self.makeEngine = makeEngine
         }
     }
@@ -156,17 +165,16 @@ extension ProviderLoop {
     /// Existing v2 slots eligible for re-slicing: live (not mid-unload)
     /// slots other than `excludingModelId` (a same-id slot present during a
     /// reload is excluded so its weights/grant are not double-counted).
-    /// Reads each slot's CURRENT TOTAL claim (post-any-earlier-resize):
-    /// engine admission ceiling PLUS the slot's fixed prefix-cache budget
-    /// (`slotKVBytesClaim`, T-041) — counting only the engine ceiling would
-    /// re-grant the cache's bytes to a newcomer. Grants flowing back down
-    /// (`updateKVBytesCapacity`) are totals too; the bridge nets out its
-    /// own cache budget before touching the engine.
+    /// Reads each slot's CURRENT logical admission target PLUS the fixed
+    /// prefix-cache budget. This is the exact rollback value after a failed
+    /// load. Paged physical claims are tracked separately by
+    /// `slotKVBytesClaim()` for fleet accounting and never shrink when this
+    /// logical target is re-sliced.
     private func existingSlotGrants(excludingModelId: String) async -> [ExistingSlotGrant] {
         var existing: [ExistingSlotGrant] = []
         for (slotModelId, slot) in modelSlots
         where slotModelId != excludingModelId && !modelsUnloading.contains(slotModelId) {
-            let currentGrant = await slot.engineV2.slotKVBytesClaim()
+            let currentGrant = await slot.engineV2.resliceAdmissionBytesClaim()
             existing.append(
                 ExistingSlotGrant(
                     slot: EngineV2KVSizing.ResliceSlot(
@@ -448,12 +456,14 @@ extension ProviderLoop {
                 prefixCacheBudgetBytes: carve.prefixCacheBudgetBytes,
                 emitTelemetry: hooks.emitTelemetry,
                 makeEngine: {
-                    // Scripted hook engines are backend-less stubs:
-                    // contiguous semantics (per-request shared-gate
-                    // reserves, resize-in-place re-slice).
+                    // Scripted hook engines default to contiguous semantics
+                    // (per-request shared-gate reserves, resize-in-place
+                    // re-slice); a per-model `.paged` entry opts into the
+                    // production paged bridge semantics for mixed-backend
+                    // re-slice tests.
                     EngineV2Factory.ProductionBuild(
                         engine: try hookBuilder(modelId, carve.engineKVBytesCapacity),
-                        kvBackendKind: .contiguous,
+                        kvBackendKind: hooks.kvBackendKindByModel[modelId] ?? .contiguous,
                         kvBackendFallbackReason: nil)
                 })
             // WARN once (per load) that kv_quant is ignored on the v2 path
