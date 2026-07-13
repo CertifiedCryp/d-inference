@@ -2202,21 +2202,52 @@ func (s *PostgresStore) UsageTotals() UsageTotals {
 	return t
 }
 
-// UsageTimeSeries returns per-minute usage buckets at or after `since`.
-func (s *PostgresStore) UsageTimeSeries(since time.Time) []UsageBucket {
+// UsageTotalsSince returns aggregate usage at or after `since`.
+func (s *PostgresStore) UsageTotalsSince(since time.Time) UsageTotals {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var t UsageTotals
+	_ = s.pool.QueryRow(ctx,
+		`SELECT COUNT(*),
+		        COALESCE(SUM(prompt_tokens), 0),
+		        COALESCE(SUM(completion_tokens), 0)
+		 FROM usage
+		 WHERE created_at >= $1`,
+		since,
+	).Scan(&t.Requests, &t.PromptTokens, &t.CompletionTokens)
+	return t
+}
+
+// UsageTimeSeries returns usage buckets at or after `since` using a bounded,
+// caller-selected interval so long windows do not return tens of thousands of
+// minute rows.
+func (s *PostgresStore) UsageTimeSeries(since, until time.Time, bucketSize time.Duration) []UsageBucket {
+	since, until, bucketSize = normalizeUsageTimeSeriesRequest(since, until, bucketSize, time.Now())
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT date_trunc('minute', created_at) AS minute,
-		        COUNT(*),
-		        COALESCE(SUM(prompt_tokens), 0),
-		        COALESCE(SUM(completion_tokens), 0)
-		 FROM usage
-		 WHERE created_at >= $1
-		 GROUP BY minute
-		 ORDER BY minute ASC`,
+		`WITH bounded AS (
+		   SELECT to_timestamp(
+		            floor(extract(epoch FROM created_at) / $3::double precision) * $3::double precision
+		          ) AS bucket_start,
+		          COUNT(*) AS requests,
+		          COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+		          COALESCE(SUM(completion_tokens), 0) AS completion_tokens
+		   FROM usage
+		   WHERE created_at >= $1 AND created_at < $2
+		   GROUP BY 1
+		   ORDER BY 1 DESC
+		   LIMIT $4
+		 )
+		 SELECT bucket_start, requests, prompt_tokens, completion_tokens
+		 FROM bounded
+		 ORDER BY bucket_start ASC`,
 		since,
+		until,
+		bucketSize.Seconds(),
+		usageTimeSeriesMaxBuckets,
 	)
 	if err != nil {
 		return nil
@@ -2231,7 +2262,7 @@ func (s *PostgresStore) UsageTimeSeries(since time.Time) []UsageBucket {
 		}
 		buckets = append(buckets, b)
 	}
-	return buckets
+	return limitUsageTimeSeriesBuckets(buckets)
 }
 
 // rewardLedgerTypesSQLList renders RewardLedgerTypes as a comma-separated list
