@@ -2,9 +2,26 @@ package store
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestLegacyCacheAffinityScrubMigration(t *testing.T) {
+	for _, required := range []string{
+		"scrub_inference_route_cache_affinity_v1",
+		"UPDATE inference_routes SET cache_affinity_key = ''",
+		"INSERT INTO schema_migrations",
+	} {
+		if !strings.Contains(legacyCacheAffinityScrubMigration, required) {
+			t.Fatalf("legacy cache-affinity scrub migration missing %q", required)
+		}
+	}
+	if !strings.Contains(legacyCacheAffinityGuardFunction, "NEW.cache_affinity_key := ''") ||
+		!strings.Contains(legacyCacheAffinityGuardTrigger, "BEFORE INSERT OR UPDATE OF cache_affinity_key") {
+		t.Fatal("legacy cache-affinity write guard is incomplete")
+	}
+}
 
 func TestInferenceRoute_Memory(t *testing.T) {
 	s := NewMemory(Config{})
@@ -74,7 +91,6 @@ func testInferenceRouteStore(t *testing.T, s Store) {
 		HasTools:                false,
 		SelfRouteOnly:           false,
 		PreferOwner:             true,
-		CacheAffinityKey:        "owner-123",
 	}
 
 	if err := s.RecordInferenceRoute(rec); err != nil {
@@ -85,6 +101,13 @@ func testInferenceRouteStore(t *testing.T, s Store) {
 	all := s.InferenceRouteRecordsSince(time.Time{})
 	if len(all) != 1 {
 		t.Fatalf("InferenceRouteRecordsSince(zero) = %d records, want 1", len(all))
+	}
+	encoded, err := json.Marshal(all[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "cache_affinity_key") {
+		t.Fatalf("route telemetry serialized legacy cache key material: %s", encoded)
 	}
 	got := all[0]
 	if got.RequestID != "req-1" || got.Attempt != 1 || got.ProviderID != "prov-1" {

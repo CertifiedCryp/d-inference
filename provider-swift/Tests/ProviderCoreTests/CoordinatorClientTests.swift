@@ -35,6 +35,7 @@ import Testing
     #expect(object["public_key"] as? String == "cHVibGlj")
     #expect(object["auth_token"] as? String == "device-token")
     #expect(object["encrypted_response_chunks"] as? Bool == true)
+    #expect(object["prefix_cache_protocol"] as? Int == 1)
     #expect(json.contains(#""attestation":\#(rawAttestation)"#))
 
     // The hypervisor concept was removed: the registration frame's
@@ -152,6 +153,26 @@ import Testing
         seSignature: "sig",
         responseHash: "hash"
     )))
+
+    let lookup = try CoordinatorClientCodec.encodeOutboundMessageString(.prefixCacheLookup(
+        requestId: "req-3",
+        cacheReceiptNonce: "nonce",
+        outcome: .hit,
+        tier: .ssd,
+        cachedTokens: 512,
+        prefillTokensSaved: 384,
+        stageMs: 2.5))
+    #expect(lookup.contains(#""type":"prefix_cache_lookup""#))
+    #expect(lookup.contains(#""cache_receipt_nonce":"nonce""#))
+
+    let ready = try CoordinatorClientCodec.encodeOutboundMessageString(.prefixCacheReady(
+        requestId: "req-3",
+        cacheReceiptNonce: "nonce",
+        readyTokens: 1024,
+        requiredRecomputeTokens: 256,
+        expectedPrefillTokensSaved: 768,
+        tier: .ssd))
+    #expect(ready.contains(#""type":"prefix_cache_ready""#))
 }
 
 @Test func coordinatorHeartbeatConstructionOmitRulesMatchProtocol() throws {

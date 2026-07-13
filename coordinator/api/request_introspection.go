@@ -3,14 +3,13 @@ package api
 // request_introspection.go holds helpers for introspecting and lightly
 // reshaping inbound inference request bodies before routing/dispatch:
 // token and cost estimation (routing vs billing), media/tool detection,
-// remote media-URL rejection, cache-affinity key derivation, and
+// remote media-URL rejection and
 // provider-serial allowlist parsing. Most are pure helpers with no Server
 // state; the pre-dispatch media-URL rejection (rejectRemoteMediaURLs) hangs
 // off *Server only to record rejection telemetry. Split out of consumer.go
 // to keep the request-handling orchestrator thin.
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -474,19 +473,6 @@ func (s *Server) rejectRemoteMediaURLs(w http.ResponseWriter, r *http.Request, p
 func requestHasTools(parsed map[string]any) bool {
 	tools, ok := parsed["tools"].([]any)
 	return ok && len(tools) > 0
-}
-
-func requestCacheAffinityKey(parsed map[string]any) string {
-	raw, ok := parsed["prompt_cache_key"].(string)
-	if !ok || raw == "" {
-		return ""
-	}
-	const maxPromptCacheKeyBytes = 512
-	if len(raw) > maxPromptCacheKeyBytes {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(raw))
-	return fmt.Sprintf("%x", sum[:])
 }
 
 func estimateRequestedMaxTokens(parsed map[string]any) int {

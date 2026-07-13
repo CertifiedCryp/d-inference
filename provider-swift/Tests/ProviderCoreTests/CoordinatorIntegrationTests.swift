@@ -127,7 +127,9 @@ struct CoordinatorIntegrationTests {
         try await mock.pushInferenceRequest(
             requestId: requestId,
             providerPublicKeyBase64: providerKeys.publicKeyBase64,
-            chatRequestJSON: chatJSON
+            chatRequestJSON: chatJSON,
+            cacheReceiptNonce: "nonce-int-1",
+            cacheScope: "authenticated-account-route"
         )
 
         // Run a tiny "fake provider loop":
@@ -146,8 +148,12 @@ struct CoordinatorIntegrationTests {
         let testTask: Task<Void, Never> = Task { [stateBox] in
             for await event in events {
                 switch event {
-                case .inferenceRequest(let rid, let ciphertext, let senderKey):
+                case .inferenceRequest(
+                    let rid, let ciphertext, let senderKey, let nonce, let scope
+                ):
                     #expect(rid == requestId)
+                    #expect(nonce == "nonce-int-1")
+                    #expect(scope == "authenticated-account-route")
                     guard let key = senderKey else {
                         Issue.record("missing sender public key")
                         continue

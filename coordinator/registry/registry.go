@@ -154,10 +154,13 @@ type PendingRequest struct {
 	// meets the floor, the full pool is kept so the request is still served
 	// (cold-dispatch/queue spill is a separate concern). 0 disables it.
 	MinDecodeTPS float64
-	// CacheAffinityKey is SHA256(prompt_cache_key) from the request body. Empty
-	// means no cache-affinity routing. It is scoped again by account and model in
-	// the registry tracker and is never persisted.
-	CacheAffinityKey string
+	// CacheRoute contains coordinator-only HMAC route keys. They are never sent
+	// to providers, logged, or persisted.
+	CacheRoute          CacheRoute
+	CacheReceiptNonce   string
+	CacheScope          string
+	cacheRoutingHints   map[string]cacheRoutingHint
+	cacheRoutingObserve bool
 	// TokenAdmission records the output-token charge admitted at request time so
 	// successful completion can reconcile any positive actual-output delta.
 	TokenAdmission TokenAdmission
@@ -475,6 +478,9 @@ type Provider struct {
 	// Benchmark data reported at registration
 	PrefillTPS float64 // prefill tokens per second
 	DecodeTPS  float64 // decode tokens per second
+	// PrefixCacheProtocol is the provider-confirmed cache receipt protocol
+	// version. Zero means the provider receives no cache fields.
+	PrefixCacheProtocol int
 
 	// Warm model cache tracking
 	WarmModels   []string // models currently loaded in provider's memory
@@ -627,8 +633,12 @@ func (p *Provider) addPendingLocked(pr *PendingRequest) {
 // RemovePending removes and returns a pending request.
 func (p *Provider) RemovePending(requestID string) *PendingRequest {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.removePendingLocked(requestID)
+	pr := p.removePendingLocked(requestID)
+	p.mu.Unlock()
+	if pr != nil && p.registry != nil {
+		p.registry.MarkCacheAttemptTerminal(pr)
+	}
+	return pr
 }
 
 // removePendingLocked removes and returns a pending request. Caller must hold p.mu.
@@ -1417,9 +1427,13 @@ type Registry struct {
 	// rebuilt each sweep so disconnected providers drop out automatically.
 	evictStrikes map[string]int
 
-	cacheAffinity        *cacheAffinityTracker
-	cacheAffinityBonusMs float64
-	warmPool             *warmPoolController
+	cacheRouting                *cacheRoutingTracker
+	cacheRoutingMode            string
+	cacheRouteKeys              cacheRouteKeys
+	cacheRoutingMaxDiscountMs   float64
+	cacheRoutingMaxCostFraction float64
+	cacheRoutingDedicated       bool
+	warmPool                    *warmPoolController
 	// loadModelSender is a test seam for SendLoadModel. Nil uses the provider WebSocket.
 	loadModelSender func(providerID, modelID string) error
 
@@ -1500,30 +1514,59 @@ func New(logger *slog.Logger) *Registry {
 		disconnectedStableIDs:          make(map[string]disconnectedStableID),
 		faultKeyBySession:              make(map[string]string),
 		evictStrikes:                   make(map[string]int),
-		cacheAffinity:                  newCacheAffinityTracker(cacheAffinityTTL),
-		cacheAffinityBonusMs:           defaultCacheAffinityBonusMs,
+		cacheRouting:                   newCacheRoutingTracker(defaultCacheRoutingTTL, defaultCacheRoutingMaxHolders),
+		cacheRoutingMode:               CacheRoutingOff,
+		cacheRoutingMaxDiscountMs:      defaultCacheRoutingMaxDiscountMs,
+		cacheRoutingMaxCostFraction:    defaultCacheRoutingMaxCostFraction,
 		logger:                         logger,
 	}
 }
 
-func (r *Registry) ConfigureCacheAffinity(cfg CacheAffinityConfig) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cfg.TTL <= 0 {
-		cfg.TTL = cacheAffinityTTL
+func (r *Registry) ConfigureCacheRouting(cfg CacheRoutingConfig) error {
+	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
+	if cfg.Mode == "" {
+		cfg.Mode = CacheRoutingOff
 	}
-	r.cacheAffinity = newCacheAffinityTracker(cfg.TTL)
-	r.cacheAffinityBonusMs = cfg.BonusMs
+	if cfg.TTL == 0 {
+		cfg.TTL = defaultCacheRoutingTTL
+	}
+	if cfg.MaxHolders == 0 {
+		cfg.MaxHolders = defaultCacheRoutingMaxHolders
+	}
+	if err := cfg.Check(); err != nil {
+		return err
+	}
+	var keys cacheRouteKeys
+	if cfg.Mode != CacheRoutingOff {
+		master, err := decodeCacheMasterKey(cfg.MasterKey)
+		if err != nil {
+			return err
+		}
+		keys = deriveCacheKeys(master)
+	}
+	tracker := newCacheRoutingTracker(cfg.TTL, cfg.MaxHolders)
+	r.mu.Lock()
+	r.cacheRouting = tracker
+	r.cacheRoutingMode = cfg.Mode
+	r.cacheRouteKeys = keys
+	r.cacheRoutingMaxDiscountMs = cfg.MaxDiscountMs
+	r.cacheRoutingMaxCostFraction = cfg.MaxCostFraction
+	r.cacheRoutingDedicated = cfg.Dedicated
+	r.mu.Unlock()
+	return nil
 }
 
-func (r *Registry) CacheAffinityConfigSnapshot() CacheAffinityConfig {
+func (r *Registry) CacheRoutingConfigSnapshot() CacheRoutingConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	ttl := cacheAffinityTTL
-	if r.cacheAffinity != nil {
-		ttl = r.cacheAffinity.ttl
+	return CacheRoutingConfig{
+		Mode:            r.cacheRoutingMode,
+		TTL:             r.cacheRouting.ttl,
+		MaxHolders:      r.cacheRouting.maxHolders,
+		MaxDiscountMs:   r.cacheRoutingMaxDiscountMs,
+		MaxCostFraction: r.cacheRoutingMaxCostFraction,
+		Dedicated:       r.cacheRoutingDedicated,
 	}
-	return CacheAffinityConfig{TTL: ttl, BonusMs: r.cacheAffinityBonusMs}
 }
 
 // RecordDispatchLoadFailure puts a provider-model pair on a routing cool-down
@@ -2545,6 +2588,7 @@ func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.Regis
 		APNsEnvironment:         msg.APNsEnvironment,
 		PrefillTPS:              msg.PrefillTPS,
 		DecodeTPS:               msg.DecodeTPS,
+		PrefixCacheProtocol:     msg.PrefixCacheProtocol,
 		TrustLevel:              TrustNone,
 		RuntimeVerified:         true,  // default to verified; API layer sets false when manifest check fails
 		RuntimeManifestChecked:  true,  // default to true; API layer sets false when no manifest is configured
@@ -3550,6 +3594,9 @@ func (r *Registry) Disconnect(id string) {
 	if !ok {
 		return
 	}
+	// Cache holders and nonce-bound attempts are connection-scoped. Clear them
+	// after releasing registry/provider locks.
+	r.cacheRouting.disconnect(id)
 
 	// Close all pending request channels so consumers get errors. Pending
 	// requests created by tests may leave these channels nil, and consumer

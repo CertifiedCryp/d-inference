@@ -256,6 +256,7 @@ extension EngineV2Factory {
         let schedulerConfig = CBv2SchedulerConfig(
             maxConcurrentRequests: max(1, maxConcurrentRequests),
             enablePrefixCache: prefixCache != nil)
+        let engineLoopConfig = productionLoopConfig(environment: environment)
 
         func contiguousAssembly() -> (CBv2KVBackend, [any CBv2AttendingLayerCache]) {
             let backend = CBv2ContiguousKVBackend(
@@ -320,7 +321,9 @@ extension EngineV2Factory {
                         engine: makeEngineV2(
                             model: model, tokenizer: tokenizer, layerKinds: layerKinds,
                             backend: paged, caches: caches,
-                            schedulerConfig: schedulerConfig, prefixCache: prefixCache),
+                            schedulerConfig: schedulerConfig,
+                            prefixCache: prefixCache,
+                            loopConfig: engineLoopConfig),
                         kvBackendKind: .paged,
                         kvBackendFallbackReason: nil)
                 } catch let error as CBv2KVError {
@@ -342,7 +345,9 @@ extension EngineV2Factory {
             engine: makeEngineV2(
                 model: model, tokenizer: tokenizer, layerKinds: layerKinds,
                 backend: backend, caches: caches,
-                schedulerConfig: schedulerConfig, prefixCache: prefixCache),
+                schedulerConfig: schedulerConfig,
+                prefixCache: prefixCache,
+                loopConfig: engineLoopConfig),
             kvBackendKind: .contiguous,
             kvBackendFallbackReason: fallbackReason)
     }
@@ -355,7 +360,8 @@ extension EngineV2Factory {
         backend: CBv2KVBackend,
         caches: [any CBv2AttendingLayerCache],
         schedulerConfig: CBv2SchedulerConfig,
-        prefixCache: (any CBv2PrefixCache)?
+        prefixCache: (any CBv2PrefixCache)?,
+        loopConfig: CBv2EngineLoopConfig
     ) -> EngineV2 {
         EngineV2(
             model: CBv2SteppableLanguageModelAdapter(model),
@@ -365,11 +371,27 @@ extension EngineV2Factory {
             sampler: CBv2DefaultSampler(),
             detokenizerFactory: CBv2TextDetokenizerFactory(tokenizer: tokenizer),
             schedulerConfig: schedulerConfig,
+            loopConfig: loopConfig,
             // TB-007 / T-041 (v0.7.5): this CBv2 cache is either the
             // default-on encrypted SSD tier or the opt-in RAM PrefixCacheV2
             // tier. Both use per-request cacheSalt scoping; selection and
             // budgets live in PrefixCachePolicy.
             prefixCache: prefixCache
         )
+    }
+
+    static func earlyPrefixDonationEnabled(environment: [String: String]) -> Bool {
+        guard let raw = environment["DARKBLOOM_EARLY_PROMPT_DONATION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        else { return false }
+        return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+    }
+
+    static func productionLoopConfig(
+        environment: [String: String]
+    ) -> CBv2EngineLoopConfig {
+        CBv2EngineLoopConfig(
+            enableEarlyPrefixDonation: earlyPrefixDonationEnabled(environment: environment))
     }
 }

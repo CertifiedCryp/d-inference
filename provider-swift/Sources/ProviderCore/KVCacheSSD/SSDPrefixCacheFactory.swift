@@ -49,6 +49,34 @@ enum SSDPrefixCacheFactory {
             "\(Self.ssdRootDirectoryName)/\(modelKey)", isDirectory: true)
     }
 
+    static func cacheRootDirectory() -> URL {
+        let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return root.appendingPathComponent(Self.ssdRootDirectoryName, isDirectory: true)
+    }
+
+    static func startWholeRootMaintenance(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        intervalSeconds: Int = 60
+    ) {
+        let root = cacheRootDirectory()
+        let ttl = SSDPrefixCachePolicy.ttlSeconds(environment: environment)
+        SSDWholeRootMaintainer.shared.startPeriodicMaintenance(
+            root: root,
+            ttlSeconds: ttl,
+            intervalSeconds: intervalSeconds,
+            nowSeconds: { Int64(Date().timeIntervalSince1970) },
+            budgetBytes: {
+                PrefixCachePolicy.ssdDiskBudgetBytes(
+                    environment: ProcessInfo.processInfo.environment,
+                    freeBytes: PrefixCachePolicy.volumeFreeBytes(at: root))
+            })
+    }
+
+    static func stopWholeRootMaintenance() {
+        SSDWholeRootMaintainer.shared.stopPeriodicMaintenance(root: cacheRootDirectory())
+    }
+
     /// Build the SSD tier for a supported model slot. `weightHash` nil falls
     /// back to the model id (same binding degradation as the legacy tier).
     static func make(
@@ -93,6 +121,7 @@ enum SSDPrefixCacheFactory {
 
         let dir = cacheDirectory(modelId: modelId)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let wholeRoot = cacheRootDirectory()
 
         let blockSize = PrefixCachePolicy.blockSize
         let config = SSDPrefixCache.Config(
@@ -117,8 +146,19 @@ enum SSDPrefixCacheFactory {
                 PrefixCachePolicy.ssdDiskBudgetBytes(
                     environment: ProcessInfo.processInfo.environment,
                     freeBytes: PrefixCachePolicy.volumeFreeBytes(at: dir))
+            },
+            maintainWholeRoot: { [wholeRoot, dir] in
+                _ = SSDWholeRootMaintainer.shared.maintain(
+                    root: wholeRoot,
+                    ttlSeconds: SSDPrefixCachePolicy.ttlSeconds(
+                        environment: ProcessInfo.processInfo.environment),
+                    nowSeconds: Int64(Date().timeIntervalSince1970),
+                    budgetBytes: PrefixCachePolicy.ssdDiskBudgetBytes(
+                        environment: ProcessInfo.processInfo.environment,
+                        freeBytes: PrefixCachePolicy.volumeFreeBytes(at: dir)))
             })
         cache.startBackgroundTasks()
+        startWholeRootMaintenance(environment: environment)
         #if canImport(os)
         logger.info(
             "ssd prefix cache active for \(modelId, privacy: .public) at \(dir.path, privacy: .public): ttl \(config.ttlSeconds)s sliding, box-wide disk budget \(PrefixCachePolicy.ssdDiskBudgetBytes(environment: environment, freeBytes: PrefixCachePolicy.volumeFreeBytes(at: dir))) B, adoption bound \(config.adoptionBoundTokens) tok — HMAC-keyed names (T-041 leak #2 closed), no memory carve")

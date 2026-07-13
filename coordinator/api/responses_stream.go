@@ -429,7 +429,7 @@ func (e *responsesStreamEmitter) finish(usage protocol.UsageInfo) {
 	e.closeOpenItems()
 
 	reasoningTokens := resolveReasoningTokens(usage, e.reasoningBuf.String())
-	u := buildResponsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens)
+	u := buildResponsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens, uint64(usage.CachedTokens))
 
 	status := "completed"
 	eventType := "response.completed"

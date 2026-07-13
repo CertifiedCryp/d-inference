@@ -53,7 +53,8 @@ public enum CoordinatorClientCodec {
             privacyCapabilities: privacyCapabilities,
             privateOnly: config.privateOnly,
             apnsDeviceToken: effectiveToken,
-            apnsEnvironment: effectiveEnv
+            apnsEnvironment: effectiveEnv,
+            prefixCacheProtocol: 1
         ))
     }
 
@@ -168,6 +169,33 @@ public enum CoordinatorClientCodec {
 
         case .modelsUpdate(let models):
             return .modelsUpdate(ProviderMessage.ModelsUpdate(models: models))
+
+        case .prefixCacheLookup(
+            let requestId, let nonce, let outcome, let tier,
+            let cachedTokens, let prefillTokensSaved, let stageMs
+        ):
+            return .prefixCacheLookup(ProviderMessage.PrefixCacheLookup(
+                requestId: requestId,
+                cacheReceiptNonce: nonce,
+                outcome: outcome,
+                tier: tier,
+                cachedTokens: cachedTokens,
+                prefillTokensSaved: prefillTokensSaved,
+                stageMs: stageMs
+            ))
+
+        case .prefixCacheReady(
+            let requestId, let nonce, let readyTokens,
+            let requiredRecomputeTokens, let expectedPrefillTokensSaved, let tier
+        ):
+            return .prefixCacheReady(ProviderMessage.PrefixCacheReady(
+                requestId: requestId,
+                cacheReceiptNonce: nonce,
+                readyTokens: readyTokens,
+                requiredRecomputeTokens: requiredRecomputeTokens,
+                expectedPrefillTokensSaved: expectedPrefillTokensSaved,
+                tier: tier
+            ))
         }
     }
 

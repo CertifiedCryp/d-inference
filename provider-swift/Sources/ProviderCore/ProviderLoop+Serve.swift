@@ -46,6 +46,12 @@ extension ProviderLoop {
         logger.info("Models: \(loopConfig.models.count) advertised")
         logger.info("Coordinator: \(loopConfig.coordinatorURL)")
 
+        // Maintain the entire encrypted SSD-cache root even when no model is
+        // loaded. This is metadata/file-only work: no weights or KV arrays are
+        // constructed. It closes TTL and 20 GiB budget gaps for unloaded dirs.
+        SSDPrefixCacheFactory.startWholeRootMaintenance()
+        defer { SSDPrefixCacheFactory.stopWholeRootMaintenance() }
+
         // Keep the network stack alive during sleep for APN/MDM push delivery.
         networkAssertion.acquire()
         defer { networkAssertion.release() }
@@ -239,11 +245,16 @@ extension ProviderLoop {
                     // will not route responses for a dead connection.
                     await cancelAllInflight()
 
-                case .inferenceRequest(let requestId, let ciphertext, let senderPublicKey):
+                case .inferenceRequest(
+                    let requestId, let ciphertext, let senderPublicKey,
+                    let cacheReceiptNonce, let cacheScope
+                ):
                     await handleInferenceRequest(
                         requestId: requestId,
                         ciphertext: ciphertext,
                         senderPublicKey: senderPublicKey,
+                        cacheReceiptNonce: cacheReceiptNonce,
+                        authenticatedCacheScope: cacheScope,
                         send: send
                     )
 

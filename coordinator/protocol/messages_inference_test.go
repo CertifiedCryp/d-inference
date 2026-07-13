@@ -133,6 +133,74 @@ func TestInferenceRequestMarshal(t *testing.T) {
 	}
 }
 
+func TestInferenceRequestCacheFieldsAreOptionalAndOuter(t *testing.T) {
+	msg := InferenceRequestMessage{Type: TypeInferenceRequest, RequestID: "req"}
+	without, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(without, []byte("cache_scope")) || bytes.Contains(without, []byte("cache_receipt_nonce")) {
+		t.Fatalf("zero-value cache fields were not omitted: %s", without)
+	}
+	msg.CacheReceiptNonce = "nonce"
+	msg.CacheScope = "opaque-scope"
+	with, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(with, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["cache_receipt_nonce"] != "nonce" || decoded["cache_scope"] != "opaque-scope" {
+		t.Fatalf("outer cache fields missing: %s", with)
+	}
+}
+
+func TestRegisterPrefixCacheProtocolOptional(t *testing.T) {
+	without, err := json.Marshal(RegisterMessage{Type: TypeRegister})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(without, []byte("prefix_cache_protocol")) {
+		t.Fatalf("zero protocol version was not omitted: %s", without)
+	}
+	with, err := json.Marshal(RegisterMessage{Type: TypeRegister, PrefixCacheProtocol: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(with, []byte(`"prefix_cache_protocol":1`)) {
+		t.Fatalf("protocol version missing: %s", with)
+	}
+}
+
+func TestPrefixCacheReceiptsDecode(t *testing.T) {
+	for _, tc := range []struct {
+		wire string
+		want any
+	}{
+		{`{"type":"prefix_cache_lookup","request_id":"r","cache_receipt_nonce":"n","outcome":"hit","tier":"ssd","cached_tokens":256,"prefill_tokens_saved":240,"stage_ms":3.5}`, &PrefixCacheLookupMessage{}},
+		{`{"type":"prefix_cache_ready","request_id":"r","cache_receipt_nonce":"n","ready_tokens":512,"required_recompute_tokens":16,"expected_prefill_tokens_saved":496,"tier":"memory"}`, &PrefixCacheReadyMessage{}},
+	} {
+		var decoded ProviderMessage
+		if err := json.Unmarshal([]byte(tc.wire), &decoded); err != nil {
+			t.Fatalf("decode %s: %v", tc.wire, err)
+		}
+		switch tc.want.(type) {
+		case *PrefixCacheLookupMessage:
+			msg, ok := decoded.Payload.(*PrefixCacheLookupMessage)
+			if !ok || msg.CacheReceiptNonce != "n" || msg.CachedTokens != 256 {
+				t.Fatalf("lookup payload = %#v", decoded.Payload)
+			}
+		case *PrefixCacheReadyMessage:
+			msg, ok := decoded.Payload.(*PrefixCacheReadyMessage)
+			if !ok || msg.CacheReceiptNonce != "n" || msg.ReadyTokens != 512 {
+				t.Fatalf("ready payload = %#v", decoded.Payload)
+			}
+		}
+	}
+}
+
 func TestCancelMarshal(t *testing.T) {
 	msg := CancelMessage{
 		Type:      TypeCancel,

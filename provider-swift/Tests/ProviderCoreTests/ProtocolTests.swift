@@ -871,6 +871,107 @@ import Testing
     #expect(!noTokenJSON.contains("apns_environment"))
 }
 
+@Test func prefixCacheProtocolCapabilityEncodesOnBothRegistrationPaths() throws {
+    func message(attestation: RawJSON?) -> ProviderMessage {
+        .register(ProviderMessage.Register(
+            hardware: sampleHardware(),
+            models: [sampleModel()],
+            backend: "mlx_swift_lm",
+            attestation: attestation,
+            prefixCacheProtocol: 1))
+    }
+    for attestation in [nil, RawJSON(rawBytes: Data(#"{"ok":true}"#.utf8))] {
+        let data = try ProviderProtocolCodec.encodeProviderMessage(message(attestation: attestation))
+        let object = try jsonObject(data)
+        #expect(object["prefix_cache_protocol"] as? Int == 1)
+        guard case .register(let decoded) = try ProviderProtocolCodec.decodeProviderMessage(from: data)
+        else { throw TestFailure.unexpectedMessage }
+        #expect(decoded.prefixCacheProtocol == 1)
+    }
+
+    let legacy = ProviderMessage.register(ProviderMessage.Register(
+        hardware: sampleHardware(), models: [], backend: "mlx_swift_lm"))
+    #expect(try jsonObject(ProviderProtocolCodec.encodeProviderMessage(legacy))["prefix_cache_protocol"] == nil)
+}
+
+@Test func inferenceRequestCacheEnvelopeFieldsRoundTripAndRemainOptional() throws {
+    let scoped = CoordinatorMessage.inferenceRequest(.init(
+        requestId: "req-cache",
+        encryptedBody: EncryptedPayload(ephemeralPublicKey: "a", ciphertext: "b"),
+        cacheReceiptNonce: "nonce-1",
+        cacheScope: "account-route-key"))
+    let data = try ProviderProtocolCodec.encodeCoordinatorMessage(scoped)
+    let object = try jsonObject(data)
+    #expect(object["cache_receipt_nonce"] as? String == "nonce-1")
+    #expect(object["cache_scope"] as? String == "account-route-key")
+    #expect(try ProviderProtocolCodec.decodeCoordinatorMessage(from: data) == scoped)
+
+    let legacy = #"{"type":"inference_request","request_id":"r","body":null}"#
+    guard case .inferenceRequest(let decoded) = try ProviderProtocolCodec.decodeCoordinatorMessage(
+        from: Data(legacy.utf8))
+    else { throw TestFailure.unexpectedMessage }
+    #expect(decoded.cacheReceiptNonce == nil)
+    #expect(decoded.cacheScope == nil)
+}
+
+@Test func prefixCacheReceiptMessagesMatchWireContract() throws {
+    let lookup = ProviderMessage.prefixCacheLookup(.init(
+        requestId: "req-1",
+        cacheReceiptNonce: "nonce-1",
+        outcome: .hit,
+        tier: .ssd,
+        cachedTokens: 4096,
+        prefillTokensSaved: 2560,
+        stageMs: 12.5))
+    let ready = ProviderMessage.prefixCacheReady(.init(
+        requestId: "req-1",
+        cacheReceiptNonce: "nonce-1",
+        readyTokens: 8192,
+        requiredRecomputeTokens: 1536,
+        expectedPrefillTokensSaved: 6656,
+        tier: .ssd))
+    for message in [lookup, ready] {
+        let data = try ProviderProtocolCodec.encodeProviderMessage(message)
+        #expect(try ProviderProtocolCodec.decodeProviderMessage(from: data) == message)
+    }
+    let lookupObject = try jsonObject(ProviderProtocolCodec.encodeProviderMessage(lookup))
+    #expect(lookupObject["type"] as? String == "prefix_cache_lookup")
+    #expect(lookupObject["cache_receipt_nonce"] as? String == "nonce-1")
+    #expect(lookupObject["outcome"] as? String == "hit")
+    #expect(lookupObject["cached_tokens"] as? Int == 4096)
+    #expect(lookupObject["prefill_tokens_saved"] as? Int == 2560)
+    let readyObject = try jsonObject(ProviderProtocolCodec.encodeProviderMessage(ready))
+    #expect(readyObject["type"] as? String == "prefix_cache_ready")
+    #expect(readyObject["ready_tokens"] as? Int == 8192)
+    #expect(readyObject["required_recompute_tokens"] as? Int == 1536)
+}
+
+@Test func usageInfoCacheFieldsAreOptionalAndBackwardCompatible() throws {
+    let legacy = UsageInfo(promptTokens: 10, completionTokens: 2)
+    let legacyObject = try jsonObject(JSONEncoder().encode(legacy))
+    #expect(legacyObject["cache_outcome"] == nil)
+    #expect(legacyObject["cache_tier"] == nil)
+    #expect(legacyObject["cached_tokens"] == nil)
+    #expect(legacyObject["prefill_tokens_saved"] == nil)
+    #expect(legacyObject["cache_stage_ms"] == nil)
+
+    let detailed = UsageInfo(
+        promptTokens: 5000,
+        completionTokens: 20,
+        cacheOutcome: .missCorrupt,
+        cacheTier: .ssd,
+        cachedTokens: 0,
+        prefillTokensSaved: 0,
+        cacheStageMs: 4.25)
+    let encoded = try JSONEncoder().encode(detailed)
+    let object = try jsonObject(encoded)
+    #expect(object["cache_outcome"] as? String == "miss_corrupt")
+    #expect(object["cache_tier"] as? String == "ssd")
+    #expect(object["cached_tokens"] as? Int == 0)
+    #expect(object["cache_stage_ms"] as? Double == 4.25)
+    #expect(try JSONDecoder().decode(UsageInfo.self, from: encoded) == detailed)
+}
+
 private func sampleHardware() -> HardwareInfo {
     HardwareInfo(
         machineModel: "Mac16,5",

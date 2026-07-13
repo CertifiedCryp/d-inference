@@ -43,6 +43,8 @@ const (
 	TypeLoadModelStatus         = "load_model_status"
 	TypePrefetchModelStatus     = "prefetch_model_status"
 	TypeModelsUpdate            = "models_update"
+	TypePrefixCacheLookup       = "prefix_cache_lookup"
+	TypePrefixCacheReady        = "prefix_cache_ready"
 
 	// Coordinator → Provider.
 	TypeInferenceRequest     = "inference_request"
@@ -152,6 +154,7 @@ type RegisterMessage struct {
 	DecodeTPS               float64         `json:"decode_tps,omitempty"`                // benchmark: decode tokens per second
 	AuthToken               string          `json:"auth_token,omitempty"`                // device-linked provider token (from darkbloom login)
 	PrivateOnly             bool            `json:"private_only,omitempty"`              // when true, this machine serves only its owner's self-route requests, never the public fleet
+	PrefixCacheProtocol     int             `json:"prefix_cache_protocol,omitempty"`     // provider-confirmed prefix-cache protocol version
 
 	// APNs code-identity attestation (v0.6.0): the device token the coordinator
 	// pushes the E_K(nonce) code-identity challenge to, and which APNs environment
@@ -312,7 +315,37 @@ type UsageInfo struct {
 	// 0 when the response carried no reasoning content. Mirrors
 	// `reasoningTokens` in the Swift UsageInfo. omitempty keeps the wire
 	// shape unchanged for non-reasoning responses and older providers.
-	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
+	ReasoningTokens    int     `json:"reasoning_tokens,omitempty"`
+	CacheOutcome       string  `json:"cache_outcome,omitempty"`
+	CacheTier          string  `json:"cache_tier,omitempty"`
+	CachedTokens       int     `json:"cached_tokens,omitempty"`
+	PrefillTokensSaved int     `json:"prefill_tokens_saved,omitempty"`
+	CacheStageMs       float64 `json:"cache_stage_ms,omitempty"`
+}
+
+// PrefixCacheLookupMessage is a nonce-bound provider receipt describing the
+// lookup performed for one inference attempt.
+type PrefixCacheLookupMessage struct {
+	Type               string  `json:"type"`
+	RequestID          string  `json:"request_id"`
+	CacheReceiptNonce  string  `json:"cache_receipt_nonce"`
+	Outcome            string  `json:"outcome"`
+	Tier               string  `json:"tier,omitempty"`
+	CachedTokens       int     `json:"cached_tokens,omitempty"`
+	PrefillTokensSaved int     `json:"prefill_tokens_saved,omitempty"`
+	StageMs            float64 `json:"stage_ms,omitempty"`
+}
+
+// PrefixCacheReadyMessage confirms that reusable prefix state is ready after
+// an inference attempt. Ready receipts may arrive after inference_complete.
+type PrefixCacheReadyMessage struct {
+	Type                       string `json:"type"`
+	RequestID                  string `json:"request_id"`
+	CacheReceiptNonce          string `json:"cache_receipt_nonce"`
+	ReadyTokens                int    `json:"ready_tokens"`
+	RequiredRecomputeTokens    int    `json:"required_recompute_tokens,omitempty"`
+	ExpectedPrefillTokensSaved int    `json:"expected_prefill_tokens_saved,omitempty"`
+	Tier                       string `json:"tier,omitempty"`
 }
 
 // InferenceCompleteMessage signals the provider finished generating.
@@ -365,7 +398,9 @@ type InferenceRequestMessage struct {
 	RequestID string               `json:"request_id"`
 	Body      InferenceRequestBody `json:"body,omitempty"`
 	// E2E encrypted request body (set when provider has a public key)
-	EncryptedBody *EncryptedPayload `json:"encrypted_body,omitempty"`
+	EncryptedBody     *EncryptedPayload `json:"encrypted_body,omitempty"`
+	CacheReceiptNonce string            `json:"cache_receipt_nonce,omitempty"`
+	CacheScope        string            `json:"cache_scope,omitempty"`
 }
 
 // EncryptedPayload carries a NaCl Box encrypted message.
@@ -675,6 +710,20 @@ func (pm *ProviderMessage) UnmarshalJSON(data []byte) error {
 		var msg ModelsUpdateMessage
 		if err := json.Unmarshal(data, &msg); err != nil {
 			return fmt.Errorf("protocol: failed to unmarshal models_update: %w", err)
+		}
+		pm.Payload = &msg
+
+	case TypePrefixCacheLookup:
+		var msg PrefixCacheLookupMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return fmt.Errorf("protocol: failed to unmarshal prefix_cache_lookup: %w", err)
+		}
+		pm.Payload = &msg
+
+	case TypePrefixCacheReady:
+		var msg PrefixCacheReadyMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			return fmt.Errorf("protocol: failed to unmarshal prefix_cache_ready: %w", err)
 		}
 		pm.Payload = &msg
 

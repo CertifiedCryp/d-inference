@@ -130,7 +130,10 @@ enum SSDBlockStore {
     static let fileExtension = "dbk2"
     /// Same hostile-length bound as the v1 parser.
     static let maxHeaderFieldBytes = 64 * 1024 * 1024
-    static let tempInfix = "tmp-"
+    static let tempMarker = "darkbloom-tmp"
+    /// Temp ownership must survive concurrent maintenance in other processes.
+    /// One hour is deliberately much longer than the largest expected block write.
+    static let crashTempTTLSeconds: Int64 = 60 * 60
 
     #if canImport(os)
     private static let logger = Logger(
@@ -201,7 +204,7 @@ enum SSDBlockStore {
 
         let dir = url.deletingLastPathComponent()
         try ensureDirectory(dir)
-        let tmpURL = url.appendingPathExtension("\(tempInfix)\(UUID().uuidString)")
+        let tmpURL = temporaryFileURL(for: url)
         do {
             FileManager.default.createFile(atPath: tmpURL.path, contents: nil)
             let handle = try FileHandle(forWritingTo: tmpURL)
@@ -253,24 +256,98 @@ enum SSDBlockStore {
 
     // MARK: Temp sweep
 
-    /// Best-effort removal of orphaned atomic-write temp files under the
-    /// fan-out tree (process kill between createFile and rename).
-    static func sweepStaleTempFiles(under root: URL) {
+    /// `<tag>.dbk2.darkbloom-tmp.<UUID>`. The product-specific marker lets
+    /// maintenance prove ownership without opening an incomplete DBK2 file.
+    static func temporaryFileURL(for url: URL, uuid: UUID = UUID()) -> URL {
+        url.deletingLastPathComponent().appendingPathComponent(
+            "\(url.lastPathComponent).\(tempMarker).\(uuid.uuidString)")
+    }
+
+    /// Exact crash-temp ownership check. A candidate must carry the generated
+    /// filename grammar and live in the matching 2-hex fan-out directory.
+    static func isOwnedTempFileName(_ name: String, fanout: String) -> Bool {
+        guard isLowerHex(fanout, count: 2), name.utf8.count > 32 else { return false }
+        let tag = String(name.prefix(32))
+        guard isLowerHex(tag, count: 32), tag.hasPrefix(fanout) else { return false }
+        let marker = ".\(fileExtension).\(tempMarker)."
+        let remainder = String(name.dropFirst(32))
+        guard remainder.hasPrefix(marker) else { return false }
+        let uuidString = String(remainder.dropFirst(marker.count))
+        guard uuidString.utf8.count == 36, let uuid = UUID(uuidString: uuidString) else {
+            return false
+        }
+        return uuid.uuidString == uuidString
+    }
+
+    static func isLowerHex(_ value: String, count: Int) -> Bool {
+        guard value.utf8.count == count else { return false }
+        return value.utf8.allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
+    }
+
+    /// Reject a maintenance root whose path resolves through any symlink.
+    /// Maintenance performs deletion, so following a caller-controlled root
+    /// outside the dedicated cache hierarchy is never acceptable.
+    static func isSafeMaintenanceRoot(_ root: URL) -> Bool {
+        let standardized = root.standardizedFileURL
+        return standardized.path
+            == standardized.resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    static func isStaleTempFile(modifiedAt: Int64?, nowSeconds: Int64) -> Bool {
+        guard let modifiedAt, modifiedAt <= nowSeconds else { return false }
+        return nowSeconds - modifiedAt >= crashTempTTLSeconds
+    }
+
+    /// Best-effort removal of orphaned atomic-write temp files under one
+    /// recognized model tree (process kill between createFile and rename).
+    /// Young files may belong to another process and are preserved. Near-matches
+    /// and unrecognized directory shapes are never removed.
+    @discardableResult
+    static func sweepStaleTempFiles(
+        under root: URL,
+        nowSeconds: Int64 = Int64(Date().timeIntervalSince1970)
+    ) -> Int {
         let fm = FileManager.default
+        guard isSafeMaintenanceRoot(root), isLowerHex(root.lastPathComponent, count: 12)
+        else { return 0 }
         guard let fanouts = try? fm.contentsOfDirectory(
-            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
-        else { return }
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles])
+        else { return 0 }
+        var removed = 0
         for dir in fanouts {
-            let isDir = (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-            if isDir {
-                guard let nested = try? fm.contentsOfDirectory(atPath: dir.path) else { continue }
-                for name in nested where name.contains(".\(tempInfix)") {
-                    try? fm.removeItem(at: dir.appendingPathComponent(name))
+            guard isLowerHex(dir.lastPathComponent, count: 2),
+                let dirValues = try? dir.resourceValues(
+                    forKeys: [.isDirectoryKey, .isSymbolicLinkKey]),
+                dirValues.isDirectory == true, dirValues.isSymbolicLink != true,
+                let nested = try? fm.contentsOfDirectory(
+                    at: dir,
+                    includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+                    options: [.skipsHiddenFiles])
+            else { continue }
+            for url in nested {
+                guard isOwnedTempFileName(
+                    url.lastPathComponent, fanout: dir.lastPathComponent),
+                    let values = try? url.resourceValues(
+                        forKeys: [
+                            .isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey,
+                        ]),
+                    values.isRegularFile == true, values.isSymbolicLink != true,
+                    isStaleTempFile(
+                        modifiedAt: values.contentModificationDate.map {
+                            Int64($0.timeIntervalSince1970)
+                        },
+                        nowSeconds: nowSeconds)
+                else { continue }
+                if (try? fm.removeItem(at: url)) != nil {
+                    removed += 1
                 }
-            } else if dir.lastPathComponent.contains(".\(tempInfix)") {
-                try? fm.removeItem(at: dir)
             }
         }
+        return removed
     }
 
     // MARK: - DEK wrap/unwrap (verbatim legacy scheme)

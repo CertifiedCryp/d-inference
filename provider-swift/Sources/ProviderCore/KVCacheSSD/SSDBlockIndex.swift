@@ -127,6 +127,10 @@ final class SSDBlockIndex: @unchecked Sendable {
             _totalBytes = 0
         }
     }
+
+    func allTags() -> [Data] {
+        lock.withLock { Array(entries.keys) }
+    }
 }
 
 // MARK: - Box-wide disk budget
@@ -141,6 +145,9 @@ protocol SSDEvictableStore: AnyObject, Sendable {
     /// Evict the store's single oldest entry. Returns bytes freed (0 when
     /// nothing was evicted).
     func evictOldestEntry() -> Int
+    /// Drop RAM-index entries whose files were removed by whole-root
+    /// maintenance (including unloaded-model accounting).
+    func reconcileExternalRemovals()
 }
 
 /// Process-wide, BOX-WIDE disk budget (Gaj, 2026-07-07: 20 GiB default
@@ -168,6 +175,12 @@ final class SSDDiskBudget: @unchecked Sendable {
 
     func deregister(_ store: SSDEvictableStore) {
         lock.withLock { stores.removeValue(forKey: ObjectIdentifier(store)) }
+    }
+
+    func reconcileAll() {
+        lock.withLock {
+            for store in stores.values { store.reconcileExternalRemovals() }
+        }
     }
 
     var totalBytes: Int {

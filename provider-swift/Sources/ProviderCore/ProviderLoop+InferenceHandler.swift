@@ -90,6 +90,8 @@ extension ProviderLoop {
         requestId: String,
         ciphertext: Data,
         senderPublicKey: Data?,
+        cacheReceiptNonce: String?,
+        authenticatedCacheScope: String?,
         send: SendHandle
     ) async {
         logger.info("Processing inference request: \(requestId)")
@@ -170,10 +172,14 @@ extension ProviderLoop {
         // Harmony reads it to set the reasoning budget; other models
         // ignore the extra template variable.
         let reasoningEffort = Self.extractReasoningEffort(from: decryptedData)
-        // Per-tenant prefix-cache scope (prompt_cache_key / user). Decoded from
-        // the sealed body like reasoning_effort; threaded into the engine so the
-        // checkpoint cache is partitioned per consumer. "" ⇒ unscoped.
-        let cacheScope = Self.extractCacheScope(from: decryptedData)
+        // Cache identity is coordinator-authored and authenticated outside the
+        // sealed OpenAI body. Never trust caller-controlled prompt_cache_key/user
+        // for remote cache partitioning. Legacy coordinators omit the outer
+        // scope; those requests still serve, but with caching disabled.
+        let remoteCache = RemotePrefixCacheContext(
+            cacheScope: authenticatedCacheScope,
+            cacheReceiptNonce: cacheReceiptNonce)
+        let cacheScope = remoteCache.scope ?? ""
         // OpenAI `logprobs` / `top_logprobs` (also absent from the upstream
         // request shape). Non-nil only when the request asked for logprobs;
         // honored by the EngineV2 path (see EngineV2Logprobs.swift).
@@ -370,12 +376,20 @@ extension ProviderLoop {
                 return true
             }
 
-            // Per-request v2 usage-detail signal (prefixCacheHitTokens):
+            // Per-request v2 usage-detail signal (matched + saved prefix tokens):
             // written by the bridge pump at the engine terminal, read below
             // when the trailing usage chunk arrives so cached_tokens can be
             // spliced into it. Every slot serves through v2 (v0.7.5), so
             // the signal always exists.
-            let v2UsageSignal = EngineV2RequestUsageSignal()
+            // Best-effort detached delivery: callbacks never hold a cache lock
+            // or delay inference terminal messages.
+            let receiptCallbacks = PrefixCacheReceiptEmitter.callbacks(
+                requestID: requestId,
+                nonce: remoteCache.receiptNonce,
+                send: send)
+            let v2UsageSignal = EngineV2RequestUsageSignal(
+                onLookupResolved: receiptCallbacks.lookup,
+                onCacheReady: receiptCallbacks.ready)
 
             // Build a single-model engine view bound to the scheduler we
             // already resolved. This keeps the engine constructor's
@@ -395,6 +409,7 @@ extension ProviderLoop {
                 defaultMaxTokens: Self.schedulerDefaultMaxTokens,
                 reasoningEffort: reasoningEffort,
                 cacheScope: cacheScope,
+                cacheEnabled: remoteCache.cacheEnabled,
                 engineV2Logprobs: logprobsChannel.map {
                     EngineV2LogprobsPlumbing(
                         topLogprobs: logprobsSpec?.topLogprobs, channel: $0)
@@ -841,10 +856,16 @@ extension ProviderLoop {
                 completionTokens: UInt64(max(completionTokens, 0)),
                 responseBody: fullResponseText
             )
+            let cacheResult = remoteCache.scope == nil ? nil : v2UsageSignal.lookupResult
             let usageInfo = UsageInfo(
                 promptTokens: UInt64(max(0, promptTokens)),
                 completionTokens: UInt64(max(0, completionTokens)),
-                reasoningTokens: UInt64(max(0, reasoningTokens))
+                reasoningTokens: UInt64(max(0, reasoningTokens)),
+                cacheOutcome: cacheResult?.outcome,
+                cacheTier: cacheResult?.tier,
+                cachedTokens: cacheResult.map { UInt64(max(0, $0.cachedTokens)) },
+                prefillTokensSaved: cacheResult.map { UInt64(max(0, $0.prefillTokensSaved)) },
+                cacheStageMs: cacheResult?.stageMs
             )
             send.send(.inferenceComplete(
                 requestId: requestId,

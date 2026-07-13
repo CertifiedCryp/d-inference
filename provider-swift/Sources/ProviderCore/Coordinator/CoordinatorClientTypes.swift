@@ -17,7 +17,13 @@ public enum CoordinatorEvent: Sendable {
     /// 32-byte X25519 ephemeral public key, also decoded.
     /// Consumers (ProviderLoop) feed both directly to NodeKeyPair.decrypt
     /// without further base64 manipulation.
-    case inferenceRequest(requestId: String, ciphertext: Data, senderPublicKey: Data?)
+    case inferenceRequest(
+        requestId: String,
+        ciphertext: Data,
+        senderPublicKey: Data?,
+        cacheReceiptNonce: String?,
+        cacheScope: String?
+    )
     case cancel(requestId: String)
     case attestationChallenge(nonce: String, timestamp: String)
     case runtimeOutdated(mismatches: [RuntimeMismatch])
@@ -138,6 +144,23 @@ public enum OutboundMessage: Sendable {
     /// (e.g. a verified prefetch), carrying full `ModelInfo` including the
     /// computed weight hash so the coordinator can cross-check before routing.
     case modelsUpdate(models: [ModelInfo])
+    case prefixCacheLookup(
+        requestId: String,
+        cacheReceiptNonce: String,
+        outcome: PrefixCacheLookupOutcome,
+        tier: PrefixCacheTier?,
+        cachedTokens: UInt64?,
+        prefillTokensSaved: UInt64?,
+        stageMs: Double?
+    )
+    case prefixCacheReady(
+        requestId: String,
+        cacheReceiptNonce: String,
+        readyTokens: UInt64,
+        requiredRecomputeTokens: UInt64,
+        expectedPrefillTokensSaved: UInt64,
+        tier: PrefixCacheTier
+    )
 }
 
 public struct AttestationResponsePayload: Sendable {
@@ -206,4 +229,3 @@ public enum CoordinatorError: Error, CustomStringConvertible {
         }
     }
 }
-

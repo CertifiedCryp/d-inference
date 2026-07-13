@@ -29,6 +29,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 
 	"net/http"
 	"strconv"
@@ -491,6 +492,22 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 			errMsg := msg.Payload.(*protocol.InferenceErrorMessage)
 			s.handleInferenceError(providerID, provider, errMsg)
 
+		case protocol.TypePrefixCacheLookup:
+			lookupMsg := msg.Payload.(*protocol.PrefixCacheLookupMessage)
+			if s.registry.ApplyPrefixCacheLookup(providerID, lookupMsg) {
+				s.ddIncr("routing.cache_lookup_receipt", []string{"outcome:" + lookupMsg.Outcome, "tier:" + lowCardinalityCacheTier(lookupMsg.Tier)})
+			} else {
+				s.ddIncr("routing.cache_receipt_rejected", []string{"type:lookup"})
+			}
+
+		case protocol.TypePrefixCacheReady:
+			readyMsg := msg.Payload.(*protocol.PrefixCacheReadyMessage)
+			if s.registry.ApplyPrefixCacheReady(providerID, readyMsg) {
+				s.ddIncr("routing.cache_ready_receipt", []string{"tier:" + lowCardinalityCacheTier(readyMsg.Tier)})
+			} else {
+				s.ddIncr("routing.cache_receipt_rejected", []string{"type:ready"})
+			}
+
 		case protocol.TypeAttestationResponse:
 			respMsg := msg.Payload.(*protocol.AttestationResponseMessage)
 			s.handleAttestationResponse(providerID, provider, respMsg, tracker)
@@ -590,6 +607,52 @@ func (s *Server) providerReadLoop(ctx context.Context, conn *websocket.Conn, pro
 			s.logger.Warn("unhandled provider message type", "provider_id", providerID, "type", msg.Type)
 		}
 	}
+}
+
+func lowCardinalityCacheTier(tier string) string {
+	if tier == "memory" || tier == "ssd" {
+		return tier
+	}
+	return "none"
+}
+
+func validCacheUsage(usage protocol.UsageInfo) bool {
+	switch usage.CacheOutcome {
+	case "":
+		return false
+	case "hit", "miss_absent", "miss_corrupt", "skipped_capacity", "skipped_cost", "skipped_policy":
+	default:
+		return false
+	}
+	if usage.CacheTier != "" && usage.CacheTier != "memory" && usage.CacheTier != "ssd" {
+		return false
+	}
+	const maxCacheUsageTokens = 1_000_000
+	if usage.CachedTokens < 0 || usage.CachedTokens > maxCacheUsageTokens || usage.CachedTokens > usage.PromptTokens ||
+		usage.PrefillTokensSaved < 0 || usage.PrefillTokensSaved > usage.CachedTokens ||
+		usage.CacheStageMs < 0 || usage.CacheStageMs > 10*60*1000 || math.IsNaN(usage.CacheStageMs) || math.IsInf(usage.CacheStageMs, 0) {
+		return false
+	}
+	if usage.CacheOutcome == "hit" {
+		return usage.CacheTier != "" && usage.CachedTokens > 0 && usage.PrefillTokensSaved > 0
+	}
+	return usage.CachedTokens == 0 && usage.PrefillTokensSaved == 0
+}
+
+func clearCacheUsage(usage *protocol.UsageInfo) {
+	if usage == nil {
+		return
+	}
+	usage.CacheOutcome = ""
+	usage.CacheTier = ""
+	usage.CachedTokens = 0
+	usage.PrefillTokensSaved = 0
+	usage.CacheStageMs = 0
+}
+
+func hasCacheUsage(usage protocol.UsageInfo) bool {
+	return usage.CacheOutcome != "" || usage.CacheTier != "" || usage.CachedTokens != 0 ||
+		usage.PrefillTokensSaved != 0 || usage.CacheStageMs != 0
 }
 
 // CodeAttestResponseTimeout bounds how long the coordinator will accept a
@@ -1619,6 +1682,18 @@ func (s *Server) handleComplete(providerID string, provider *registry.Provider, 
 			"model", pr.Model,
 			"prompt_tokens", msg.Usage.PromptTokens,
 		)
+	}
+	cacheUsageValid := validCacheUsage(msg.Usage)
+	if hasCacheUsage(msg.Usage) && !cacheUsageValid {
+		s.ddIncr("routing.cache_usage_rejected", nil)
+		clearCacheUsage(&msg.Usage)
+	}
+	if cacheUsageValid {
+		tags := []string{"outcome:" + msg.Usage.CacheOutcome, "tier:" + lowCardinalityCacheTier(msg.Usage.CacheTier)}
+		s.ddIncr("routing.cache_usage", tags)
+		s.ddCount("routing.cache_tokens", int64(msg.Usage.CachedTokens), tags)
+		s.ddCount("routing.cache_prefill_tokens_saved", int64(msg.Usage.PrefillTokensSaved), tags)
+		s.ddHistogram("routing.cache_stage_ms", msg.Usage.CacheStageMs, tags)
 	}
 	s.reconcileOutputAdmission(pr, msg.Usage.CompletionTokens)
 

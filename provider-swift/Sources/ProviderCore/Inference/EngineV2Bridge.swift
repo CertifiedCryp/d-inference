@@ -134,6 +134,11 @@ public actor EngineV2Bridge {
     /// set — see `stableSeededRawId`), so the two families cannot collide:
     /// reaching 2^63 monotonic ids is unattainable at any real submit rate.
     var nextRawId: UInt64 = 1
+    /// Receipt correlation is submission-unique even when the seeded sampler
+    /// identity is intentionally stable across sequential identical requests.
+    /// This counter is a separate namespace: advancing it must never perturb
+    /// engine idMap/cancellation or sampler reproducibility.
+    var nextPrefixCacheReceiptRawId: UInt64 = 1
     /// Live per-request pump tasks, so `shutdown()` can cancel any that
     /// outlive the engine drain (defense against a leaked stream). Keyed by
     /// the (normalized) provider request-id; each entry removes itself when
@@ -279,17 +284,16 @@ public actor EngineV2Bridge {
     /// itself). Sampling/stop/max-token translation still comes from the
     /// request so both entry points share one translation source.
     ///
-    /// `cacheScope` is the per-tenant prefix-cache scope
-    /// (`SHA256(prompt_cache_key)`/`SHA256(user)`, "" ⇒ unscoped) — the
-    /// same value the legacy `BatchScheduler.submitTokenized(cacheScope:)`
-    /// receives. It maps onto `CBv2Request.cacheSalt` (TB-007/T-041):
-    /// non-empty scopes can never share cached KV across tenants; "" maps
-    /// to nil (cache-level salt fallback). LIVE as of v0.7.5 — the
+    /// `cacheScope` is the authenticated coordinator-authored scope for
+    /// remote requests, or the fixed/local caller scope for standalone use.
+    /// It maps onto `CBv2Request.cacheSalt` (TB-007/T-041): non-empty scopes
+    /// can never share cached KV across tenants; `cacheEnabled=false` is the
+    /// legacy-remote fail-closed path. LIVE as of v0.7.5 — the
     /// production engine runs with `PrefixCacheV2` when
     /// `PrefixCachePolicy` funds it.
     ///
     /// `usageSignal`, when non-nil, receives the engine's terminal usage
-    /// detail (`prefixCacheHitTokens`) so the coordinator frames loop can
+    /// detail (matched and actually-saved prefix tokens) so the frames loop can
     /// splice `prompt_tokens_details.cached_tokens` into the trailing SSE
     /// usage chunk (same out-of-band pattern as `logprobsChannel`).
     ///
@@ -312,6 +316,7 @@ public actor EngineV2Bridge {
         request: ChatCompletionRequest,
         requestId: String? = nil,
         cacheScope: String = "",
+        cacheEnabled: Bool = true,
         logprobsChannel: EngineV2LogprobsChannel? = nil,
         usageSignal: EngineV2RequestUsageSignal? = nil,
         multimodal: CBv2MultimodalInput? = nil,
@@ -349,9 +354,13 @@ public actor EngineV2Bridge {
         // where lookup never ran (rejections below, pump terminals).
         // Vision requests never stage (engine policy symmetry).
         var ssdStaged = false
-        if let ssd = ssdPrefixCache, multimodal == nil {
-            ssdStaged = await ssd.stage(
+        if !cacheEnabled {
+            usageSignal?.recordCacheDisabled(tier: ssdPrefixCache == nil ? .memory : .ssd)
+        } else if let ssd = ssdPrefixCache, multimodal == nil {
+            let stageResult = await ssd.stage(
                 requestID: id, promptTokens: promptTokens, cacheScope: cacheScope)
+            usageSignal?.record(stageResult: stageResult)
+            ssdStaged = stageResult.staged
             // `stage` suspended this actor — re-check the duplicate guard
             // (same discipline as the shared-budget gate below).
             guard active[id] == nil else {
@@ -375,6 +384,7 @@ public actor EngineV2Bridge {
             defaultMaxTokens: defaultMaxTokens,
             stopTokenIds: stopTokenIds,
             cacheScope: cacheScope,
+            cacheEnabled: cacheEnabled,
             multimodal: multimodal
         )
 
@@ -448,6 +458,18 @@ public actor EngineV2Bridge {
         let cbv2Id = mintEngineRequestId(
             seed: cbv2Request.sampling.seed, promptTokens: promptTokens)
         cbv2Request.id = cbv2Id
+        let readyReceiptRequestID: CBv2RequestID?
+        if cacheEnabled, multimodal == nil,
+            let ssd = ssdPrefixCache,
+            let callback = usageSignal?.onCacheReady
+        {
+            let receiptID = mintPrefixCacheReceiptID()
+            cbv2Request.prefixCacheReceiptID = receiptID
+            ssd.registerReadyReceipt(requestID: receiptID, callback: callback)
+            readyReceiptRequestID = receiptID
+        } else {
+            readyReceiptRequestID = nil
+        }
 
         let events: AsyncStream<CBv2Event>
         do {
@@ -467,6 +489,9 @@ public actor EngineV2Bridge {
             // the engine can never balance the staging ticket — backstop it.
             if sharedKVReserved { await kvBudget?.release(requestID: id) }
             if ssdStaged { ssdPrefixCache?.completeStaging(requestID: id) }
+            if let readyReceiptRequestID {
+                ssdPrefixCache?.discardReadyReceipt(requestID: readyReceiptRequestID)
+            }
             // Admission failure. The message keeps the canonical
             // `token_budget_exhausted:` prefix contract so
             // `fromSchedulerMessage` classifies it as a retryable capacity
@@ -498,7 +523,8 @@ public actor EngineV2Bridge {
             id: id, events: events, continuation: continuation,
             holdsSharedReservation: sharedKVReserved,
             logprobsChannel: logprobsChannel,
-            usageSignal: usageSignal
+            usageSignal: usageSignal,
+            readyReceiptRequestID: readyReceiptRequestID
         )
 
         let bridge = self
@@ -613,7 +639,8 @@ public actor EngineV2Bridge {
         continuation: AsyncStream<GenerationEvent>.Continuation,
         holdsSharedReservation: Bool,
         logprobsChannel: EngineV2LogprobsChannel? = nil,
-        usageSignal: EngineV2RequestUsageSignal? = nil
+        usageSignal: EngineV2RequestUsageSignal? = nil,
+        readyReceiptRequestID: CBv2RequestID? = nil
     ) {
         let bridge = self
         let task = Task {
@@ -621,7 +648,8 @@ public actor EngineV2Bridge {
                 id: id, events: events, continuation: continuation,
                 holdsSharedReservation: holdsSharedReservation,
                 logprobsChannel: logprobsChannel,
-                usageSignal: usageSignal
+                usageSignal: usageSignal,
+                readyReceiptRequestID: readyReceiptRequestID
             )
             await bridge.clearPumpTask(id: id)
         }
@@ -640,7 +668,8 @@ public actor EngineV2Bridge {
         continuation: AsyncStream<GenerationEvent>.Continuation,
         holdsSharedReservation: Bool,
         logprobsChannel: EngineV2LogprobsChannel? = nil,
-        usageSignal: EngineV2RequestUsageSignal? = nil
+        usageSignal: EngineV2RequestUsageSignal? = nil,
+        readyReceiptRequestID: CBv2RequestID? = nil
     ) async {
         // NOTE: the shared-budget KV reservation is taken in `submitTokenized`
         // (the pre-engine admission gate), NOT here — the pump only RELEASES
@@ -682,14 +711,16 @@ public actor EngineV2Bridge {
             case .finished(let reason, let usage):
                 sawTerminal = true
                 // Out-of-band usage detail (logprobs-channel pattern): the
-                // engine's `prefixCacheHitTokens` has no seat in the shared
+                // engine's prefix-cache detail has no seat in the shared
                 // `GenerationEvent.info` shape, so the frames loop reads it
                 // from this per-request signal and splices
                 // `usage.prompt_tokens_details.cached_tokens` into the
                 // trailing SSE usage chunk. Recorded BEFORE the terminal
                 // events are yielded, so it is set by the time any
                 // downstream consumer sees the usage frame.
-                usageSignal?.record(prefixCacheHitTokens: usage.prefixCacheHitTokens)
+                usageSignal?.record(
+                    usage: usage,
+                    fallbackTier: ssdPrefixCache == nil ? .memory : .ssd)
                 finishAndEmit(
                     id: id, reason: reason, usage: usage,
                     sawFirstToken: sawFirstToken, continuation: continuation
@@ -703,6 +734,10 @@ public actor EngineV2Bridge {
                 // endAdoption already balanced the ticket at adoption
                 // time); covers the lookup-missed corner. Idempotent.
                 ssdPrefixCache?.completeStaging(requestID: id)
+                if let readyReceiptRequestID {
+                    ssdPrefixCache?.markReadyReceiptTerminal(
+                        requestID: readyReceiptRequestID)
+                }
                 continuation.finish()
                 return
             }
@@ -720,6 +755,10 @@ public actor EngineV2Bridge {
                 await kvBudget?.release(requestID: id)
             }
             ssdPrefixCache?.completeStaging(requestID: id)
+            if let readyReceiptRequestID {
+                ssdPrefixCache?.markReadyReceiptTerminal(
+                    requestID: readyReceiptRequestID)
+            }
             continuation.finish()
         }
     }
@@ -1032,6 +1071,16 @@ public actor EngineV2Bridge {
         let fresh = CBv2RequestID(nextRawId)
         nextRawId &+= 1
         return fresh
+    }
+
+    /// Monotonic correlation identity for one receipt-enabled submission.
+    /// It is deliberately independent of `mintEngineRequestId`: seeded engine
+    /// ids may repeat after terminal for deterministic sampling, while receipt
+    /// callbacks remain retained for the coordinator settlement window.
+    private func mintPrefixCacheReceiptID() -> CBv2RequestID {
+        let id = CBv2RequestID(nextPrefixCacheReceiptRawId)
+        nextPrefixCacheReceiptRawId &+= 1
+        return id
     }
 
     // MARK: - Request-id validation

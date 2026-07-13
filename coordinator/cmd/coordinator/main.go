@@ -201,9 +201,19 @@ func main() {
 		"decode_floor_tps", cfg.RegistryCfg.WarmPool.DecodeFloorTPS,
 	)
 
-	reg.ConfigureCacheAffinity(cfg.RegistryCfg.CacheAffinity)
-	cacheAffinityCfg := reg.CacheAffinityConfigSnapshot()
-	logger.Info("cache affinity configured", "ttl", cacheAffinityCfg.TTL.String(), "bonus_ms", cacheAffinityCfg.BonusMs, "enabled", cacheAffinityCfg.BonusMs > 0)
+	if err := reg.ConfigureCacheRouting(cfg.RegistryCfg.CacheRouting); err != nil {
+		logger.Error("cache routing configuration rejected", "error", err)
+		os.Exit(1)
+	}
+	cacheRoutingCfg := reg.CacheRoutingConfigSnapshot()
+	logger.Info("provider-confirmed cache routing configured",
+		"mode", cacheRoutingCfg.Mode,
+		"ttl", cacheRoutingCfg.TTL.String(),
+		"max_holders", cacheRoutingCfg.MaxHolders,
+		"max_discount_ms", cacheRoutingCfg.MaxDiscountMs,
+		"max_cost_fraction", cacheRoutingCfg.MaxCostFraction,
+		"dedicated", cacheRoutingCfg.Dedicated,
+	)
 	stopWarmPool := reg.StartWarmPoolController(ctx, cfg.RegistryCfg.WarmPool)
 	defer stopWarmPool()
 	if cfg.RegistryCfg.WarmPool.Enabled {

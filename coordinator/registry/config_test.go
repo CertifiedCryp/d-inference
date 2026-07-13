@@ -87,3 +87,40 @@ func TestReadConfigWarmPoolCanBeDisabled(t *testing.T) {
 		t.Fatal("warm pool observe-only override was not honored")
 	}
 }
+
+func TestCacheRoutingConfigFailsClosedUnlessOff(t *testing.T) {
+	base := CacheRoutingConfig{TTL: 10 * time.Minute, MaxHolders: 4, MaxDiscountMs: 1000, MaxCostFraction: .35}
+	base.Mode = CacheRoutingOff
+	if err := base.Check(); err != nil {
+		t.Fatalf("off mode required a key: %v", err)
+	}
+	for _, mode := range []string{CacheRoutingObserve, CacheRoutingExact, CacheRoutingConversation} {
+		cfg := base
+		cfg.Mode = mode
+		if err := cfg.Check(); err == nil {
+			t.Fatalf("mode %q accepted missing key", mode)
+		}
+		cfg.MasterKey = "not-a-valid-key"
+		if err := cfg.Check(); err == nil {
+			t.Fatalf("mode %q accepted malformed key", mode)
+		}
+		cfg.MasterKey = testCacheRoutingConfig(mode).MasterKey
+		if err := cfg.Check(); err != nil {
+			t.Fatalf("mode %q rejected valid key: %v", mode, err)
+		}
+	}
+}
+
+func TestReadConfigCacheRoutingDefaultsOff(t *testing.T) {
+	for _, suffix := range []string{"MODE", "TTL", "MAX_HOLDERS", "MAX_DISCOUNT_MS", "MAX_COST_FRACTION", "DEDICATED", "CACHE_MASTER_KEY"} {
+		key := env.EnvPrefix + "_CACHE_ROUTING_" + suffix
+		if suffix == "CACHE_MASTER_KEY" {
+			key = env.EnvPrefix + "_CACHE_MASTER_KEY"
+		}
+		t.Setenv(key, "")
+	}
+	cfg := ReadConfig().CacheRouting
+	if cfg.Mode != "" || cfg.TTL != 10*time.Minute || cfg.MaxHolders != 4 || cfg.MaxDiscountMs != 1000 || cfg.MaxCostFraction != .35 || cfg.Dedicated {
+		t.Fatalf("cache routing defaults = %+v", cfg)
+	}
+}

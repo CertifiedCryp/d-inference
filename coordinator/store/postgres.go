@@ -97,6 +97,34 @@ func (s *PostgresStore) Close() {
 	s.pool.Close()
 }
 
+const legacyCacheAffinityGuardFunction = `CREATE OR REPLACE FUNCTION clear_legacy_cache_affinity_key()
+RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+	NEW.cache_affinity_key := '';
+	RETURN NEW;
+END $$`
+
+const legacyCacheAffinityGuardTrigger = `DO $$ BEGIN
+	IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'clear_legacy_cache_affinity_key') THEN
+		CREATE TRIGGER clear_legacy_cache_affinity_key
+		BEFORE INSERT OR UPDATE OF cache_affinity_key ON inference_routes
+		FOR EACH ROW EXECUTE FUNCTION clear_legacy_cache_affinity_key();
+	END IF;
+END $$`
+
+const legacyCacheAffinityScrubMigration = `DO $$ BEGIN
+	IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE id = 'scrub_inference_route_cache_affinity_v1') THEN
+		IF EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = current_schema()
+			  AND table_name = 'inference_routes'
+			  AND column_name = 'cache_affinity_key'
+		) THEN
+			UPDATE inference_routes SET cache_affinity_key = '' WHERE cache_affinity_key <> '';
+		END IF;
+		INSERT INTO schema_migrations (id) VALUES ('scrub_inference_route_cache_affinity_v1');
+	END IF;
+END $$`
+
 // migrate runs the schema creation statements.
 func (s *PostgresStore) migrate(ctx context.Context) error {
 	migrations := []string{
@@ -870,6 +898,13 @@ func (s *PostgresStore) migrate(ctx context.Context) error {
 		// DAR-341: normalized provider/coordinator error reason. Nullable and
 		// appended so fresh DBs match upgraded DB column order for SELECT * scans.
 		`ALTER TABLE inference_routes ADD COLUMN IF NOT EXISTS error_reason TEXT`,
+		// Route keys are memory-only HMACs. Scrub legacy persisted SHA-256
+		// prompt-cache identifiers once. The trigger also clears writes from an
+		// older coordinator during blue-green overlap or emergency rollback while
+		// retaining that binary's expected SQL shape.
+		legacyCacheAffinityGuardFunction,
+		legacyCacheAffinityGuardTrigger,
+		legacyCacheAffinityScrubMigration,
 
 		// Rejected inbound inference requests (4xx/5xx) at any pipeline stage,
 		// with the request shape and a counterfactual servability snapshot
@@ -1618,7 +1653,7 @@ const inferenceRouteSelectColumns = `
 			slot_state, backend_running, backend_waiting,
 			active_token_budget_used, active_token_budget_max, queued_token_budget,
 			estimated_prompt_tokens, requested_max_tokens,
-			requires_vision, has_tools, self_route_only, prefer_owner, cache_affinity_key,
+			requires_vision, has_tools, self_route_only, prefer_owner,
 			final_status, error_code, error_class, prompt_tokens, completion_tokens, reasoning_tokens, cost_micro_usd,
 			actual_ttft_ms, dispatch_to_first_chunk_ms, total_duration_ms,
 			created_at, updated_at,
@@ -1659,7 +1694,7 @@ func (s *PostgresStore) RecordInferenceRoute(record *InferenceRouteRecord) error
 			slot_state, backend_running, backend_waiting,
 			active_token_budget_used, active_token_budget_max, queued_token_budget,
 			estimated_prompt_tokens, requested_max_tokens,
-			requires_vision, has_tools, self_route_only, prefer_owner, cache_affinity_key,
+			requires_vision, has_tools, self_route_only, prefer_owner,
 			created_at, updated_at,
 			provider_region, consumer_region, error_reason
 		) VALUES (
@@ -1673,9 +1708,9 @@ func (s *PostgresStore) RecordInferenceRoute(record *InferenceRouteRecord) error
 			$41, $42, $43,
 			$44, $45, $46,
 			$47, $48,
-			$49, $50, $51, $52, $53,
-			$54, $55,
-			$56, $57, $58
+			$49, $50, $51, $52,
+			$53, $54,
+			$55, $56, $57
 		) ON CONFLICT (request_id, attempt) DO UPDATE SET
 			provider_id = EXCLUDED.provider_id,
 			model = EXCLUDED.model,
@@ -1727,7 +1762,6 @@ func (s *PostgresStore) RecordInferenceRoute(record *InferenceRouteRecord) error
 			has_tools = EXCLUDED.has_tools,
 			self_route_only = EXCLUDED.self_route_only,
 			prefer_owner = EXCLUDED.prefer_owner,
-			cache_affinity_key = EXCLUDED.cache_affinity_key,
 			provider_region = EXCLUDED.provider_region,
 			consumer_region = EXCLUDED.consumer_region,
 			`+inferenceRouteErrorReasonUpsertAssignment+`,
@@ -1742,7 +1776,7 @@ func (s *PostgresStore) RecordInferenceRoute(record *InferenceRouteRecord) error
 		record.SlotState, record.BackendRunning, record.BackendWaiting,
 		record.ActiveTokenBudgetUsed, record.ActiveTokenBudgetMax, record.QueuedTokenBudget,
 		record.EstimatedPromptTokens, record.RequestedMaxTokens,
-		record.RequiresVision, record.HasTools, record.SelfRouteOnly, record.PreferOwner, record.CacheAffinityKey,
+		record.RequiresVision, record.HasTools, record.SelfRouteOnly, record.PreferOwner,
 		createdAt, updatedAt,
 		record.ProviderRegion, record.ConsumerRegion, record.ErrorReason,
 	)
@@ -1859,7 +1893,7 @@ func (s *PostgresStore) InferenceRouteRecordsSince(since time.Time) []InferenceR
 			&r.SlotState, &r.BackendRunning, &r.BackendWaiting,
 			&r.ActiveTokenBudgetUsed, &r.ActiveTokenBudgetMax, &r.QueuedTokenBudget,
 			&r.EstimatedPromptTokens, &r.RequestedMaxTokens,
-			&r.RequiresVision, &r.HasTools, &r.SelfRouteOnly, &r.PreferOwner, &r.CacheAffinityKey,
+			&r.RequiresVision, &r.HasTools, &r.SelfRouteOnly, &r.PreferOwner,
 			&finalStatus, &errorCode, &errorClass, &promptTokens, &completionTokens, &reasoningTokens, &costMicroUSD,
 			&actualTTFTMs, &dispatchToFirstChunkMs, &totalDurationMs,
 			&r.CreatedAt, &r.UpdatedAt,
