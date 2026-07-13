@@ -236,6 +236,14 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
             visionGate = entry.visionGate
         }
 
+        let prepared: ToolChoicePromptPolicy.Prepared
+        do {
+            prepared = try ToolChoicePromptPolicy.prepare(request)
+        } catch {
+            await releaseBox.fire()
+            throw error
+        }
+
         // Multimodal (image/video) requests can't flow through the token-only
         // batched TEXT paths. For VLM models they are handled here: on a
         // EngineV2 with precomputed vision-tower embeddings (v0.7.5, below).
@@ -249,6 +257,11 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
         // must pass through THIS branch first (the text tokenization below
         // silently discards image parts; media must never reach it).
         if isVLM, let container, MediaIngest.hasMedia(request) {
+            guard !prepared.requiresToolCall else {
+                await releaseBox.fire()
+                throw MultiModelBatchSchedulerEngineError.invalidToolPayload(
+                    "forced tool_choice is not supported for multimodal requests")
+            }
             // Decode + validate inline media SYNCHRONOUSLY, before returning the
             // stream. A MediaError (oversized/malformed/non-`data:` payload) thrown
             // here propagates through this `async throws` to the caller — so both
@@ -374,6 +387,8 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
                         upstream: upstream,
                         cancelUpstream: { await bridge.cancel(requestId: visionRequestId) },
                         toolHandler: nil,
+                        requiresToolCall: false,
+                        allowedToolNames: [],
                         releaseBox: releaseBox
                     )
                 } catch is CancellationError {
@@ -448,17 +463,10 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
         // Tokenize the full OpenAI request (including tools, tool_call_id,
         // reasoning_content, etc.) ourselves rather than going through the
         // lossy `translate()` → `ChatMessage` path that drops tool fields.
-        let messages = request.messages.map { $0.templateMessageDict() }
-        let toolSpecs = request.tools?.map { $0.toolSpec() }
-        // Surface `reasoning_effort` to the Jinja render context. Templates
-        // that don't reference the key (most models) ignore the extra
-        // variable; gpt-oss / Harmony reads it to emit `Reasoning: <effort>`.
-        let additionalContext: [String: any Sendable]?
-        if let reasoningEffort {
-            additionalContext = ["reasoning_effort": reasoningEffort]
-        } else {
-            additionalContext = nil
-        }
+        let messages = prepared.messages.map { $0.templateMessageDict() }
+        let toolSpecs = prepared.tools?.map { $0.toolSpec() }
+        let additionalContext = Self.templateAdditionalContext(
+            for: request, reasoningEffort: reasoningEffort)
         let promptTokens: [Int]
         do {
             // Strip JSON `null` / `Optional` leaves (NSNull, the
@@ -483,7 +491,7 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
         // Resolve tool call format before submitting so a bad
         // `tool_call_parser` value does not leave an orphaned request.
         let toolHandler: BatchedToolStreamHandler?
-        if let requestTools = request.tools, !requestTools.isEmpty {
+        if prepared.tools?.isEmpty == false {
             let format: ToolCallFormat
             do {
                 format = try ServerToolParser.resolve(
@@ -554,6 +562,8 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
             upstream: upstream,
             cancelUpstream: cancelUpstream,
             toolHandler: toolHandler,
+            requiresToolCall: prepared.requiresToolCall,
+            allowedToolNames: prepared.allowedToolNames,
             releaseBox: releaseBox
         )
     }
@@ -564,10 +574,14 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
     /// Shared by the batched/v2 TEXT path and the v0.7.5 media-through-v2
     /// path (which passes `toolHandler: nil` — see the routing comment) so
     /// the downstream SSE/billing contract is identical for both.
+    private static let maxDeferredToolChoiceContentBytes = 1024 * 1024
+
     private func makeEventStream(
         upstream: AsyncStream<GenerationEvent>,
         cancelUpstream: @escaping @Sendable () async -> Void,
         toolHandler: BatchedToolStreamHandler?,
+        requiresToolCall: Bool,
+        allowedToolNames: Set<String>,
         releaseBox: OneShotRelease
     ) -> AsyncThrowingStream<MLXServerGenerationEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -579,7 +593,16 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
                 var lastTokenAt: Date?
                 var stopReason: String = "stop"
                 var failed: String?
+                var deferredContentBytes = 0
                 startedAt = Date()
+
+                func acceptDeferredContent(_ content: String) -> Bool {
+                    let byteCount = content.utf8.count
+                    guard byteCount <= Self.maxDeferredToolChoiceContentBytes - deferredContentBytes
+                    else { return false }
+                    deferredContentBytes += byteCount
+                    return true
+                }
 
                 for await event in upstream {
                     if Task.isCancelled {
@@ -597,7 +620,28 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
                                 if let visible = handler.processChunk(text),
                                     !visible.isEmpty
                                 {
-                                    continuation.yield(.content(visible))
+                                    if requiresToolCall {
+                                        guard acceptDeferredContent(visible) else {
+                                            await cancelUpstream()
+                                            await releaseBox.fire()
+                                            continuation.finish(
+                                                throwing: MultiModelBatchSchedulerEngineError
+                                                    .generationFailed(
+                                                        "required tool call response exceeded deferred content limit"))
+                                            return
+                                        }
+                                    } else {
+                                        continuation.yield(.content(visible))
+                                    }
+                                }
+                            } else if requiresToolCall {
+                                guard acceptDeferredContent(text) else {
+                                    await cancelUpstream()
+                                    await releaseBox.fire()
+                                    continuation.finish(
+                                        throwing: MultiModelBatchSchedulerEngineError.generationFailed(
+                                            "required tool call response exceeded deferred content limit"))
+                                    return
                                 }
                             } else {
                                 continuation.yield(.content(text))
@@ -632,11 +676,26 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
                     return
                 }
 
-                // Flush remaining tool calls on successful completion.
-                if let handler = toolHandler {
-                    for toolCall in handler.finish() {
-                        continuation.yield(.toolCall(toolCall))
-                    }
+                // Flush remaining tool calls on successful completion. Forced
+                // choices hold text until a call is proven, so a non-compliant
+                // model can never return a normal text answer with `stop`.
+                let toolCalls = toolHandler?.finish() ?? []
+                if toolCalls.contains(where: { !allowedToolNames.contains($0.function.name) }) {
+                    await releaseBox.fire()
+                    continuation.finish(
+                        throwing: MultiModelBatchSchedulerEngineError.generationFailed(
+                            "model emitted a tool call outside tool_choice"))
+                    return
+                }
+                if requiresToolCall && toolCalls.isEmpty {
+                    await releaseBox.fire()
+                    continuation.finish(
+                        throwing: MultiModelBatchSchedulerEngineError.generationFailed(
+                            "model did not emit the required tool call"))
+                    return
+                }
+                for toolCall in toolCalls {
+                    continuation.yield(.toolCall(toolCall))
                 }
 
                 let now = Date()
