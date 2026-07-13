@@ -35,7 +35,7 @@ private let fixtureLayerKinds: [CBv2LayerKind] = [
 ]
 
 private func tempDir(_ label: String) -> URL {
-    let url = FileManager.default.temporaryDirectory
+    let url = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
         .appendingPathComponent("ssd-prefix-\(label)-\(UUID().uuidString)", isDirectory: true)
     try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
@@ -67,6 +67,23 @@ private final class ClockBox: @unchecked Sendable {
     func advance(_ seconds: Int64) { lock.withLock { _now += seconds } }
 }
 
+private final class ReadyReceiptBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [PrefixCacheReadyResult] = []
+
+    func append(_ value: PrefixCacheReadyResult) { lock.withLock { values.append(value) } }
+    var snapshot: [PrefixCacheReadyResult] { lock.withLock { values } }
+
+    func waitForCount(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if snapshot.count >= count { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return snapshot.count >= count
+    }
+}
+
 private func makeCache(
     dir: URL,
     kek: SymmetricKey,
@@ -79,7 +96,8 @@ private func makeCache(
     maxWriteBytesPerDay: Int = 0,
     diskBudgetBytes: Int = 1 << 40,
     kvBudget: GlobalKVCacheBudget? = nil,
-    diskBudget: SSDDiskBudget = SSDDiskBudget()
+    diskBudget: SSDDiskBudget = SSDDiskBudget(),
+    maintainWholeRoot: (@Sendable () -> Void)? = nil
 ) -> SSDPrefixCache {
     let config = SSDPrefixCache.Config(
         modelId: "test-model",
@@ -97,7 +115,8 @@ private func makeCache(
     return SSDPrefixCache(
         config: config, kekKey: kek, kvBudget: kvBudget, diskBudget: diskBudget,
         maxWriteBytesPerDay: maxWriteBytesPerDay, strictFsync: false,
-        diskBudgetBytes: { diskBudgetBytes })
+        diskBudgetBytes: { diskBudgetBytes },
+        maintainWholeRoot: maintainWholeRoot)
 }
 
 /// Poll until the cache's index holds `count` entries (write-behind is
@@ -117,6 +136,17 @@ private func dbk2Files(under root: URL) -> [URL] {
     guard let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
     else { return [] }
     return e.compactMap { $0 as? URL }.filter { $0.pathExtension == "dbk2" }
+}
+
+private func waitForSemaphore(
+    _ semaphore: DispatchSemaphore,
+    timeout: DispatchTime
+) async -> DispatchTimeoutResult {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.global(qos: .utility).async {
+            continuation.resume(returning: semaphore.wait(timeout: timeout))
+        }
+    }
 }
 
 // MARK: - HMAC name derivation
@@ -271,6 +301,55 @@ struct SSDBlockStoreTests {
         #expect(a != b)
         #expect(a != c)
         #expect(a.hasPrefix("cbv2-snap-1|f16|8|"))
+    }
+
+    @Test("atomic writer uses the exact Darkbloom-owned crash-temp grammar")
+    func exactTempName() throws {
+        let uuid = try #require(UUID(uuidString: "01234567-89ab-cdef-0123-456789abcdef"))
+        let destination = URL(fileURLWithPath: "/tmp/ab/ab00112233445566778899aabbccddee.dbk2")
+        let temp = SSDBlockStore.temporaryFileURL(for: destination, uuid: uuid)
+        #expect(
+            temp.lastPathComponent
+                == "ab00112233445566778899aabbccddee.dbk2.darkbloom-tmp.01234567-89AB-CDEF-0123-456789ABCDEF")
+        #expect(SSDBlockStore.isOwnedTempFileName(temp.lastPathComponent, fanout: "ab"))
+        #expect(!SSDBlockStore.isOwnedTempFileName(
+            "ab00112233445566778899aabbccddee.dbk2.darkbloom-tmp.11234567-89ab-cdef-0123-456789abcdef",
+            fanout: "ab"))
+        #expect(!SSDBlockStore.isOwnedTempFileName(
+            "ab00112233445566778899aabbccddee.dbk2.darkbloom-tmp.21234567-89AB-cDEF-0123-456789ABCDef",
+            fanout: "ab"))
+    }
+
+    @Test("startup temp sweep preserves young writes and removes stale crash orphans")
+    func startupTempSweepUsesAge() throws {
+        let root = tempDir("store-temp-age").appendingPathComponent(
+            "abcdefabcdef", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let destination = SSDBlockStore.fileURL(
+            root: root, tag16Hex: "ab00112233445566778899aabbccddee")
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let stale = SSDBlockStore.temporaryFileURL(
+            for: destination,
+            uuid: try #require(UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")))
+        let young = SSDBlockStore.temporaryFileURL(
+            for: destination,
+            uuid: try #require(UUID(uuidString: "11234567-89AB-CDEF-0123-456789ABCDEF")))
+        try Data("stale".utf8).write(to: stale)
+        try Data("young".utf8).write(to: young)
+        let now: Int64 = 10_000
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: TimeInterval(
+                now - SSDBlockStore.crashTempTTLSeconds))],
+            ofItemAtPath: stale.path)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: TimeInterval(
+                now - SSDBlockStore.crashTempTTLSeconds + 1))],
+            ofItemAtPath: young.path)
+
+        #expect(SSDBlockStore.sweepStaleTempFiles(under: root, nowSeconds: now) == 1)
+        #expect(!FileManager.default.fileExists(atPath: stale.path))
+        #expect(FileManager.default.fileExists(atPath: young.path))
     }
 }
 
@@ -458,7 +537,7 @@ struct SSDPrefixCacheLifecycleTests {
         // Stage for a prompt extending the donated prefix.
         let prompt = tokens + Array(1000 ..< 1004)
         let staged = await reader.stage(requestID: "req-1", promptTokens: prompt, cacheScope: "")
-        #expect(staged)
+        #expect(staged.staged)
         #expect(reader.bytesInUse > 0)
 
         // Engine-side synchronous lookup hits the staging map.
@@ -506,9 +585,9 @@ struct SSDPrefixCacheLifecycleTests {
         #expect(await waitForIndexCount(cache, atLeast: 8))
 
         let prompt = tokens + [9999]
-        #expect(await !cache.stage(requestID: "r-unscoped", promptTokens: prompt, cacheScope: ""))
-        #expect(await !cache.stage(requestID: "r-b", promptTokens: prompt, cacheScope: "scope-b"))
-        #expect(await cache.stage(requestID: "r-a", promptTokens: prompt, cacheScope: "scope-a"))
+        #expect(!(await cache.stage(requestID: "r-unscoped", promptTokens: prompt, cacheScope: "")).staged)
+        #expect(!(await cache.stage(requestID: "r-b", promptTokens: prompt, cacheScope: "scope-b")).staged)
+        #expect((await cache.stage(requestID: "r-a", promptTokens: prompt, cacheScope: "scope-a")).staged)
         // And the staged entry only resolves under the donor's salt.
         #expect(cache.lookup(tokens: prompt, layerKinds: fixtureLayerKinds, cacheSalt: nil) == nil)
         let hit = cache.lookup(
@@ -547,7 +626,8 @@ struct SSDPrefixCacheLifecycleTests {
         }
         let prompt = tokens + [12345]
         let staged = await cache.stage(requestID: "r-c", promptTokens: prompt, cacheScope: "")
-        #expect(!staged, "corrupt blocks must fall back to recompute, not stage")
+        #expect(!staged.staged, "corrupt blocks must fall back to recompute, not stage")
+        #expect(staged.disposition == .missCorrupt)
         #expect(cache.stats().corruptDropped >= 1)
         // The poisoned file was deleted and de-indexed.
         #expect(cache.index.count < 8)
@@ -576,7 +656,10 @@ struct SSDPrefixCacheLifecycleTests {
         #expect(cache.stats().ttlExpired == 8)
         // Nothing left to adopt.
         let prompt = tokens + [1]
-        #expect(await !cache.stage(requestID: "r-t", promptTokens: prompt, cacheScope: ""))
+        let expiredResult = await cache.stage(
+            requestID: "r-t", promptTokens: prompt, cacheScope: "")
+        #expect(!expiredResult.staged)
+        #expect(expiredResult.disposition == .missAbsent)
     }
 
     @Test("TTL slides on hit: a staged (hit) entry survives what an untouched one doesn't")
@@ -596,7 +679,7 @@ struct SSDPrefixCacheLifecycleTests {
 
         // 600 s later, HIT the hot prefix (stage bumps lastAccess).
         clock.advance(600)
-        #expect(await cache.stage(requestID: "r-hot", promptTokens: hot + [7], cacheScope: ""))
+        #expect((await cache.stage(requestID: "r-hot", promptTokens: hot + [7], cacheScope: "")).staged)
         cache.completeStaging(requestID: "r-hot")
 
         // 600 s more: the cold prefix (1,200 s idle) expires; the hot one
@@ -604,9 +687,9 @@ struct SSDPrefixCacheLifecycleTests {
         clock.advance(600)
         cache.sweepExpiredEntries()
         #expect(cache.index.count == 8)
-        #expect(await cache.stage(requestID: "r-hot2", promptTokens: hot + [8], cacheScope: ""))
+        #expect((await cache.stage(requestID: "r-hot2", promptTokens: hot + [8], cacheScope: "")).staged)
         cache.completeStaging(requestID: "r-hot2")
-        #expect(await !cache.stage(requestID: "r-cold", promptTokens: cold + [9], cacheScope: ""))
+        #expect(!(await cache.stage(requestID: "r-cold", promptTokens: cold + [9], cacheScope: "")).staged)
     }
 
     @Test("LRU eviction at the box-wide budget: oldest-by-last-hit unlinked first")
@@ -638,9 +721,9 @@ struct SSDPrefixCacheLifecycleTests {
         #expect(cache.index.totalBytes <= perBlockBytes * 8)
         #expect(cache.stats().evictions >= 8)
         // The NEWER prefix must still be fully adoptable; the older one not.
-        #expect(await cache.stage(requestID: "r-new", promptTokens: fresh + [1], cacheScope: ""))
+        #expect((await cache.stage(requestID: "r-new", promptTokens: fresh + [1], cacheScope: "")).staged)
         cache.completeStaging(requestID: "r-new")
-        #expect(await !cache.stage(requestID: "r-old", promptTokens: old + [1], cacheScope: ""))
+        #expect(!(await cache.stage(requestID: "r-old", promptTokens: old + [1], cacheScope: "")).staged)
     }
 
     @Test("endurance write cap: an exhausted token bucket drops donations, engine unaffected")
@@ -716,10 +799,321 @@ struct SSDPrefixCacheLifecycleTests {
         cache.scanOnDisk()
         #expect(cache.index.count == 8, "scan must index the seeded blocks")
         #expect(
-            await !cache.stage(
+            !(await cache.stage(
                 requestID: "r-overflow",
                 promptTokens: Array(0 ..< tokenCount) + [99],
-                cacheScope: ""))
+                cacheScope: "")).staged)
+    }
+}
+
+// MARK: - Provider-confirmed durable-ready receipts
+
+@Suite("SSD prefix cache: durable-ready receipts", .serialized)
+struct SSDPrefixCacheReadyReceiptTests {
+    private func correlatedDonate(
+        _ cache: SSDPrefixCache,
+        requestID: CBv2RequestID,
+        tokenCount: Int,
+        seed: Float = 1
+    ) {
+        cache.donate(
+            requestID: requestID,
+            tokens: Array(0 ..< tokenCount),
+            snapshots: fixtureSnapshots(tokenCount: tokenCount, seed: seed),
+            layerKinds: fixtureLayerKinds,
+            cacheSalt: "scope")
+    }
+
+    @Test("ready is durable/readable and monotonically increases across early + terminal donations")
+    func monotonicReady() async throws {
+        let dir = tempDir("ready-monotonic")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cache = makeCache(
+            dir: dir,
+            kek: SymmetricKey(size: .bits256),
+            clock: ClockBox(10_000),
+            minEffectiveTokens: fixtureBlockSize)
+        defer { cache.close() }
+        let box = ReadyReceiptBox()
+        let requestID = CBv2RequestID(41)
+        cache.registerReadyReceipt(requestID: requestID, callback: box.append)
+
+        correlatedDonate(cache, requestID: requestID, tokenCount: 64)
+        #expect(await box.waitForCount(1))
+        #expect(box.snapshot[0] == PrefixCacheReadyResult(
+            readyTokens: 64,
+            requiredRecomputeTokens: 0,
+            expectedPrefillTokensSaved: 64))
+
+        correlatedDonate(cache, requestID: requestID, tokenCount: 72)
+        #expect(await box.waitForCount(2))
+        #expect(box.snapshot.map(\.readyTokens) == [64, 72])
+
+        // Re-donation of the same terminal prefix is durable but must not
+        // emit a duplicate/non-increasing receipt.
+        correlatedDonate(cache, requestID: requestID, tokenCount: 72)
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(box.snapshot.count == 2)
+    }
+
+    @Test("too-short, rate-limited, immediate-eviction, corrupt, and shutdown donations emit no ready")
+    func noReadyFailureMatrix() async throws {
+        func run(
+            _ label: String,
+            make: (URL, SymmetricKey, ClockBox) -> SSDPrefixCache,
+            mutate: ((URL) -> Void)? = nil,
+            closeBeforeDonate: Bool = false
+        ) async -> [PrefixCacheReadyResult] {
+            let dir = tempDir(label)
+            defer { try? FileManager.default.removeItem(at: dir) }
+            let kek = SymmetricKey(size: .bits256)
+            let cache = make(dir, kek, ClockBox(10_000))
+            let box = ReadyReceiptBox()
+            let id = CBv2RequestID(51)
+            cache.registerReadyReceipt(requestID: id, callback: box.append)
+            if closeBeforeDonate { cache.close() }
+            correlatedDonate(cache, requestID: id, tokenCount: 64)
+            mutate?(dir)
+            try? await Task.sleep(for: .milliseconds(500))
+            cache.close()
+            return box.snapshot
+        }
+
+        // Exactly at donation floor: no write job exists.
+        let tooShortDir = tempDir("ready-short")
+        defer { try? FileManager.default.removeItem(at: tooShortDir) }
+        let tooShort = makeCache(
+            dir: tooShortDir,
+            kek: SymmetricKey(size: .bits256),
+            clock: ClockBox(10_000),
+            minEffectiveTokens: 64)
+        let tooShortBox = ReadyReceiptBox()
+        tooShort.registerReadyReceipt(requestID: CBv2RequestID(50), callback: tooShortBox.append)
+        correlatedDonate(tooShort, requestID: CBv2RequestID(50), tokenCount: 64)
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(tooShortBox.snapshot.isEmpty)
+        tooShort.close()
+
+        #expect(await run("ready-rate", make: { dir, kek, clock in
+            makeCache(
+                dir: dir, kek: kek, clock: clock,
+                minEffectiveTokens: fixtureBlockSize,
+                maxWriteBytesPerDay: 1)
+        }).isEmpty)
+        #expect(await run("ready-evict", make: { dir, kek, clock in
+            makeCache(
+                dir: dir, kek: kek, clock: clock,
+                minEffectiveTokens: fixtureBlockSize,
+                diskBudgetBytes: 0)
+        }).isEmpty)
+        #expect(await run("ready-shutdown", make: { dir, kek, clock in
+            makeCache(
+                dir: dir, kek: kek, clock: clock,
+                minEffectiveTokens: fixtureBlockSize)
+        }, closeBeforeDonate: true).isEmpty)
+
+        // Corrupt every landed file inside the post-write whole-root barrier;
+        // settlement's authenticated reread must suppress the receipt.
+        let corruptDir = tempDir("ready-corrupt")
+        defer { try? FileManager.default.removeItem(at: corruptDir) }
+        let corrupt = makeCache(
+            dir: corruptDir,
+            kek: SymmetricKey(size: .bits256),
+            clock: ClockBox(10_000),
+            minEffectiveTokens: fixtureBlockSize,
+            maintainWholeRoot: {
+                for file in dbk2Files(under: corruptDir) {
+                    guard var bytes = try? Data(contentsOf: file), bytes.count > 16 else { continue }
+                    bytes[bytes.count - 8] ^= 0xff
+                    try? bytes.write(to: file)
+                }
+            })
+        let corruptBox = ReadyReceiptBox()
+        corrupt.registerReadyReceipt(requestID: CBv2RequestID(52), callback: corruptBox.append)
+        correlatedDonate(corrupt, requestID: CBv2RequestID(52), tokenCount: 64)
+        try? await Task.sleep(for: .milliseconds(500))
+        #expect(corruptBox.snapshot.isEmpty)
+        corrupt.close()
+    }
+
+    @Test("terminal cleanup retention covers the coordinator two-minute attempt window")
+    func receiptRetention() {
+        #expect(SSDPrefixCache.readyReceiptRetention == .seconds(120))
+    }
+
+    @Test("write-behind maintenance/ready never blocks donation return")
+    func responsePathNotDelayed() async throws {
+        let dir = tempDir("ready-nonblocking")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let cache = makeCache(
+            dir: dir,
+            kek: SymmetricKey(size: .bits256),
+            clock: ClockBox(10_000),
+            minEffectiveTokens: fixtureBlockSize,
+            maintainWholeRoot: {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 5)
+            })
+        defer { cache.close(); release.signal() }
+        let id = CBv2RequestID(61)
+        cache.registerReadyReceipt(requestID: id, callback: { _ in })
+        let returned = Task {
+            correlatedDonate(cache, requestID: id, tokenCount: 64)
+            return true
+        }
+        #expect(await returned.value)
+        let enteredResult = await waitForSemaphore(entered, timeout: .now() + 5)
+        #expect(enteredResult == .success)
+        release.signal()
+    }
+}
+
+@Suite("SSD prefix cache: ready write failure barriers", .serialized)
+struct SSDReadyWriteBarrierTests {
+    private final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func increment() { lock.withLock { value += 1 } }
+        var count: Int { lock.withLock { value } }
+        func waitForCount(_ expected: Int, timeout: Duration = .seconds(5)) async -> Bool {
+            let deadline = ContinuousClock.now + timeout
+            while ContinuousClock.now < deadline {
+                if count >= expected { return true }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            return count >= expected
+        }
+    }
+
+    private enum InjectedWriteError: Error { case failed }
+
+    private func block(_ byte: UInt8) -> SSDBlockWrite {
+        let tag = Data(repeating: byte, count: 16)
+        return SSDBlockWrite(
+            tag16: tag,
+            tag16Hex: SSDLookupKeys.hex(tag),
+            metadata: SSDBlockMetadata(
+                lookupTag: String(repeating: "ab", count: 32),
+                weightHash: "w",
+                layoutEpoch: "layout",
+                blockSize: 8,
+                layerCount: 1,
+                chunks: [],
+                chunkPlaintextSizes: [],
+                createdAt: 10_000),
+            chunks: [],
+            plaintextBytes: 1)
+    }
+
+    private func pipeline(
+        dir: URL,
+        maxJobs: Int = 2,
+        volumeSpace: @escaping @Sendable () -> (free: Int, capacity: Int)? = { nil },
+        writeBlock: (@Sendable (SSDBlockWrite, URL) throws -> Int)? = nil,
+        onBlockSettled: @escaping @Sendable (Data) -> Void = { _ in }
+    ) -> SSDWriteBehind {
+        SSDWriteBehind(
+            config: .init(
+                root: dir,
+                kekKey: SymmetricKey(size: .bits256),
+                strictFsync: false,
+                ttlSeconds: 0,
+                maxJobs: maxJobs,
+                maxQueuedBytes: 1 << 20,
+                diskBudgetBytes: { 1 << 20 },
+                volumeSpace: volumeSpace,
+                nowSeconds: { 10_000 },
+                maintainWholeRoot: nil,
+                writeBlock: writeBlock),
+            rateLimiter: SSDWriteRateLimiter(capBytesPerDay: 0),
+            index: SSDBlockIndex(),
+            diskBudget: SSDDiskBudget(),
+            stats: SSDPrefixCacheStatsBox(),
+            onBlockSettled: onBlockSettled,
+            sweepExpired: {})
+    }
+
+    @Test("low disk, generic write error, ENOSPC, and shutdown never cross durable barrier")
+    func failureMatrix() async throws {
+        let dir = tempDir("ready-write-failures")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let lowCounter = Counter()
+        let lowSettled = Counter()
+        let low = pipeline(
+            dir: dir,
+            volumeSpace: { (free: 0, capacity: 1) },
+            onBlockSettled: { _ in lowSettled.increment() })
+        #expect(low.submit(.init(
+            blocks: [block(1)], totalBytes: 1, onDurable: lowCounter.increment)))
+        #expect(await lowSettled.waitForCount(1))
+        low.close()
+        await low.waitUntilDrained()
+        #expect(lowCounter.count == 0)
+
+        let errorCounter = Counter()
+        let errorSettled = Counter()
+        let generic = pipeline(
+            dir: dir,
+            writeBlock: { _, _ in throw InjectedWriteError.failed },
+            onBlockSettled: { _ in errorSettled.increment() })
+        #expect(generic.submit(.init(
+            blocks: [block(2)], totalBytes: 1, onDurable: errorCounter.increment)))
+        #expect(await errorSettled.waitForCount(1))
+        generic.close()
+        await generic.waitUntilDrained()
+        #expect(errorCounter.count == 0)
+
+        let enospcCounter = Counter()
+        let enospcSettled = Counter()
+        let enospc = pipeline(
+            dir: dir,
+            writeBlock: { _, _ in throw POSIXError(.ENOSPC) },
+            onBlockSettled: { _ in enospcSettled.increment() })
+        #expect(enospc.submit(.init(
+            blocks: [block(3)], totalBytes: 1, onDurable: enospcCounter.increment)))
+        #expect(await enospcSettled.waitForCount(1))
+        enospc.close()
+        await enospc.waitUntilDrained()
+        #expect(enospcCounter.count == 0)
+
+        let closedCounter = Counter()
+        let closed = pipeline(dir: dir)
+        closed.close()
+        #expect(!closed.submit(.init(
+            blocks: [block(4)], totalBytes: 1, onDurable: closedCounter.increment)))
+        #expect(closedCounter.count == 0)
+    }
+
+    @Test("queue overflow drops the new receipt job without blocking")
+    func queueDrop() async throws {
+        let dir = tempDir("ready-queue-drop")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let settled = Counter()
+        let pipeline = pipeline(dir: dir, maxJobs: 1, writeBlock: { block, _ in
+            if block.tag16.first == 1 {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 5)
+            }
+            return 1
+        }, onBlockSettled: { _ in settled.increment() })
+        defer { release.signal(); pipeline.close() }
+        #expect(pipeline.submit(.init(blocks: [block(1)], totalBytes: 1)))
+        let enteredResult = await waitForSemaphore(entered, timeout: .now() + 5)
+        #expect(enteredResult == .success)
+        #expect(pipeline.submit(.init(blocks: [block(2)], totalBytes: 1)))
+        let dropped = Counter()
+        #expect(!pipeline.submit(.init(
+            blocks: [block(3)], totalBytes: 1, onDurable: dropped.increment)))
+        #expect(dropped.count == 0)
+        release.signal()
+        #expect(await settled.waitForCount(2))
+        pipeline.close()
+        await pipeline.waitUntilDrained()
     }
 }
 
@@ -777,7 +1171,7 @@ struct SSDPrefixCacheReservationTests {
         defer { cache.close() }
 
         let prompt = Array(0 ..< tokenCount) + [1]
-        #expect(await cache.stage(requestID: "req-ok", promptTokens: prompt, cacheScope: ""))
+        #expect((await cache.stage(requestID: "req-ok", promptTokens: prompt, cacheScope: "")).staged)
         #expect(await budget.outstandingReservedBytes() > 0)
         let hit = try #require(
             cache.lookup(tokens: prompt, layerKinds: fixtureLayerKinds, cacheSalt: nil))
@@ -822,7 +1216,13 @@ struct SSDPrefixCacheReservationTests {
         }
 
         let prompt = tokens + [7]
-        #expect(await cache.stage(requestID: "req-short", promptTokens: prompt, cacheScope: ""))
+        let stageResult = await cache.stage(
+            requestID: "req-short", promptTokens: prompt, cacheScope: "")
+        #expect(stageResult.staged)
+        #expect(stageResult.disposition == .staged(
+            matchedTokens: 7 * fixtureBlockSize,
+            expectedPrefillTokensSaved: 7 * fixtureBlockSize,
+            shortenedByCorruption: true))
         #expect(cache.stats().corruptDropped == 1)
         // Regression (Codex, v0.7.5 SSD review): the reservation and the
         // staging accounting must reflect the SHORTENED run — they used to
@@ -851,7 +1251,7 @@ struct SSDPrefixCacheReservationTests {
         defer { cache.close() }
 
         let prompt = Array(0 ..< tokenCount) + [1]
-        #expect(await cache.stage(requestID: "req-b", promptTokens: prompt, cacheScope: ""))
+        #expect((await cache.stage(requestID: "req-b", promptTokens: prompt, cacheScope: "")).staged)
         #expect(await budget.outstandingReservedBytes() > 0)
         cache.completeStaging(requestID: "req-b")
         #expect(await waitForZeroOutstanding(budget))
@@ -876,7 +1276,7 @@ struct SSDPrefixCacheReservationTests {
             // Guarantee the cancellation flag is observed before staging
             // starts its read loop.
             while !Task.isCancelled { await Task.yield() }
-            return await cache.stage(requestID: "req-x", promptTokens: prompt, cacheScope: "")
+            return (await cache.stage(requestID: "req-x", promptTokens: prompt, cacheScope: "")).staged
         }
         task.cancel()
         let staged = await task.value
@@ -905,7 +1305,8 @@ struct SSDPrefixCacheReservationTests {
 
         let prompt = Array(0 ..< tokenCount) + [1]
         let staged = await cache.stage(requestID: "req-p", promptTokens: prompt, cacheScope: "")
-        #expect(!staged, "refusal under memory pressure must be a silent recompute")
+        #expect(!staged.staged, "refusal under memory pressure must be a silent recompute")
+        #expect(staged.disposition == .skippedCapacity)
         #expect(await budget.outstandingReservedBytes() == 0)
         #expect(cache.bytesInUse == 0)
     }
@@ -920,7 +1321,7 @@ struct SSDPrefixCacheReservationTests {
             dir: dir, kek: SymmetricKey(size: .bits256), clock: clock, kvBudget: budget)
 
         let prompt = Array(0 ..< tokenCount) + [1]
-        #expect(await cache.stage(requestID: "req-c", promptTokens: prompt, cacheScope: ""))
+        #expect((await cache.stage(requestID: "req-c", promptTokens: prompt, cacheScope: "")).staged)
         #expect(await budget.outstandingReservedBytes() > 0)
         cache.close()
         #expect(await waitForZeroOutstanding(budget))
@@ -952,10 +1353,10 @@ struct SSDPrefixCacheReservationTests {
 
         let prompt = Array(0 ..< tokenCount) + [1]
         // A creates the staged entry; B attaches to the SAME entry.
-        #expect(await cache.stage(requestID: "req-A", promptTokens: prompt, cacheScope: ""))
+        #expect((await cache.stage(requestID: "req-A", promptTokens: prompt, cacheScope: "")).staged)
         let afterA = await budget.outstandingReservedBytes()
         #expect(afterA > 0)
-        #expect(await cache.stage(requestID: "req-B", promptTokens: prompt, cacheScope: ""))
+        #expect((await cache.stage(requestID: "req-B", promptTokens: prompt, cacheScope: "")).staged)
         // Charged ONCE: attaching adds a residency ticket, not a reservation.
         // (Pre-fix this was 2 × afterA.)
         #expect(
@@ -1049,9 +1450,337 @@ struct SSDRootIsolationTests {
         defer { reader.close() }
         reader.scanOnDisk()
         #expect(reader.index.count == 8)
-        #expect(await reader.stage(
-            requestID: "r-survive", promptTokens: tokens + [1], cacheScope: ""))
+        #expect((await reader.stage(
+            requestID: "r-survive", promptTokens: tokens + [1], cacheScope: "")).staged)
         reader.completeStaging(requestID: "r-survive")
+    }
+}
+
+@Suite("SSD prefix cache: unloaded whole-root maintenance", .serialized)
+struct SSDWholeRootMaintenanceTests {
+    private func writeOwnedFile(
+        root: URL,
+        modelKey: String,
+        tagHex: String,
+        modifiedAt: Int64,
+        payloadBytes: Int = 128
+    ) throws -> URL {
+        let modelRoot = root.appendingPathComponent(modelKey, isDirectory: true)
+        let url = SSDBlockStore.fileURL(root: modelRoot, tag16Hex: tagHex)
+        let chunk = Data(repeating: 7, count: payloadBytes)
+        let metadata = SSDBlockMetadata(
+            lookupTag: String(repeating: "ab", count: 32),
+            weightHash: "weight",
+            layoutEpoch: "layout",
+            blockSize: 8,
+            layerCount: 1,
+            chunks: [.init(
+                layerIndex: 0,
+                tensor: 0,
+                shape: [1, 1, 1, 1],
+                dtype: "float16")],
+            chunkPlaintextSizes: [chunk.count],
+            createdAt: modifiedAt)
+        try SSDBlockStore.write(
+            to: url,
+            metadata: metadata,
+            chunks: [chunk],
+            kekKey: SymmetricKey(size: .bits256))
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: TimeInterval(modifiedAt))],
+            ofItemAtPath: url.path)
+        return url
+    }
+
+    private func writeOwnedTemp(
+        root: URL,
+        modelKey: String,
+        tagHex: String,
+        uuid: UUID,
+        modifiedAt: Int64,
+        payloadBytes: Int
+    ) throws -> URL {
+        let destination = SSDBlockStore.fileURL(
+            root: root.appendingPathComponent(modelKey, isDirectory: true),
+            tag16Hex: tagHex)
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let url = SSDBlockStore.temporaryFileURL(for: destination, uuid: uuid)
+        try Data(repeating: 9, count: payloadBytes).write(to: url)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: TimeInterval(modifiedAt))],
+            ofItemAtPath: url.path)
+        return url
+    }
+
+    @Test("startup sweep expires files in unloaded model directories")
+    func unloadedTTL() throws {
+        let root = tempDir("whole-root-ttl")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let expired = try writeOwnedFile(
+            root: root,
+            modelKey: "aaaaaaaaaaaa",
+            tagHex: "aa00112233445566778899aabbccddee",
+            modifiedAt: 1_000)
+        let fresh = try writeOwnedFile(
+            root: root,
+            modelKey: "bbbbbbbbbbbb",
+            tagHex: "bb00112233445566778899aabbccddee",
+            modifiedAt: 1_950)
+
+        let result = SSDWholeRootMaintainer.shared.maintain(
+            root: root,
+            ttlSeconds: 900,
+            nowSeconds: 2_000,
+            budgetBytes: Int.max)
+        #expect(result.ttlExpired == 1)
+        #expect(!FileManager.default.fileExists(atPath: expired.path))
+        #expect(FileManager.default.fileExists(atPath: fresh.path))
+    }
+
+    @Test("20 GiB-style budget is global across unloaded model directories")
+    func globalBudget() throws {
+        let root = tempDir("whole-root-budget")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let old = try writeOwnedFile(
+            root: root,
+            modelKey: "111111111111",
+            tagHex: "1100112233445566778899aabbccddee",
+            modifiedAt: 1_000,
+            payloadBytes: 256)
+        let fresh = try writeOwnedFile(
+            root: root,
+            modelKey: "222222222222",
+            tagHex: "2200112233445566778899aabbccddee",
+            modifiedAt: 2_000,
+            payloadBytes: 256)
+        let freshBytes = try fresh.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+
+        let result = SSDWholeRootMaintainer.shared.maintain(
+            root: root,
+            ttlSeconds: 10_000,
+            nowSeconds: 2_100,
+            budgetBytes: freshBytes)
+        #expect(result.budgetEvicted == 1)
+        #expect(!FileManager.default.fileExists(atPath: old.path))
+        #expect(FileManager.default.fileExists(atPath: fresh.path))
+        #expect(result.bytesAfter <= freshBytes)
+    }
+
+    @Test("young temp bytes consume global budget without making the active temp evictable")
+    func youngTempBudgetAccounting() throws {
+        let root = tempDir("whole-root-temp-budget")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let completed = try writeOwnedFile(
+            root: root,
+            modelKey: "111111111111",
+            tagHex: "1100112233445566778899aabbccddee",
+            modifiedAt: 1_000,
+            payloadBytes: 256)
+        let now: Int64 = 10_000
+        let temp = try writeOwnedTemp(
+            root: root,
+            modelKey: "222222222222",
+            tagHex: "2200112233445566778899aabbccddee",
+            uuid: #require(UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")),
+            modifiedAt: now - SSDBlockStore.crashTempTTLSeconds + 1,
+            payloadBytes: 257)
+        let tempBytes = try #require(
+            temp.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+
+        let result = SSDWholeRootMaintainer.shared.maintain(
+            root: root,
+            ttlSeconds: 0,
+            nowSeconds: now,
+            budgetBytes: tempBytes)
+        #expect(result.budgetEvicted == 1)
+        #expect(!FileManager.default.fileExists(atPath: completed.path))
+        #expect(FileManager.default.fileExists(atPath: temp.path))
+        #expect(result.bytesAfter == tempBytes)
+
+        let belowTempBudget = SSDWholeRootMaintainer.shared.maintain(
+            root: root,
+            ttlSeconds: 0,
+            nowSeconds: now,
+            budgetBytes: tempBytes - 1)
+        #expect(belowTempBudget.budgetEvicted == 0)
+        #expect(belowTempBudget.bytesAfter == tempBytes)
+        #expect(FileManager.default.fileExists(atPath: temp.path))
+    }
+
+    @Test("malformed exact-looking files remain untouched without DBK2 ownership proof")
+    func malformedLookalikePreserved() throws {
+        let root = tempDir("whole-root-lookalike")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = root.appendingPathComponent("abcdefabcdef", isDirectory: true)
+        let fanout = model.appendingPathComponent("ab", isDirectory: true)
+        try FileManager.default.createDirectory(at: fanout, withIntermediateDirectories: true)
+        let lookalike = fanout.appendingPathComponent(
+            "ab00112233445566778899aabbccddee.dbk2")
+        try Data("not-a-darkbloom-block".utf8).write(to: lookalike)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 1_000)],
+            ofItemAtPath: lookalike.path)
+
+        let result = SSDWholeRootMaintainer.shared.maintain(
+            root: root,
+            ttlSeconds: 1,
+            nowSeconds: 10_000,
+            budgetBytes: 0)
+        #expect(result.filesSeen == 0)
+        #expect(FileManager.default.fileExists(atPath: lookalike.path))
+    }
+
+    @Test("maintenance rejects roots reached through a symlinked ancestor")
+    func symlinkedRootIsNeverTraversed() throws {
+        let container = tempDir("whole-root-symlink-container")
+        let root = container.appendingPathComponent("kv2", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let stale = try writeOwnedTemp(
+            root: root,
+            modelKey: "abcdefabcdef",
+            tagHex: "ab00112233445566778899aabbccddee",
+            uuid: try #require(UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")),
+            modifiedAt: 1_000,
+            payloadBytes: 64)
+        let alias = container.deletingLastPathComponent().appendingPathComponent(
+            "ssd-prefix-root-alias-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: alias, withDestinationURL: container)
+        defer {
+            try? FileManager.default.removeItem(at: alias)
+            try? FileManager.default.removeItem(at: container)
+        }
+        let aliasedRoot = alias.appendingPathComponent("kv2", isDirectory: true)
+
+        let result = SSDWholeRootMaintainer.shared.maintain(
+            root: aliasedRoot,
+            ttlSeconds: 1,
+            nowSeconds: 10_000,
+            budgetBytes: 0)
+        #expect(result == SSDWholeRootMaintainer.Result())
+        #expect(SSDBlockStore.sweepStaleTempFiles(
+            under: aliasedRoot.appendingPathComponent("abcdefabcdef", isDirectory: true),
+            nowSeconds: 10_000) == 0)
+        #expect(FileManager.default.fileExists(atPath: stale.path))
+    }
+
+    @Test("whole-root sweep preserves young and near-match temps but removes stale owned temps")
+    func tempCleanupUsesAgeAndExactOwnership() throws {
+        let root = tempDir("whole-root-temp-ownership")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let now: Int64 = 10_000
+        let uuid = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        let tag = "ab00112233445566778899aabbccddee"
+        let exactName = "\(tag).dbk2.darkbloom-tmp.\(uuid)"
+
+        func create(
+            _ relativeDirectory: String,
+            _ name: String,
+            modifiedAt: Int64 = 0
+        ) throws -> URL {
+            let directory = root.appendingPathComponent(relativeDirectory, isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent(name)
+            try Data("incomplete".utf8).write(to: url)
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date(timeIntervalSince1970: TimeInterval(modifiedAt))],
+                ofItemAtPath: url.path)
+            return url
+        }
+
+        let stale = try create(
+            "abcdefabcdef/ab", exactName,
+            modifiedAt: now - SSDBlockStore.crashTempTTLSeconds)
+        let young = try create(
+            "abcdefabcdef/ab",
+            "\(tag).dbk2.darkbloom-tmp.31234567-89AB-CDEF-0123-456789ABCDEF",
+            modifiedAt: now - SSDBlockStore.crashTempTTLSeconds + 1)
+        let preserved = try [
+            young,
+            // UUID values differ so case-only near-matches remain distinct on
+            // the default case-insensitive macOS filesystem.
+            create("abcdefabcdef/ab", "\(tag).dbk2.darkbloom-tmp.11234567-89ab-cdef-0123-456789abcdef"),
+            create("abcdefabcdef/ab", "\(tag).dbk2.darkbloom-tmp.21234567-89AB-cDEF-0123-456789ABCDef"),
+            create("abcdefabcdef/ab", "AB00112233445566778899aabbccddee.dbk2.darkbloom-tmp.11234567-89AB-CDEF-0123-456789ABCDEF"),
+            create("abcdefabcdef/ab", "\(tag).dbk2.darkbloom-tmp.not-a-uuid"),
+            create("abcdefabcdef/ab", "\(tag).dbk2.darkbloom-tmp-\(uuid)"),
+            create("abcdefabcdef/ab", "\(tag).dbk2.darkbloom-tmp.\(uuid).extra"),
+            create("abcdefabcdef/cd", exactName),
+            create("not-a-model/ab", exactName),
+            create("abcdefabcdef/not-fanout", exactName),
+        ]
+
+        let result = SSDWholeRootMaintainer.shared.maintain(
+            root: root,
+            ttlSeconds: 0,
+            nowSeconds: now,
+            budgetBytes: 0)
+        #expect(result.tempFilesRemoved == 1)
+        #expect(!FileManager.default.fileExists(atPath: stale.path))
+        for url in preserved {
+            #expect(FileManager.default.fileExists(atPath: url.path), "preserved \(url.path)")
+        }
+    }
+
+    @Test("periodic maintenance sweeps stale unloaded-model temps and can restart")
+    func periodicRestartSeam() async throws {
+        let root = tempDir("whole-root-periodic")
+        defer {
+            SSDWholeRootMaintainer.shared.stopPeriodicMaintenance(root: root)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let destination = SSDBlockStore.fileURL(
+            root: root.appendingPathComponent("abcdefabcdef", isDirectory: true),
+            tag16Hex: "ab00112233445566778899aabbccddee")
+        try FileManager.default.createDirectory(
+            at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let temp = SSDBlockStore.temporaryFileURL(
+            for: destination,
+            uuid: try #require(UUID(uuidString: "01234567-89AB-CDEF-0123-456789ABCDEF")))
+        try Data("incomplete".utf8).write(to: temp)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970:
+                TimeInterval(10_000 - SSDBlockStore.crashTempTTLSeconds))],
+            ofItemAtPath: temp.path)
+
+        SSDWholeRootMaintainer.shared.startPeriodicMaintenance(
+            root: root,
+            ttlSeconds: 900,
+            intervalSeconds: 3600,
+            nowSeconds: { 10_000 },
+            budgetBytes: { 1 << 20 })
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline,
+            FileManager.default.fileExists(atPath: temp.path)
+        {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(!FileManager.default.fileExists(atPath: temp.path))
+        SSDWholeRootMaintainer.shared.stopPeriodicMaintenance(root: root)
+        SSDWholeRootMaintainer.shared.startPeriodicMaintenance(
+            root: root,
+            ttlSeconds: 900,
+            intervalSeconds: 3600,
+            nowSeconds: { 10_000 },
+            budgetBytes: { 1 << 20 })
+
+        let restartedTemp = SSDBlockStore.temporaryFileURL(
+            for: destination,
+            uuid: try #require(UUID(uuidString: "11234567-89AB-CDEF-0123-456789ABCDEF")))
+        try Data("second-incomplete".utf8).write(to: restartedTemp)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970:
+                TimeInterval(10_000 - SSDBlockStore.crashTempTTLSeconds))],
+            ofItemAtPath: restartedTemp.path)
+        let restartDeadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < restartDeadline,
+            FileManager.default.fileExists(atPath: restartedTemp.path)
+        {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(!FileManager.default.fileExists(atPath: restartedTemp.path))
     }
 }
 
@@ -1178,7 +1907,7 @@ struct SSDPrefixCacheDonationGateTests {
         reader.scanOnDisk()
         let staged = await reader.stage(
             requestID: "r-cap", promptTokens: Array(0 ..< 64) + [1], cacheScope: "")
-        #expect(staged)
+        #expect(staged.staged)
         let hit = reader.lookup(
             tokens: Array(0 ..< 64) + [1], layerKinds: fixtureLayerKinds, cacheSalt: nil)
         #expect(hit?.matched == 3 * fixtureBlockSize)
@@ -1208,7 +1937,9 @@ struct SSDPrefixCacheDonationGateTests {
                 maxJobs: 2, maxQueuedBytes: effectiveCap,
                 diskBudgetBytes: { 1 << 40 },
                 volumeSpace: { nil },
-                nowSeconds: { 10_000 }),
+                nowSeconds: { 10_000 },
+                maintainWholeRoot: nil,
+                writeBlock: nil),
             rateLimiter: SSDWriteRateLimiter(capBytesPerDay: 0),
             index: index, diskBudget: SSDDiskBudget(), stats: stats,
             onBlockSettled: { _ in }, sweepExpired: {})

@@ -33,12 +33,13 @@ enum EngineV2Translation {
     ///   and batched requests stop identically.
     /// * `stopStrings` carries the request's `stop` sequences; the v2
     ///   engine matches them against held-back detokenized text.
-    /// * `cacheScope` is the provider's per-tenant prefix-cache scope
-    ///   (`SHA256(prompt_cache_key)`/`SHA256(user)`, "" ⇒ unscoped). It
+    /// * `cacheScope` is an authenticated remote scope or configured local
+    ///   scope. It
     ///   maps onto `CBv2Request.cacheSalt` (TB-007/T-041): a non-empty
     ///   scope REPLACES the cache-level salt in the first block hash so
     ///   tenants can never share cached KV; "" maps to nil (cache-level
-    ///   salt fallback — byte-identical hashes to the pre-salt behavior).
+    ///   salt fallback for direct/local callers. Remote legacy requests set
+    ///   `cacheEnabled=false` and never use that fallback.
     ///   LIVE as of v0.7.5: the production engine runs `PrefixCacheV2`
     ///   whenever `PrefixCachePolicy` funds it.
     /// * `multimodal` (v0.7.5) carries the precomputed vision-prefill spans
@@ -51,6 +52,7 @@ enum EngineV2Translation {
         defaultMaxTokens: Int,
         stopTokenIds: Set<Int>,
         cacheScope: String = "",
+        cacheEnabled: Bool = true,
         multimodal: CBv2MultimodalInput? = nil
     ) -> CBv2Request {
         CBv2Request(
@@ -62,6 +64,7 @@ enum EngineV2Translation {
             stopStrings: request.stop?.asArray ?? [],
             priority: 0,
             cacheSalt: cacheScope.isEmpty ? nil : cacheScope,
+            prefixCacheEnabled: cacheEnabled,
             multimodal: multimodal
         )
     }

@@ -14,13 +14,18 @@ import (
 type Config struct {
 	MinTrustLevel string
 	WarmPool      WarmPoolConfig
-	CacheAffinity CacheAffinityConfig
+	CacheRouting  CacheRoutingConfig
 	QualityCap    QualityCapConfig
 }
 
-type CacheAffinityConfig struct {
-	TTL     time.Duration
-	BonusMs float64
+type CacheRoutingConfig struct {
+	Mode            string
+	TTL             time.Duration
+	MaxHolders      int
+	MaxDiscountMs   float64
+	MaxCostFraction float64
+	Dedicated       bool
+	MasterKey       string
 }
 
 // QualityCapConfig governs the per-provider admission concurrency cap derived
@@ -136,9 +141,14 @@ func ReadConfig() Config {
 			RampGapFraction:        env.EnvFloat(env.EnvPrefix+"_WARM_POOL_RAMP_GAP_FRACTION", 0.5),
 			MaxGlobalPendingLoads:  env.EnvInt(env.EnvPrefix+"_WARM_POOL_MAX_GLOBAL_PENDING_LOADS", 16),
 		},
-		CacheAffinity: CacheAffinityConfig{
-			TTL:     envDuration(env.EnvPrefix+"_CACHE_AFFINITY_TTL", cacheAffinityTTL),
-			BonusMs: env.EnvFloat(env.EnvPrefix+"_CACHE_AFFINITY_BONUS_MS", defaultCacheAffinityBonusMs),
+		CacheRouting: CacheRoutingConfig{
+			Mode:            strings.ToLower(strings.TrimSpace(os.Getenv(env.EnvPrefix + "_CACHE_ROUTING_MODE"))),
+			TTL:             envDuration(env.EnvPrefix+"_CACHE_ROUTING_TTL", defaultCacheRoutingTTL),
+			MaxHolders:      env.EnvInt(env.EnvPrefix+"_CACHE_ROUTING_MAX_HOLDERS", defaultCacheRoutingMaxHolders),
+			MaxDiscountMs:   env.EnvFloat(env.EnvPrefix+"_CACHE_ROUTING_MAX_DISCOUNT_MS", defaultCacheRoutingMaxDiscountMs),
+			MaxCostFraction: env.EnvFloat(env.EnvPrefix+"_CACHE_ROUTING_MAX_COST_FRACTION", defaultCacheRoutingMaxCostFraction),
+			Dedicated:       env.EnvBool(env.EnvPrefix+"_CACHE_ROUTING_DEDICATED", false),
+			MasterKey:       strings.TrimSpace(os.Getenv(env.EnvPrefix + "_CACHE_MASTER_KEY")),
 		},
 		QualityCap: QualityCapConfig{
 			Enabled:    env.EnvBool(env.EnvPrefix+"_QUALITY_CONCURRENCY_CAP", true),
@@ -169,21 +179,38 @@ func (c Config) Check() error {
 	if err := c.WarmPool.Check(); err != nil {
 		return err
 	}
-	if err := c.CacheAffinity.Check(); err != nil {
+	if err := c.CacheRouting.Check(); err != nil {
 		return err
 	}
 	return c.QualityCap.Check()
 }
 
-func (c CacheAffinityConfig) Check() error {
+func (c CacheRoutingConfig) Check() error {
+	mode := c.Mode
+	if mode == "" {
+		mode = CacheRoutingOff
+	}
+	switch mode {
+	case CacheRoutingOff, CacheRoutingObserve, CacheRoutingExact, CacheRoutingConversation:
+	default:
+		return fmt.Errorf("registry: invalid cache routing mode %q", c.Mode)
+	}
 	if c.TTL < 0 {
-		return fmt.Errorf("registry: cache affinity ttl must be >= 0")
+		return fmt.Errorf("registry: cache routing ttl must be >= 0")
 	}
-	if c.BonusMs < 0 {
-		return fmt.Errorf("registry: cache affinity bonus must be >= 0")
+	if c.MaxHolders < 1 || c.MaxHolders > 32 {
+		return fmt.Errorf("registry: cache routing max holders must be between 1 and 32")
 	}
-	if c.BonusMs > 10_000 {
-		return fmt.Errorf("registry: cache affinity bonus must be <= 10000ms")
+	if c.MaxDiscountMs < 0 || c.MaxDiscountMs > 10_000 {
+		return fmt.Errorf("registry: cache routing max discount must be between 0 and 10000ms")
+	}
+	if c.MaxCostFraction < 0 || c.MaxCostFraction > 1 {
+		return fmt.Errorf("registry: cache routing max cost fraction must be between 0 and 1")
+	}
+	if mode != CacheRoutingOff {
+		if _, err := decodeCacheMasterKey(c.MasterKey); err != nil {
+			return fmt.Errorf("registry: cache routing requires a valid CACHE_MASTER_KEY: %w", err)
+		}
 	}
 	return nil
 }

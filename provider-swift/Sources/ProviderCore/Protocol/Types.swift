@@ -247,6 +247,20 @@ public struct ProviderStats: Codable, Sendable, Equatable {
     }
 }
 
+public enum PrefixCacheLookupOutcome: String, Codable, Sendable, Equatable, CaseIterable {
+    case hit
+    case missAbsent = "miss_absent"
+    case missCorrupt = "miss_corrupt"
+    case skippedCapacity = "skipped_capacity"
+    case skippedCost = "skipped_cost"
+    case skippedPolicy = "skipped_policy"
+}
+
+public enum PrefixCacheTier: String, Codable, Sendable, Equatable {
+    case memory
+    case ssd
+}
+
 public struct UsageInfo: Codable, Sendable, Equatable {
     public var promptTokens: UInt64
     public var completionTokens: UInt64
@@ -257,17 +271,41 @@ public struct UsageInfo: Codable, Sendable, Equatable {
     /// `reasoning_tokens` in the Responses API and as
     /// `completion_tokens_details.reasoning_tokens` in chat completions.
     public var reasoningTokens: UInt64
+    public var cacheOutcome: PrefixCacheLookupOutcome?
+    public var cacheTier: PrefixCacheTier?
+    public var cachedTokens: UInt64?
+    public var prefillTokensSaved: UInt64?
+    public var cacheStageMs: Double?
 
     enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
         case reasoningTokens = "reasoning_tokens"
+        case cacheOutcome = "cache_outcome"
+        case cacheTier = "cache_tier"
+        case cachedTokens = "cached_tokens"
+        case prefillTokensSaved = "prefill_tokens_saved"
+        case cacheStageMs = "cache_stage_ms"
     }
 
-    public init(promptTokens: UInt64, completionTokens: UInt64, reasoningTokens: UInt64 = 0) {
+    public init(
+        promptTokens: UInt64,
+        completionTokens: UInt64,
+        reasoningTokens: UInt64 = 0,
+        cacheOutcome: PrefixCacheLookupOutcome? = nil,
+        cacheTier: PrefixCacheTier? = nil,
+        cachedTokens: UInt64? = nil,
+        prefillTokensSaved: UInt64? = nil,
+        cacheStageMs: Double? = nil
+    ) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.reasoningTokens = reasoningTokens
+        self.cacheOutcome = cacheOutcome
+        self.cacheTier = cacheTier
+        self.cachedTokens = cachedTokens
+        self.prefillTokensSaved = prefillTokensSaved
+        self.cacheStageMs = cacheStageMs
     }
 
     public init(from decoder: Decoder) throws {
@@ -276,6 +314,23 @@ public struct UsageInfo: Codable, Sendable, Equatable {
         self.completionTokens = try c.decode(UInt64.self, forKey: .completionTokens)
         // Optional for backward compatibility with peers that don't send it.
         self.reasoningTokens = try c.decodeIfPresent(UInt64.self, forKey: .reasoningTokens) ?? 0
+        self.cacheOutcome = try c.decodeIfPresent(PrefixCacheLookupOutcome.self, forKey: .cacheOutcome)
+        self.cacheTier = try c.decodeIfPresent(PrefixCacheTier.self, forKey: .cacheTier)
+        self.cachedTokens = try c.decodeIfPresent(UInt64.self, forKey: .cachedTokens)
+        self.prefillTokensSaved = try c.decodeIfPresent(UInt64.self, forKey: .prefillTokensSaved)
+        self.cacheStageMs = try c.decodeIfPresent(Double.self, forKey: .cacheStageMs)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(promptTokens, forKey: .promptTokens)
+        try c.encode(completionTokens, forKey: .completionTokens)
+        if reasoningTokens != 0 { try c.encode(reasoningTokens, forKey: .reasoningTokens) }
+        try c.encodeIfPresent(cacheOutcome, forKey: .cacheOutcome)
+        try c.encodeIfPresent(cacheTier, forKey: .cacheTier)
+        try c.encodeIfPresent(cachedTokens, forKey: .cachedTokens)
+        try c.encodeIfPresent(prefillTokensSaved, forKey: .prefillTokensSaved)
+        try c.encodeIfPresent(cacheStageMs, forKey: .cacheStageMs)
     }
 }
 

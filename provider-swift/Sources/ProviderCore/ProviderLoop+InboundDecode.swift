@@ -81,25 +81,6 @@ extension ProviderLoop {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// Per-tenant prefix-cache scope for this request. Like `reasoning_effort`,
-    /// `prompt_cache_key` isn't on the upstream `OpenAIChatCompletionRequest`,
-    /// so decode it (and `user` as fallback) directly from the sealed body.
-    /// Policy: `SHA256(prompt_cache_key)` if present, else `SHA256(user)`, else
-    /// "" (unscoped — shared cache, current behavior). The hash keeps the scope
-    /// opaque + fixed-width. Reuses `ChatCompletionRequest.cacheScope` so the
-    /// policy lives in exactly one place.
-    internal static func extractCacheScope(from data: Data) -> String {
-        struct Probe: Decodable { let prompt_cache_key: String?; let user: String? }
-        guard let probe = try? JSONDecoder().decode(Probe.self, from: data) else { return "" }
-        if let k = probe.prompt_cache_key, !k.isEmpty {
-            return ChatCompletionRequest.scopeHash(k)
-        }
-        if let u = probe.user, !u.isEmpty {
-            return ChatCompletionRequest.scopeHash(u)
-        }
-        return ""
-    }
-
     /// OpenAI `logprobs` / `top_logprobs` for this request. Like
     /// `reasoning_effort` and the cache scope, neither field is on the
     /// upstream `OpenAIChatCompletionRequest`, so decode them straight from

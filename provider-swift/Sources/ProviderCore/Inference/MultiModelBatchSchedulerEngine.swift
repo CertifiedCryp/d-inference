@@ -77,12 +77,14 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
     /// allowed set is model-specific and lives in each model's Jinja
     /// template, so passing through is the format-agnostic choice.
     private let reasoningEffort: String?
-    /// Per-tenant prefix-cache scope (`SHA256(prompt_cache_key)`/`user`, ""
-    /// means unscoped). Maps to `CBv2Request.cacheSalt` for both the default
-    /// encrypted SSD tier and the opt-in RAM tier.
+    /// Authenticated remote or configured local prefix-cache scope. Maps to
+    /// `CBv2Request.cacheSalt` for both cache tiers.
     private let cacheScope: String
+    /// False only for remote requests from a legacy/malformed coordinator
+    /// that did not provide an authenticated outer cache scope.
+    private let cacheEnabled: Bool
     /// Per-request usage-detail signal: the bridge
-    /// records the engine's terminal `prefixCacheHitTokens` here so the
+    /// records the engine's terminal matched/saved token detail here so the
     /// caller's frames loop can splice OpenAI-standard
     /// `prompt_tokens_details.cached_tokens` into the trailing SSE usage
     /// chunk. Same out-of-band pattern as `engineV2Logprobs`.
@@ -113,6 +115,7 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
         defaultMaxTokens: Int = 4096,
         reasoningEffort: String? = nil,
         cacheScope: String = "",
+        cacheEnabled: Bool = true,
         engineV2Logprobs: EngineV2LogprobsPlumbing? = nil,
         engineV2Sampling: EngineV2SamplingOverrides? = nil,
         engineV2Vision: EngineV2VisionPlumbing? = nil,
@@ -125,6 +128,7 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
         self.defaultMaxTokens = defaultMaxTokens
         self.reasoningEffort = reasoningEffort
         self.cacheScope = cacheScope
+        self.cacheEnabled = cacheEnabled
         self.engineV2Logprobs = engineV2Logprobs
         self.engineV2Sampling = engineV2Sampling
         self.engineV2Vision = engineV2Vision
@@ -167,6 +171,7 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
         // ⇒ unscoped (default). Set via DARKBLOOM_PREFIX_CACHE_SCOPE; used to
         // exercise/validate cross-tenant isolation on a single box.
         self.cacheScope = cacheScope
+        self.cacheEnabled = true
         // The --local path serves SSE frames inside the upstream router, so
         // there is no provider seam to decorate frames with logprobs on this
         // init (same visible behavior as the legacy engine: none emitted).
@@ -374,6 +379,7 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
                             seed: engineV2Sampling?.seed),
                         requestId: visionRequestId,
                         cacheScope: cacheScope,
+                        cacheEnabled: cacheEnabled,
                         logprobsChannel: engineV2Logprobs?.channel,
                         // Media requests are prefix-cache-excluded engine-
                         // side (hit tokens always 0), but the signal still
@@ -545,6 +551,7 @@ public struct MultiModelBatchSchedulerEngine: MLXServerEngine, Sendable {
                 // (TB-007/T-041 — LIVE as of v0.7.5 when PrefixCachePolicy
                 // funds the cache).
                 cacheScope: cacheScope,
+                cacheEnabled: cacheEnabled,
                 logprobsChannel: engineV2Logprobs?.channel,
                 usageSignal: engineV2Usage
             )

@@ -693,7 +693,7 @@ func (s *Server) dispatchOneProvider(
 	policy selfRoutePolicy,
 	timing *registry.RequestTiming,
 	serviceReservation bool,
-	cacheAffinityKey string,
+	cacheRoute registry.CacheRoute,
 	excludeProviders map[string]struct{},
 	attempt int,
 	recordRoute routeDecisionRecorder,
@@ -726,7 +726,7 @@ func (s *Server) dispatchOneProvider(
 		Traits:                 traits,
 		RequestedMaxTokens:     requestedMaxTokens,
 		TokenAdmission:         tokenAdmission,
-		CacheAffinityKey:       cacheAffinityKey,
+		CacheRoute:             cacheRoute,
 		ReservedMicroUSD:       reservedMicroUSD,
 		BaseReservedMicroUSD:   reservedMicroUSD,
 		ServiceReservation:     serviceReservation,
@@ -878,6 +878,11 @@ func (s *Server) dispatchOneProvider(
 	if pr.Timing != nil {
 		pr.Timing.EncryptedAt = time.Now()
 	}
+	if err := s.registry.PrepareCacheAttempt(pr, provider); err != nil {
+		s.registry.ForgetCacheAttempt(pr)
+		s.ddIncr("routing.cache_prepare_error", nil)
+		s.logger.Warn("cache routing attempt disabled", "request_id", requestID, "provider_id", provider.ID, "error", err)
+	}
 
 	wireMsg := map[string]any{
 		"type":       protocol.TypeInferenceRequest,
@@ -887,6 +892,10 @@ func (s *Server) dispatchOneProvider(
 			"ciphertext":           encrypted.Ciphertext,
 		},
 	}
+	if pr.CacheReceiptNonce != "" && pr.CacheScope != "" {
+		wireMsg["cache_receipt_nonce"] = pr.CacheReceiptNonce
+		wireMsg["cache_scope"] = pr.CacheScope
+	}
 
 	pr.SessionPrivKey = &sessionKeys.PrivateKey
 	// pr.ReservedMicroUSD was already set in the struct literal and may have
@@ -894,6 +903,7 @@ func (s *Server) dispatchOneProvider(
 
 	data, err := json.Marshal(wireMsg)
 	if err != nil {
+		s.registry.ForgetCacheAttempt(pr)
 		refundExtra()
 		cleanupPending()
 		return nil, nil, decision, "failed to marshal request", http.StatusInternalServerError
@@ -902,6 +912,7 @@ func (s *Server) dispatchOneProvider(
 		pr.Timing.DispatchedAt = time.Now()
 	}
 	if err := writeProviderInferenceRequest(r.Context(), provider, data); err != nil {
+		s.registry.ForgetCacheAttempt(pr)
 		refundExtra()
 		cleanupPending()
 		excludeProviders[provider.ID] = struct{}{}
@@ -1286,7 +1297,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// schemas without crashing (version floor + template_render_ok gate);
 	// detected here, alongside the media gate, while the parsed body is hot.
 	hasTools := requestHasTools(parsed)
-	cacheAffinityKey := requestCacheAffinityKey(parsed)
 	// Shared media/tools fail-fast. Chat completions additionally rejects media
 	// sent via the Responses API surface (input-without-messages), because the
 	// Responses→chat lowering doesn't carry image/video parts through.
@@ -1548,6 +1558,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if rec, err := s.store.GetModelRegistryRecord(model); err == nil {
 		modelMaxContext = rec.MaxContextLength
 	}
+	cacheEndpoint := "/v1/chat/completions"
+	if isResponsesAPI {
+		cacheEndpoint = "/v1/responses"
+	}
+	cacheRoute := s.registry.DeriveCacheRoute(consumerKey, model, cacheEndpoint, rawBody, r.Header.Get("X-Session-Id"), requiresVision)
 
 	d := &dispatchState{
 		s:                      s,
@@ -1569,7 +1584,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		stream:                 stream,
 		policy:                 policy,
 		allowedProviderSerials: allowedProviderSerials,
-		cacheAffinityKey:       cacheAffinityKey,
+		cacheRoute:             cacheRoute,
 		timing:                 timing,
 		deadline:               deadline,
 		speculativeAt:          time.Duration(float64(deadline) * speculativeTimerRatio),
@@ -1996,6 +2011,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 								// accurate reasoning-token count if its raw usage
 								// object didn't already carry one.
 								injectReasoningDetailIntoRawUsage(obj, completeUsage)
+								injectCacheDetailIntoRawUsage(obj, completeUsage)
 								if pr.IsResponsesAPI {
 									var chatResp types.ChatCompletionResponse
 									b, err := json.Marshal(obj)
@@ -2462,6 +2478,24 @@ func injectReasoningDetailIntoRawUsage(obj map[string]any, usage protocol.UsageI
 	obj["usage"] = usageObj
 }
 
+func injectCacheDetailIntoRawUsage(obj map[string]any, usage protocol.UsageInfo) {
+	if usage.CachedTokens <= 0 {
+		return
+	}
+	usageObj, ok := obj["usage"].(map[string]any)
+	if !ok {
+		return
+	}
+	details, _ := usageObj["prompt_tokens_details"].(map[string]any)
+	if details == nil {
+		details = map[string]any{}
+	}
+	if _, exists := details["cached_tokens"]; !exists {
+		details["cached_tokens"] = usage.CachedTokens
+	}
+	usageObj["prompt_tokens_details"] = details
+}
+
 // parseUsageOnlyStreamChunk decodes a terminal include_usage chunk (empty choices
 // + a non-null usage object, carrying the final usage and no content delta) and
 // returns the parsed object. ok is false for any other chunk. Parsing here once
@@ -2613,6 +2647,7 @@ func parseUsageOnlyStreamChunk(chunk string) (obj map[string]any, ok bool) {
 // ONCE (obj is already parsed). Returns "" if it can't be marshalled.
 func finalizeUsageChunk(obj map[string]any, usage protocol.UsageInfo, pr *registry.PendingRequest) string {
 	injectReasoningDetailIntoRawUsage(obj, usage)
+	injectCacheDetailIntoRawUsage(obj, usage)
 	if v, present := obj["system_fingerprint"]; present && v == nil {
 		delete(obj, "system_fingerprint")
 	}
@@ -2711,10 +2746,10 @@ func resolveReasoningTokens(usage protocol.UsageInfo, reasoning string) uint64 {
 	return 0
 }
 
-func buildResponsesUsage(promptTokens, completionTokens uint64, reasoningTokens uint64) types.ResponsesUsage {
+func buildResponsesUsage(promptTokens, completionTokens, reasoningTokens, cachedTokens uint64) types.ResponsesUsage {
 	return types.ResponsesUsage{
 		InputTokens:        int(promptTokens),
-		InputTokensDetail:  types.ResponsesUsageDetail{},
+		InputTokensDetail:  types.ResponsesUsageDetail{CachedTokens: int(cachedTokens)},
 		OutputTokens:       int(completionTokens),
 		OutputTokensDetail: types.ResponsesUsageDetail{ReasoningTokens: int(reasoningTokens)},
 	}
@@ -2813,7 +2848,7 @@ func buildResponsesResponse(requestID, model string, msg extractedMessage, usage
 		CreatedAt:        time.Now().Unix(),
 		Model:            model,
 		Output:           appendResponsesOutputItems(nil, requestID, msg),
-		Usage:            buildResponsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens),
+		Usage:            buildResponsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens, uint64(usage.CachedTokens)),
 		IncompleteDetail: buildResponsesIncompleteDetails(finishReason),
 	}
 	finalizeResponsesEnvelope(&resp)
@@ -2838,7 +2873,11 @@ func chatUsageToResponsesUsage(resp types.ChatCompletionResponse, reasoning stri
 	} else if reasoning != "" {
 		reasoningTokens = resp.Usage.CompletionTokens
 	}
-	return buildResponsesUsage(uint64(resp.Usage.PromptTokens), uint64(resp.Usage.CompletionTokens), uint64(reasoningTokens))
+	cachedTokens := 0
+	if details := resp.Usage.PromptTokensDetails; details != nil {
+		cachedTokens = details.CachedTokens
+	}
+	return buildResponsesUsage(uint64(resp.Usage.PromptTokens), uint64(resp.Usage.CompletionTokens), uint64(reasoningTokens), uint64(cachedTokens))
 }
 
 func chatCompletionToResponses(resp types.ChatCompletionResponse, requestedModel, seSignature, responseHash string) types.ResponsesResponse {
@@ -2917,6 +2956,9 @@ func buildNonStreamingResponse(requestID, model string, msg extractedMessage, us
 		resp.Usage.CompletionTokensDetails = &types.CompletionTokensDetails{
 			ReasoningTokens: int(rt),
 		}
+	}
+	if usage.CachedTokens > 0 {
+		resp.Usage.PromptTokensDetails = &types.PromptTokensDetails{CachedTokens: usage.CachedTokens}
 	}
 
 	if seSignature != "" {
@@ -3227,7 +3269,6 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	model = buildModel
-	cacheAffinityKey := requestCacheAffinityKey(parsed)
 
 	if !policy.enabled && !s.registry.IsModelInCatalog(model) {
 		s.recordRejection(rejectionInfo{
@@ -3370,6 +3411,8 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	if preflightHandled {
 		return
 	}
+	inferenceBody, _ := marshalForwardBody(parsed)
+	cacheRoute := s.registry.DeriveCacheRoute(consumerKey, model, endpoint, inferenceBody, r.Header.Get("X-Session-Id"), requiresVision)
 
 	requestID := uuid.New().String()
 	pr := &registry.PendingRequest{
@@ -3388,7 +3431,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		FreeSelfRoute:          policy.enabled,
 		EstimatedPromptTokens:  estimatedPromptTokens,
 		RequiresVision:         requiresVision,
-		CacheAffinityKey:       cacheAffinityKey,
+		CacheRoute:             cacheRoute,
 		// Single-attempt path: no retry loop, so no AvoidVersion to thread.
 		Traits:               registry.RequestTraits{HasTools: hasTools},
 		RequestedMaxTokens:   requestedMaxTokens,
@@ -3540,7 +3583,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			requiresVision:        requiresVision,
 			hasTools:              hasTools,
 			policy:                policy,
-			cacheAffinityKey:      cacheAffinityKey,
+			cacheRoute:            cacheRoute,
 			requestID:             requestID,
 			attempt:               pr.Attempt,
 			pr:                    pr,
@@ -3608,7 +3651,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		requiresVision:        requiresVision,
 		hasTools:              hasTools,
 		policy:                policy,
-		cacheAffinityKey:      cacheAffinityKey,
+		cacheRoute:            cacheRoute,
 		requestID:             requestID,
 		attempt:               pr.Attempt,
 		provider:              provider,
@@ -3673,8 +3716,6 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 	}
-
-	inferenceBody, _ := marshalForwardBody(parsed)
 
 	// Re-check the cap on the FINAL body we'll seal (the input cap bounded the
 	// read; this body was re-marshaled after mutation). A body over the cap seals
@@ -3751,6 +3792,11 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	timing.EncryptedAt = time.Now()
+	if err := s.registry.PrepareCacheAttempt(pr, provider); err != nil {
+		s.registry.ForgetCacheAttempt(pr)
+		s.ddIncr("routing.cache_prepare_error", nil)
+		s.logger.Warn("cache routing attempt disabled", "request_id", requestID, "provider_id", provider.ID, "error", err)
+	}
 
 	wireMsg := map[string]any{
 		"type":       protocol.TypeInferenceRequest,
@@ -3760,11 +3806,24 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			"ciphertext":           encrypted.Ciphertext,
 		},
 	}
+	if pr.CacheReceiptNonce != "" && pr.CacheScope != "" {
+		wireMsg["cache_receipt_nonce"] = pr.CacheReceiptNonce
+		wireMsg["cache_scope"] = pr.CacheScope
+	}
 
 	pr.SessionPrivKey = &sessionKeys.PrivateKey
-	data, _ := json.Marshal(wireMsg)
+	data, err := json.Marshal(wireMsg)
+	if err != nil {
+		s.registry.ForgetCacheAttempt(pr)
+		cleanupPending()
+		refundExtra()
+		refundReservation()
+		writeJSON(w, http.StatusInternalServerError, errorResponse("internal_error", "failed to marshal inference request"))
+		return
+	}
 	timing.DispatchedAt = time.Now()
 	if err := writeProviderInferenceRequest(r.Context(), provider, data); err != nil {
+		s.registry.ForgetCacheAttempt(pr)
 		cleanupPending()
 		refundExtra()
 		refundReservation()

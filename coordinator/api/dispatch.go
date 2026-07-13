@@ -103,7 +103,7 @@ type dispatchState struct {
 	stream                 bool
 	policy                 selfRoutePolicy
 	allowedProviderSerials []string
-	cacheAffinityKey       string
+	cacheRoute             registry.CacheRoute
 	timing                 *registry.RequestTiming
 	deadline               time.Duration
 	speculativeAt          time.Duration
@@ -302,7 +302,6 @@ func (d *dispatchState) recordRoutingDecisionFor(provider *registry.Provider, pr
 		HasTools:                d.hasTools,
 		SelfRouteOnly:           d.policy.enabled,
 		PreferOwner:             d.policy.prefer,
-		CacheAffinityKey:        d.cacheAffinityKey,
 		CreatedAt:               time.Now(),
 		UpdatedAt:               time.Now(),
 	}
@@ -344,6 +343,20 @@ func (d *dispatchState) recordRoutingDecisionFor(provider *registry.Provider, pr
 	// evaluated (admission mode != off AND a provider was selected). Emitted on
 	// the synchronous path (cheap counter incr), not inside the async store write.
 	s.emitTTFTShadowMetrics(d.model, decision)
+	if decision.CacheKind != "" {
+		mode := "active"
+		kind := decision.CacheKind
+		if strings.HasPrefix(kind, "observe_") {
+			mode = "observe"
+			kind = strings.TrimPrefix(kind, "observe_")
+		}
+		s.ddIncr("routing.cache_evaluation", []string{
+			"mode:" + mode,
+			"kind:" + kind,
+			"tier:" + lowCardinalityCacheTier(decision.CacheTier),
+			"would_change:" + strconv.FormatBool(decision.CacheWouldChange),
+		})
+	}
 
 	s.submitTelemetry("recordInferenceRoute", func() {
 		if err := s.store.RecordInferenceRoute(record); err != nil && s.logger != nil {
@@ -666,7 +679,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 		r, d.model, d.publicModel, d.rawBody, d.consumerKey, d.consumerLocation, d.reservedMicroUSD,
 		d.estimatedPromptTokens, d.requestedMaxTokens, d.tokenAdmission, d.requiresVision,
 		d.traits(),
-		d.allowedProviderSerials, d.isResponsesAPI, d.policy, d.timing, d.serviceReservation, d.cacheAffinityKey, d.excludeProviders,
+		d.allowedProviderSerials, d.isResponsesAPI, d.policy, d.timing, d.serviceReservation, d.cacheRoute, d.excludeProviders,
 		d.attempt,
 		func(provider *registry.Provider, pr *registry.PendingRequest, decision registry.RoutingDecision) {
 			routeRecorded = true
@@ -771,7 +784,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			BaseReservedMicroUSD:   d.reservedMicroUSD,
 			ServiceReservation:     d.serviceReservation,
 			AllowedProviderSerials: d.allowedProviderSerials,
-			CacheAffinityKey:       d.cacheAffinityKey,
+			CacheRoute:             d.cacheRoute,
 			SelfRouteOnly:          d.policy.enabled,
 			PreferOwner:            d.policy.prefer,
 			OwnerAccountID:         d.policy.ownerAccountID,
@@ -962,6 +975,11 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			return outcomeRetry
 		}
 		d.timing.EncryptedAt = time.Now()
+		if err := s.registry.PrepareCacheAttempt(d.pr, d.provider); err != nil {
+			s.registry.ForgetCacheAttempt(d.pr)
+			s.ddIncr("routing.cache_prepare_error", nil)
+			s.logger.Warn("cache routing attempt disabled", "request_id", d.requestID, "provider_id", d.provider.ID, "error", err)
+		}
 		wireMsg := map[string]any{
 			"type":       protocol.TypeInferenceRequest,
 			"request_id": d.requestID,
@@ -970,12 +988,26 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 				"ciphertext":           encrypted.Ciphertext,
 			},
 		}
+		if d.pr.CacheReceiptNonce != "" && d.pr.CacheScope != "" {
+			wireMsg["cache_receipt_nonce"] = d.pr.CacheReceiptNonce
+			wireMsg["cache_scope"] = d.pr.CacheScope
+		}
 		d.pr.SessionPrivKey = &sessionKeys.PrivateKey
 		// pr.ReservedMicroUSD was already set in the struct literal and may
 		// have been increased by reserveAdditionalForProvider. Don't overwrite.
-		data, _ := json.Marshal(wireMsg)
+		data, err := json.Marshal(wireMsg)
+		if err != nil {
+			s.registry.ForgetCacheAttempt(d.pr)
+			d.provider.RemovePending(d.requestID)
+			s.registry.SetProviderIdle(d.provider.ID)
+			s.refundProviderExtra(d.pr)
+			d.setLastError("failed to marshal request", 0)
+			d.updateRoutingOutcome(d.errorRoutingOutcome("error", "provider_error", 0))
+			return outcomeRetry
+		}
 		d.pr.Timing.DispatchedAt = time.Now()
 		if err := writeProviderInferenceRequest(r.Context(), d.provider, data); err != nil {
+			s.registry.ForgetCacheAttempt(d.pr)
 			d.provider.RemovePending(d.requestID)
 			s.registry.SetProviderIdle(d.provider.ID)
 			s.refundProviderExtra(d.pr)
@@ -1305,7 +1337,7 @@ func (d *dispatchState) runSpeculative() dispatchOutcome {
 			d.allowedProviderSerials, d.isResponsesAPI, d.policy,
 			&registry.RequestTiming{ReceivedAt: d.timing.ReceivedAt},
 			d.serviceReservation,
-			d.cacheAffinityKey,
+			d.cacheRoute,
 			backupExclude,
 			d.attempt,
 			func(provider *registry.Provider, pr *registry.PendingRequest, decision registry.RoutingDecision) {
@@ -2403,8 +2435,6 @@ func (d *dispatchState) writeCommittedResponse() {
 	providerID := provider.ID
 	chipName := provider.Hardware.ChipName
 	machineModel := provider.Hardware.MachineModel
-	s.registry.RecordCacheAffinity(pr.ConsumerKey, pr.Model, pr.CacheAffinityKey, providerID)
-
 	if pubKey != "" {
 		w.Header().Set("X-Provider-Encrypted", "true")
 	}

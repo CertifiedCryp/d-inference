@@ -41,6 +41,8 @@ public struct CapturedMessages: Sendable {
     public var loadModelStatuses: [ProviderMessage.LoadModelStatus] = []
     public var prefetchModelStatuses: [ProviderMessage.PrefetchModelStatus] = []
     public var modelsUpdates: [ProviderMessage.ModelsUpdate] = []
+    public var prefixCacheLookups: [ProviderMessage.PrefixCacheLookup] = []
+    public var prefixCacheReady: [ProviderMessage.PrefixCacheReady] = []
     public var telemetryBatches: [TelemetryBatch] = []
 
     public init() {}
@@ -339,7 +341,9 @@ public final class MockCoordinator: @unchecked Sendable {
     public func pushInferenceRequest(
         requestId: String,
         providerPublicKeyBase64: String,
-        chatRequestJSON: Data
+        chatRequestJSON: Data,
+        cacheReceiptNonce: String? = nil,
+        cacheScope: String? = nil
     ) async throws {
         guard let providerPubKeyData = Data(base64Encoded: providerPublicKeyBase64),
               providerPubKeyData.count == 32
@@ -354,7 +358,9 @@ public final class MockCoordinator: @unchecked Sendable {
         let msg = CoordinatorMessage.inferenceRequest(.init(
             requestId: requestId,
             body: .null,
-            encryptedBody: payload
+            encryptedBody: payload,
+            cacheReceiptNonce: cacheReceiptNonce,
+            cacheScope: cacheScope
         ))
         try await sendCoordinatorMessage(msg)
     }
@@ -599,6 +605,8 @@ public final class MockCoordinator: @unchecked Sendable {
             case .loadModelStatus(let s):    captured.loadModelStatuses.append(s)
             case .prefetchModelStatus(let s): captured.prefetchModelStatuses.append(s)
             case .modelsUpdate(let u):       captured.modelsUpdates.append(u)
+            case .prefixCacheLookup(let r):  captured.prefixCacheLookups.append(r)
+            case .prefixCacheReady(let r):   captured.prefixCacheReady.append(r)
             }
         }
         eventContinuation.yield(.providerMessage(parsed))

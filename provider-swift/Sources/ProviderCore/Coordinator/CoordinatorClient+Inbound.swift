@@ -74,7 +74,9 @@ extension CoordinatorClient {
             eventContinuation?.yield(.inferenceRequest(
                 requestId: requestId,
                 ciphertext: cipherBytes,
-                senderPublicKey: senderKeyBytes
+                senderPublicKey: senderKeyBytes,
+                cacheReceiptNonce: request.cacheReceiptNonce,
+                cacheScope: request.cacheScope
             ))
 
         case .cancel(let cancel):

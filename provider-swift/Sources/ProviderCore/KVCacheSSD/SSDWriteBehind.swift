@@ -42,6 +42,18 @@ struct SSDBlockWrite: Sendable {
 struct SSDDonationJob: Sendable {
     let blocks: [SSDBlockWrite]
     let totalBytes: Int
+    /// Called only after every block succeeded and post-write TTL/budget
+    /// maintenance completed. Never called for drops or partial failures.
+    let onDurable: (@Sendable () -> Void)?
+
+    init(
+        blocks: [SSDBlockWrite], totalBytes: Int,
+        onDurable: (@Sendable () -> Void)? = nil
+    ) {
+        self.blocks = blocks
+        self.totalBytes = totalBytes
+        self.onDurable = onDurable
+    }
 }
 
 // MARK: - Endurance rate limiter
@@ -110,6 +122,11 @@ final class SSDWriteBehind: @unchecked Sendable {
         /// Volume (free, capacity) probe for the low-disk guard.
         let volumeSpace: @Sendable () -> (free: Int, capacity: Int)?
         let nowSeconds: @Sendable () -> Int64
+        /// Production whole-root maintenance. nil keeps the legacy registered-
+        /// store budget seam used by isolated tests.
+        let maintainWholeRoot: (@Sendable () -> Void)?
+        /// Failure-injection seam. nil uses the real encrypted DBK2 writer.
+        let writeBlock: (@Sendable (SSDBlockWrite, URL) throws -> Int)?
     }
 
     private let config: Config
@@ -220,11 +237,21 @@ final class SSDWriteBehind: @unchecked Sendable {
             queuedJobs -= 1
             queuedBytes -= job.totalBytes
         }
+        // Empty jobs represent all-deduped, already-durable donations. For a
+        // real job, at least one successful write allows settlement to reprobe
+        // a shorter leading contiguous run after all attempts complete.
+        var maySettleDurable = job.blocks.isEmpty
         defer {
             // Opportunistic maintenance on the serial consumer: TTL sweep +
             // box-wide LRU budget enforcement (unlink-only, spec §4.1).
             sweepExpired()
-            diskBudget.enforce(budgetBytes: config.diskBudgetBytes())
+            if let maintainWholeRoot = config.maintainWholeRoot {
+                maintainWholeRoot()
+                diskBudget.reconcileAll()
+            } else {
+                diskBudget.enforce(budgetBytes: config.diskBudgetBytes())
+            }
+            if maySettleDurable { job.onDurable?() }
         }
 
         let now = config.nowSeconds()
@@ -249,6 +276,13 @@ final class SSDWriteBehind: @unchecked Sendable {
             }
             let url = SSDBlockStore.fileURL(root: config.root, tag16Hex: block.tag16Hex)
             do {
+                if let writeBlock = config.writeBlock {
+                    let fileBytes = try writeBlock(block, url)
+                    index.insert(tag16: block.tag16, fileBytes: fileBytes, lastAccess: now)
+                    stats.add(blocksWritten: 1, bytesWritten: fileBytes)
+                    maySettleDurable = true
+                    continue
+                }
                 try SSDBlockStore.write(
                     to: url, metadata: block.metadata, chunks: block.chunks,
                     kekKey: config.kekKey, strictFsync: config.strictFsync)
@@ -270,6 +304,7 @@ final class SSDWriteBehind: @unchecked Sendable {
             // Index LAST, after the durable rename (spec §3.2 step 7).
             index.insert(tag16: block.tag16, fileBytes: fileBytes, lastAccess: now)
             stats.add(blocksWritten: 1, bytesWritten: fileBytes)
+            maySettleDurable = true
         }
     }
 

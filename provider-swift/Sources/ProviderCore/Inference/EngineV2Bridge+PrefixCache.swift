@@ -40,18 +40,114 @@ import os
 public final class EngineV2RequestUsageSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var _prefixCacheHitTokens: Int?
+    private var _prefixCachePrefillTokensSaved: Int?
+    private var _stageResult: SSDPrefixCacheStageResult?
+    private var _lookupResult: PrefixCacheLookupResult?
+    private var _cacheDisabled = false
+    private var didEmitLookup = false
+    private let onLookupResolved: (@Sendable (PrefixCacheLookupResult) -> Void)?
+    let onCacheReady: (@Sendable (PrefixCacheReadyResult) -> Void)?
 
-    public init() {}
+    public init(
+        onLookupResolved: (@Sendable (PrefixCacheLookupResult) -> Void)? = nil,
+        onCacheReady: (@Sendable (PrefixCacheReadyResult) -> Void)? = nil
+    ) {
+        self.onLookupResolved = onLookupResolved
+        self.onCacheReady = onCacheReady
+    }
 
     /// Record the engine-reported prefix-cache hit tokens for this request.
+    func record(
+        usage: CBv2Usage,
+        fallbackTier: PrefixCacheTier = .memory
+    ) {
+        let resolved: PrefixCacheLookupResult? = lock.withLock {
+            // `prefixCacheHitTokens` is the pre-v1 compatibility alias. Old
+            // scripted engines may set only that field, so let it raise (never
+            // lower) the richer counts.
+            let matched = max(0, usage.prefixCacheMatchedTokens, usage.prefixCacheHitTokens)
+            let saved = max(0, usage.prefixCachePrefillTokensSaved, usage.prefixCacheHitTokens)
+            let engineOutcome: CBv2PrefixCacheOutcome =
+                usage.prefixCacheOutcome == .disabled && usage.prefixCacheHitTokens > 0
+                ? .hit : usage.prefixCacheOutcome
+            _prefixCacheHitTokens = matched
+            _prefixCachePrefillTokensSaved = saved
+            if _cacheDisabled { return nil }
+            switch engineOutcome {
+            case .hit:
+                _lookupResult = PrefixCacheLookupResult(
+                    outcome: .hit,
+                    tier: fallbackTier,
+                    cachedTokens: matched,
+                    prefillTokensSaved: saved,
+                    stageMs: _stageResult?.stageMs)
+            case .miss:
+                if let stage = _stageResult {
+                    _lookupResult = stage.resolved(actualCachedTokens: 0)
+                } else {
+                    _lookupResult = PrefixCacheLookupResult(
+                        outcome: .missAbsent, tier: fallbackTier)
+                }
+            case .skippedCapacity:
+                _lookupResult = PrefixCacheLookupResult(
+                    outcome: .skippedCapacity,
+                    tier: fallbackTier,
+                    stageMs: _stageResult?.stageMs)
+            case .skippedPolicy, .disabled, .adoptionFailed:
+                _lookupResult = PrefixCacheLookupResult(
+                    outcome: .skippedPolicy,
+                    tier: fallbackTier,
+                    stageMs: _stageResult?.stageMs)
+            }
+            guard !didEmitLookup, let result = _lookupResult else { return nil }
+            didEmitLookup = true
+            return result
+        }
+        if let resolved { onLookupResolved?(resolved) }
+    }
+
+    /// Compatibility helper for scripted tests/older callers whose usage did
+    /// not yet expose the richer engine outcome.
     func record(prefixCacheHitTokens: Int) {
-        lock.withLock { _prefixCacheHitTokens = max(0, prefixCacheHitTokens) }
+        let tokens = max(0, prefixCacheHitTokens)
+        record(
+            usage: CBv2Usage(
+                promptTokens: 0,
+                completionTokens: 0,
+                prefixCacheHitTokens: tokens,
+                prefixCacheOutcome: tokens > 0 ? .hit : .miss,
+                prefixCacheMatchedTokens: tokens,
+                prefixCachePrefillTokensSaved: tokens))
+    }
+
+    func record(stageResult: SSDPrefixCacheStageResult) {
+        lock.withLock { _stageResult = stageResult }
+    }
+
+    func recordCacheDisabled(tier: PrefixCacheTier?) {
+        let resolved: PrefixCacheLookupResult? = lock.withLock {
+            _cacheDisabled = true
+            _lookupResult = PrefixCacheLookupResult(
+                outcome: .skippedPolicy, tier: tier)
+            guard !didEmitLookup, let result = _lookupResult else { return nil }
+            didEmitLookup = true
+            return result
+        }
+        if let resolved { onLookupResolved?(resolved) }
     }
 
     /// Engine-reported prompt tokens whose KV was adopted from the prefix
     /// cache (0 on a miss). nil until the request reached its terminal.
     public var prefixCacheHitTokens: Int? {
         lock.withLock { _prefixCacheHitTokens }
+    }
+
+    public var prefixCachePrefillTokensSaved: Int? {
+        lock.withLock { _prefixCachePrefillTokensSaved }
+    }
+
+    public var lookupResult: PrefixCacheLookupResult? {
+        lock.withLock { _lookupResult }
     }
 }
 

@@ -148,13 +148,12 @@ type InferenceRouteRecord struct {
 	ActiveTokenBudgetMax  int64   `json:"active_token_budget_max"`
 	QueuedTokenBudget     int64   `json:"queued_token_budget"`
 
-	EstimatedPromptTokens int    `json:"estimated_prompt_tokens"`
-	RequestedMaxTokens    int    `json:"requested_max_tokens"`
-	RequiresVision        bool   `json:"requires_vision"`
-	HasTools              bool   `json:"has_tools"`
-	SelfRouteOnly         bool   `json:"self_route_only"`
-	PreferOwner           bool   `json:"prefer_owner"`
-	CacheAffinityKey      string `json:"cache_affinity_key"`
+	EstimatedPromptTokens int  `json:"estimated_prompt_tokens"`
+	RequestedMaxTokens    int  `json:"requested_max_tokens"`
+	RequiresVision        bool `json:"requires_vision"`
+	HasTools              bool `json:"has_tools"`
+	SelfRouteOnly         bool `json:"self_route_only"`
+	PreferOwner           bool `json:"prefer_owner"`
 
 	// Geo (coarse region of provider/consumer; no raw IPs). Optional.
 	ProviderRegion string `json:"provider_region,omitempty"`

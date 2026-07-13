@@ -20,7 +20,9 @@
 //   * Capacity: CBv2CapacitySnapshot → BackendSlotCapacity field mapping
 //     (truthful bytes-derived budgets, wedge counters).
 
+import CryptoKit
 import Foundation
+import MLX
 import MLXLMCommon
 import Testing
 
@@ -210,6 +212,7 @@ private func makeBridge(
     defaultMaxTokens: Int = 4096,
     kvBytesPerToken: Int = 0,
     kvBudget: GlobalKVCacheBudget? = nil,
+    ssdPrefixCache: SSDPrefixCache? = nil,
     kvBackendKind: EngineV2KVBackendKind = .contiguous,
     telemetry: TelemetrySink? = nil
 ) -> EngineV2Bridge {
@@ -223,6 +226,7 @@ private func makeBridge(
         maxConcurrentRequests: 4,
         kvBytesPerToken: kvBytesPerToken,
         kvBudget: kvBudget,
+        ssdPrefixCache: ssdPrefixCache,
         kvBackendKind: kvBackendKind,
         emitTelemetry: telemetry?.callback()
     )
@@ -1712,6 +1716,26 @@ private final class StochasticScriptedEngine: CBv2Engine, @unchecked Sendable {
     }
 }
 
+private final class ReceiptNonceBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+
+    func append(nonce: String, result: PrefixCacheReadyResult) {
+        lock.withLock { values.append("\(nonce):\(result.readyTokens)") }
+    }
+
+    var snapshot: [String] { lock.withLock { values } }
+
+    func waitForCount(_ count: Int, timeout: Duration = .seconds(10)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if snapshot.count >= count { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return snapshot.count >= count
+    }
+}
+
 @Suite("EngineV2 seeded sampling reproducibility")
 struct EngineV2SeededSamplingTests {
 
@@ -1748,6 +1772,109 @@ struct EngineV2SeededSamplingTests {
         #expect(engine.submitted.count == 3)
         #expect(engine.submitted[0].id == engine.submitted[2].id)
         #expect(engine.submitted[0].id.raw & EngineV2Bridge.seededIdTagBit != 0)
+    }
+
+    @Test("sequential identical seeded requests keep receipt callbacks and cleanup isolated")
+    func seededReceiptIdentityIsIndependent() async throws {
+        _ = LiveInferenceFixtures.ensureMetallibColocated()
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "bridge-receipt-\(UUID().uuidString)", isDirectory: true)
+        let root = parent.appendingPathComponent("aaaaaaaaaaaa", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+
+        let layerKinds = [
+            CBv2LayerKind(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 1)
+        ]
+        let cache = SSDPrefixCache(
+            config: .init(
+                modelId: "receipt-model",
+                weightHash: "receipt-weight",
+                blockSize: 8,
+                adoptionBoundTokens: 0,
+                layoutEpoch: SSDBlockStore.layoutEpoch(
+                    blockSize: 8, layerKinds: layerKinds),
+                root: root,
+                ttlSeconds: 900,
+                minEffectiveTokens: 8,
+                maxStageBytes: 1 << 20,
+                maxStageMillis: 10_000,
+                nowSeconds: { 10_000 }),
+            kekKey: SymmetricKey(size: .bits256),
+            kvBudget: nil,
+            diskBudget: SSDDiskBudget(),
+            maxWriteBytesPerDay: 0,
+            diskBudgetBytes: { 1 << 20 })
+        defer { cache.close() }
+
+        let engine = StochasticScriptedEngine()
+        let bridge = makeBridge(engine: engine, ssdPrefixCache: cache)
+        let callbackBox = ReceiptNonceBox()
+        let prompt = [11, 22, 33]
+        let request = makeRequest(maxTokens: 8, seed: 42)
+
+        let signalA = EngineV2RequestUsageSignal(onCacheReady: { result in
+            callbackBox.append(nonce: "nonce-a", result: result)
+        })
+        _ = await record(await bridge.submitTokenized(
+            promptTokens: prompt,
+            request: request,
+            requestId: "receipt-a",
+            cacheScope: "scope-a",
+            usageSignal: signalA))
+
+        let signalB = EngineV2RequestUsageSignal(onCacheReady: { result in
+            callbackBox.append(nonce: "nonce-b", result: result)
+        })
+        _ = await record(await bridge.submitTokenized(
+            promptTokens: prompt,
+            request: request,
+            requestId: "receipt-b",
+            cacheScope: "scope-b",
+            usageSignal: signalB))
+
+        #expect(engine.submitted.count == 2)
+        #expect(engine.submitted[0].id == engine.submitted[1].id)
+        #expect(engine.submitted[0].cacheSalt == "scope-a")
+        #expect(engine.submitted[1].cacheSalt == "scope-b")
+        let receiptA = try #require(engine.submitted[0].prefixCacheReceiptID)
+        let receiptB = try #require(engine.submitted[1].prefixCacheReceiptID)
+        #expect(receiptA != receiptB)
+        #expect(receiptB.raw == receiptA.raw + 1)
+
+        let tokenCount = 64
+        let shape = [1, 1, tokenCount, 4]
+        let base = MLXArray(0 ..< shape.reduce(1, *)).reshaped(shape).asType(.float16)
+        let values = base + 1
+        let snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = [
+            (keys: base, values: values, offset: tokenCount)
+        ]
+        eval(base, values)
+
+        // A settles only after B has registered under the same stable sampler
+        // id. Its callback must still carry A's nonce, never B's.
+        cache.donate(
+            requestID: receiptA,
+            tokens: Array(0 ..< tokenCount),
+            snapshots: snapshots,
+            layerKinds: layerKinds,
+            cacheSalt: "scope-a")
+        #expect(await callbackBox.waitForCount(1))
+        #expect(callbackBox.snapshot == ["nonce-a:64"])
+
+        // Accelerate only A's terminal-retention cleanup. It must not remove
+        // B's callback before B's differently-scoped donation settles.
+        cache.markReadyReceiptTerminal(
+            requestID: receiptA, cleanupDelay: .milliseconds(30))
+        try? await Task.sleep(for: .milliseconds(100))
+        cache.donate(
+            requestID: receiptB,
+            tokens: Array(0 ..< tokenCount),
+            snapshots: snapshots,
+            layerKinds: layerKinds,
+            cacheSalt: "scope-b")
+        #expect(await callbackBox.waitForCount(2))
+        #expect(callbackBox.snapshot == ["nonce-a:64", "nonce-b:64"])
     }
 
     @Test("different seed or different prompt produce different ids (and RNG streams)")
