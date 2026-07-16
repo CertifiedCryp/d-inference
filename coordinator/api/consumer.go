@@ -23,6 +23,7 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -246,6 +247,35 @@ func (s *Server) refundProviderExtra(pr *registry.PendingRequest) {
 	s.ddIncr("billing.reservation_extra_refunds", []string{"model:" + pr.Model})
 }
 
+// writeGenericProviderError writes the terminal HTTP body for a provider error
+// on paths WITHOUT a failover ladder or in-band SSE error framing: the generic
+// inference handlers (/v1/messages, /v1/completions) and the non-streaming
+// chat response assembly. Deterministic non-provider-fault reasons surface the
+// SAME curated bodies as the chat dispatch ladder — a jinja_* template-render
+// failure becomes the 422 model_capability invalid_request_error (the raw
+// template backtrace never reaches a client), gated by the ladder's
+// EIGENINFERENCE_JINJA_TERMINAL_REJECT kill switch; tool_noncompliance keeps
+// its provider-typed 422 message (already curated and content-free) but in the
+// invalid_request_error/model_capability envelope instead of provider_error.
+// Every other error keeps the legacy raw passthrough byte-for-byte.
+func (s *Server) writeGenericProviderError(w http.ResponseWriter, errMsg protocol.InferenceErrorMessage) {
+	if jinjaTerminalRejectEnabled() && isJinjaTemplateErrorReason(errMsg.ErrorReason) {
+		writeJSON(w, http.StatusUnprocessableEntity,
+			errorResponse("invalid_request_error", jinjaTerminalRejectMessage, withCode("model_capability")))
+		return
+	}
+	if normalizeInferenceErrorReason(errMsg.ErrorReason) == errorReasonToolNoncompliance {
+		writeJSON(w, http.StatusUnprocessableEntity,
+			errorResponse("invalid_request_error", errMsg.Error, withCode("model_capability")))
+		return
+	}
+	statusCode := errMsg.StatusCode
+	if statusCode == 0 {
+		statusCode = http.StatusBadGateway
+	}
+	writeJSON(w, statusCode, errorResponse("provider_error", errMsg.Error))
+}
+
 // noteInferenceError feeds the circuit breakers for a provider-side error
 // received on a pending request's ErrorCh (any phase, pre- or post-commit):
 //   - the shape-keyed inference-error breaker (counts only sickness-shaped
@@ -264,6 +294,19 @@ func (s *Server) refundProviderExtra(pr *registry.PendingRequest) {
 // same way the dispatch failover trusts it (classifyRejection P1).
 func (s *Server) noteInferenceError(providerID string, pr *registry.PendingRequest, statusCode int, errStr, errReason string) {
 	if providerID == "" || pr == nil {
+		return
+	}
+	// Deterministic request/model-capability faults (isNonProviderFaultErrorReason:
+	// jinja_* template-render failures, tool_noncompliance) never feed the
+	// provider-health breakers — the provider executed faithfully; the request
+	// shape or the model's sampled output is what failed. Gating HERE (the single
+	// breaker chokepoint) mirrors the dispatch-funnel gate
+	// (dispatchState.noteProviderError) and the reputation exemption
+	// (handleInferenceError), and closes the generic-inference path
+	// (/v1/messages, /v1/completions), which calls noteInferenceError directly on
+	// pre-commit provider errors. Capacity-class rejections never carry these
+	// reasons, so the capacity-reject cooldown feed below is unaffected.
+	if isNonProviderFaultErrorReason(errReason) {
 		return
 	}
 	if s.registry.RecordInferenceError(providerID, pr.Model, statusCode, pr.Traits.CooldownShape()) {
@@ -1957,11 +2000,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 						s.refundReservedBalance(pr, "provider_error:"+pr.RequestID)
 						s.noteInferenceError(pr.ProviderID, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason)
 						s.updateInferenceRouteOutcomeForPending(pr, preResponseProviderErrorOutcome(pr, errMsg))
-						statusCode := errMsg.StatusCode
-						if statusCode == 0 {
-							statusCode = http.StatusBadGateway
-						}
-						writeJSON(w, statusCode, errorResponse("provider_error", errMsg.Error))
+						s.writeGenericProviderError(w, errMsg)
 						return
 					}
 				default:
@@ -2088,11 +2127,7 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 			s.refundReservedBalance(pr, "provider_error:"+pr.RequestID)
 			s.noteInferenceError(pr.ProviderID, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason)
 			s.updateInferenceRouteOutcomeForPending(pr, preResponseProviderErrorOutcome(pr, errMsg))
-			statusCode := errMsg.StatusCode
-			if statusCode == 0 {
-				statusCode = http.StatusBadGateway
-			}
-			writeJSON(w, statusCode, errorResponse("provider_error", errMsg.Error))
+			s.writeGenericProviderError(w, errMsg)
 			return
 
 		case <-ctx.Done():
@@ -2317,6 +2352,142 @@ func normalizeSSEChunk(chunk string) string {
 	return "data: " + string(out)
 }
 
+// maxLogicalToolCalls caps how many logical tool calls a single stream may
+// reconstruct. Chunks come from providers, which are only semi-trusted: a
+// buggy or malicious provider could otherwise stream an unbounded number of
+// distinct-id tool-call deltas and grow the reconstruction (and its wire-index
+// tracking) without limit. Real parallel-tool-call fan-out is tiny (typically
+// <= 4 calls), so 128 is far above anything legitimate while bounding the
+// worst case. Past the cap, deltas that would START a new logical call are
+// dropped (counted + logged); argument fragments for already-kept calls still
+// accumulate, so kept calls are never truncated or corrupted.
+const maxLogicalToolCalls = 128
+
+// toolCallWireIndex reads an accumulated tool-call entry's wire index.
+// Entries are always created with an int "index" (toolCallAccumulator.apply),
+// so the comma-ok is defensive only: a corrupt entry cannot panic the request
+// path — it sorts last, keeping arrival order relative to other corrupt
+// entries.
+func toolCallWireIndex(tc map[string]any) int {
+	idx, ok := tc["index"].(int)
+	if !ok {
+		return math.MaxInt
+	}
+	return idx
+}
+
+// streamedToolCallDelta is a single tool_calls entry from a streaming delta
+// frame.
+type streamedToolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Function struct {
+		Name      string `json:"name,omitempty"`
+		Arguments string `json:"arguments,omitempty"`
+	} `json:"function,omitempty"`
+}
+
+// toolCallAccumulator reconstructs logical tool calls from streamed deltas.
+// Logical calls are kept in ARRIVAL order (calls) because a wire index is
+// NOT unique: our engine emits every parallel call with index 0 (E6), so
+// index-keyed storage alone would let a second call overwrite the first's
+// id/name and concatenate both argument streams into one corrupted call.
+// activeByIndex maps each wire index to the position (in calls) of its
+// CURRENT logical call — the one still receiving that index's id-less
+// argument fragments; a delta whose non-empty id DIFFERS from that entry's
+// non-empty id starts a NEW logical call, so well-behaved indexed streams
+// are unchanged.
+type toolCallAccumulator struct {
+	calls         []map[string]any
+	activeByIndex map[int]int
+	// droppedDeltas counts deltas swallowed past maxLogicalToolCalls
+	// (dropped new logical calls and their argument fragments).
+	droppedDeltas int
+}
+
+func newToolCallAccumulator() *toolCallAccumulator {
+	return &toolCallAccumulator{activeByIndex: map[int]int{}}
+}
+
+// apply folds one streamed delta into the accumulator. Past
+// maxLogicalToolCalls, a delta that would start a new logical call is
+// dropped and its wire index forgotten, so the dropped call's later id-less
+// fragments can never accumulate onto a kept call; kept calls keep receiving
+// their own fragments as usual.
+func (a *toolCallAccumulator) apply(tc streamedToolCallDelta) {
+	pos, ok := a.activeByIndex[tc.Index]
+	if ok && tc.ID != "" {
+		if existingID, _ := a.calls[pos]["id"].(string); existingID != "" && existingID != tc.ID {
+			// A NEW id on an already-active wire index is a new logical
+			// call, not a continuation (the all-index-0 engine shape) —
+			// never merge two calls into one.
+			ok = false
+		}
+	}
+	if !ok {
+		if len(a.calls) >= maxLogicalToolCalls {
+			// Cap reached: drop the new logical call. The kept call at
+			// this wire index (if any) is complete as-is. This also
+			// bounds activeByIndex: keys are only ever added alongside a
+			// kept call, so both structures stay <= maxLogicalToolCalls
+			// entries no matter how many distinct ids or sparse wire
+			// indices are streamed.
+			a.droppedDeltas++
+			delete(a.activeByIndex, tc.Index)
+			return
+		}
+		entry := map[string]any{
+			"index": tc.Index,
+			"function": map[string]any{
+				"arguments": "",
+			},
+		}
+		a.calls = append(a.calls, entry)
+		pos = len(a.calls) - 1
+		a.activeByIndex[tc.Index] = pos
+	}
+	entry := a.calls[pos]
+	if tc.ID != "" {
+		entry["id"] = tc.ID
+	}
+	if tc.Type != "" {
+		entry["type"] = tc.Type
+	}
+	fn, fnOK := entry["function"].(map[string]any)
+	if !fnOK {
+		// Defensive: entries are always created with a function map —
+		// never panic the request path on a corrupt entry.
+		fn = map[string]any{}
+		entry["function"] = fn
+	}
+	if tc.Function.Name != "" {
+		fn["name"] = tc.Function.Name
+	}
+	args, _ := fn["arguments"].(string)
+	fn["arguments"] = args + tc.Function.Arguments
+}
+
+// finalize returns the reconstructed calls (nil when there are none),
+// ordered by wire index for well-behaved indexed streams; the stable sort
+// preserves ARRIVAL order among equal indices (the all-index-0 shape), and —
+// unlike the old dense 0..n-1 map walk — sparse indices are never dropped.
+// The internal "index" key is stripped from the returned maps.
+func (a *toolCallAccumulator) finalize() []map[string]any {
+	if len(a.calls) == 0 {
+		return nil
+	}
+	sort.SliceStable(a.calls, func(i, j int) bool {
+		return toolCallWireIndex(a.calls[i]) < toolCallWireIndex(a.calls[j])
+	})
+	out := make([]map[string]any, 0, len(a.calls))
+	for _, tc := range a.calls {
+		delete(tc, "index")
+		out = append(out, tc)
+	}
+	return out
+}
+
 // extractedMessage holds the reconstructed assistant message from SSE chunks,
 // including text content, reasoning, and any tool calls.
 type extractedMessage struct {
@@ -2332,8 +2503,9 @@ func extractMessage(chunks []string) extractedMessage {
 	var contentBuilder strings.Builder
 	var reasoningBuilder strings.Builder
 	finishReason := ""
-	// Tool calls are indexed — accumulate argument fragments by index.
-	toolCallMap := map[int]map[string]any{}
+	// See toolCallAccumulator for the logical-call model (arrival order,
+	// non-unique wire indices, the maxLogicalToolCalls cap).
+	acc := newToolCallAccumulator()
 
 	for _, chunk := range chunks {
 		line := strings.TrimPrefix(chunk, "data: ")
@@ -2353,18 +2525,10 @@ func extractMessage(chunks []string) extractedMessage {
 		}
 		var choices []struct {
 			Delta struct {
-				Content          string `json:"content"`
-				Reasoning        string `json:"reasoning"`
-				ReasoningContent string `json:"reasoning_content"`
-				ToolCalls        []struct {
-					Index    int    `json:"index"`
-					ID       string `json:"id,omitempty"`
-					Type     string `json:"type,omitempty"`
-					Function struct {
-						Name      string `json:"name,omitempty"`
-						Arguments string `json:"arguments,omitempty"`
-					} `json:"function,omitempty"`
-				} `json:"tool_calls,omitempty"`
+				Content          string                  `json:"content"`
+				Reasoning        string                  `json:"reasoning"`
+				ReasoningContent string                  `json:"reasoning_content"`
+				ToolCalls        []streamedToolCallDelta `json:"tool_calls,omitempty"`
 			} `json:"delta"`
 			Message struct {
 				Content          string `json:"content"`
@@ -2396,27 +2560,7 @@ func extractMessage(chunks []string) extractedMessage {
 				reasoningBuilder.WriteString(c.Message.ReasoningContent)
 			}
 			for _, tc := range c.Delta.ToolCalls {
-				existing, ok := toolCallMap[tc.Index]
-				if !ok {
-					existing = map[string]any{
-						"index": tc.Index,
-						"function": map[string]any{
-							"arguments": "",
-						},
-					}
-					toolCallMap[tc.Index] = existing
-				}
-				if tc.ID != "" {
-					existing["id"] = tc.ID
-				}
-				if tc.Type != "" {
-					existing["type"] = tc.Type
-				}
-				fn := existing["function"].(map[string]any)
-				if tc.Function.Name != "" {
-					fn["name"] = tc.Function.Name
-				}
-				fn["arguments"] = fn["arguments"].(string) + tc.Function.Arguments
+				acc.apply(tc)
 			}
 		}
 	}
@@ -2432,15 +2576,10 @@ func extractMessage(chunks []string) extractedMessage {
 		}
 	}
 	msg := extractedMessage{Content: content, Reasoning: reasoning, FinishReason: finishReason}
-	if len(toolCallMap) > 0 {
-		msg.ToolCalls = make([]map[string]any, 0, len(toolCallMap))
-		for i := range len(toolCallMap) {
-			if tc, ok := toolCallMap[i]; ok {
-				delete(tc, "index")
-				msg.ToolCalls = append(msg.ToolCalls, tc)
-			}
-		}
+	if acc.droppedDeltas > 0 {
+		log.Printf("WARN: extractMessage: logical tool-call cap (%d) reached; dropped %d tool-call delta(s) from excess calls", maxLogicalToolCalls, acc.droppedDeltas)
 	}
+	msg.ToolCalls = acc.finalize()
 	return msg
 }
 
@@ -3892,11 +4031,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 				refundReservation()
 				s.noteInferenceError(provider.ID, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason)
 				s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
-				statusCode := errMsg.StatusCode
-				if statusCode == 0 {
-					statusCode = http.StatusBadGateway
-				}
-				writeJSON(w, statusCode, errorResponse("provider_error", errMsg.Error))
+				s.writeGenericProviderError(w, errMsg)
 				return
 			default:
 				committed = true
@@ -3911,11 +4046,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		refundReservation()
 		s.noteInferenceError(provider.ID, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason)
 		s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
-		statusCode := errMsg.StatusCode
-		if statusCode == 0 {
-			statusCode = http.StatusBadGateway
-		}
-		writeJSON(w, statusCode, errorResponse("provider_error", errMsg.Error))
+		s.writeGenericProviderError(w, errMsg)
 		return
 	case <-ttftTimer.C:
 		provider.RemovePending(requestID)
@@ -3967,11 +4098,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 					refundReservation()
 					s.noteInferenceError(provider.ID, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason)
 					s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
-					statusCode := errMsg.StatusCode
-					if statusCode == 0 {
-						statusCode = http.StatusBadGateway
-					}
-					writeJSON(w, statusCode, errorResponse("provider_error", errMsg.Error))
+					s.writeGenericProviderError(w, errMsg)
 					return
 				default:
 					committed = true
@@ -3986,11 +4113,7 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			refundReservation()
 			s.noteInferenceError(provider.ID, pr, errMsg.StatusCode, errMsg.Error, errMsg.ErrorReason)
 			s.updateInferenceRouteOutcomeForPending(pr, preCommitProviderErrorOutcome(pr, errMsg))
-			statusCode := errMsg.StatusCode
-			if statusCode == 0 {
-				statusCode = http.StatusBadGateway
-			}
-			writeJSON(w, statusCode, errorResponse("provider_error", errMsg.Error))
+			s.writeGenericProviderError(w, errMsg)
 			return
 		case <-chunkTimer.C:
 			provider.RemovePending(requestID)
