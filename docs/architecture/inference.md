@@ -50,11 +50,13 @@ Code:
 ## Prefix cache
 
 An EngineV2 prefix cache accelerates repeated or shared prompts. The encrypted
-SSD tier is selected by default and can be disabled with
-`DARKBLOOM_PREFIX_CACHE_SSD=0`; `DARKBLOOM_PREFIX_CACHE=0` disables every tier.
-When SSD is disabled, setting `DARKBLOOM_PREFIX_CACHE=1` selects the experimental
-RAM `PrefixCacheV2` tier. Both pure-attention and supported hybrid
-sliding-window models use CBv2 layer-aware block snapshots and adoption bounds.
+SSD tier is the only production tier. It is selected by default and can be
+disabled with `DARKBLOOM_PREFIX_CACHE=0`; there is no production RAM cache or
+persistent memory carve. CBv2 layer-aware block snapshots are enabled only for
+layouts that can resume exactly. Interleaved hybrids with a storage-owning full
+layer after sliding attention require full replay and remain cold-only. The
+production gate is
+`provider-swift/Sources/ProviderCore/Inference/PrefixCachePolicy.swift`.
 
 See [`reference/ssd-kv-cache.md`](../reference/ssd-kv-cache.md) for the as-built reference and
 [`reference/ssd-kv-cache-hybrid-models.md`](../reference/ssd-kv-cache-hybrid-models.md) for the hybrid-model design.

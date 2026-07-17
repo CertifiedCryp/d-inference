@@ -103,7 +103,7 @@ type dispatchState struct {
 	stream                 bool
 	policy                 selfRoutePolicy
 	allowedProviderSerials []string
-	cacheRoute             registry.CacheRoute
+	cachePlan              registry.CachePlan
 	timing                 *registry.RequestTiming
 	deadline               time.Duration
 	speculativeAt          time.Duration
@@ -178,12 +178,35 @@ type dispatchState struct {
 	dispatchErr string
 	// dispatchErrCode captures the HTTP status code associated with dispatchErr.
 	dispatchErrCode int
+	// providerBodyTooLargeErr preserves a protocol-0 cache-buster overflow
+	// while failover tries providers whose newer protocol does not add it.
+	providerBodyTooLargeErr   string
+	providerBodyTooLargeBytes int
+	minPrefixCacheProtocol    int
 }
 
 // traits builds the routing traits for the current attempt, steering away from
 // the most recently failed provider's binary version.
 func (d *dispatchState) traits() registry.RequestTraits {
-	return registry.RequestTraits{HasTools: d.hasTools, AvoidVersion: d.lastFailedVersion}
+	return registry.RequestTraits{
+		HasTools:               d.hasTools,
+		AvoidVersion:           d.lastFailedVersion,
+		MinPrefixCacheProtocol: d.minPrefixCacheProtocol,
+	}
+}
+
+func (d *dispatchState) excludedProviderIDs() []string {
+	ids := make([]string, 0, len(d.excludeProviders))
+	for id := range d.excludeProviders {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (d *dispatchState) shouldQueueCompatibleProvider(decision registry.RoutingDecision) bool {
+	return d.providerBodyTooLargeErr != "" &&
+		d.lastErrCode == http.StatusRequestEntityTooLarge &&
+		decision.CapacityRejections > 0
 }
 
 // envTTFTTerminalReject is the kill switch for the terminal TTFT-rejection fix.
@@ -378,18 +401,10 @@ func (d *dispatchState) recordRoutingDecisionFor(provider *registry.Provider, pr
 	// evaluated (admission mode != off AND a provider was selected). Emitted on
 	// the synchronous path (cheap counter incr), not inside the async store write.
 	s.emitTTFTShadowMetrics(d.model, decision)
-	if decision.CacheKind != "" {
-		mode := "active"
-		kind := decision.CacheKind
-		if strings.HasPrefix(kind, "observe_") {
-			mode = "observe"
-			kind = strings.TrimPrefix(kind, "observe_")
-		}
+	if decision.CacheDiscountMs > 0 {
 		s.ddIncr("routing.cache_evaluation", []string{
-			"mode:" + mode,
-			"kind:" + kind,
+			"mode:active",
 			"tier:" + lowCardinalityCacheTier(decision.CacheTier),
-			"would_change:" + strconv.FormatBool(decision.CacheWouldChange),
 		})
 	}
 
@@ -475,24 +490,38 @@ func (d *dispatchState) commitFirstContent(pr *registry.PendingRequest, chunk st
 	}
 }
 
-// successRoutingOutcome builds a success outcome for the committed attempt.
-// Token counts and final_status are left empty because the final terminal is
-// only known when the provider later sends complete/error; handleComplete or
-// post-commit response handlers update them.
-func (d *dispatchState) successRoutingOutcome() *store.InferenceRouteOutcome {
-	return committedRouteOutcome(d.pr)
+func (d *dispatchState) successRoutingOutcomeFor(pr *registry.PendingRequest) *store.InferenceRouteOutcome {
+	return committedRouteOutcome(pr)
 }
 
 // errorRoutingOutcome builds an error / timeout / cancelled outcome.
 func (d *dispatchState) errorRoutingOutcome(status, class string, code int) *store.InferenceRouteOutcome {
+	return d.errorRoutingOutcomeFor(d.pr, status, class, code)
+}
+
+func (d *dispatchState) errorRoutingOutcomeFor(pr *registry.PendingRequest, status, class string, code int) *store.InferenceRouteOutcome {
 	providerReason, errorText := "", ""
 	if routeOutcomeUsesProviderErrorText(class) {
 		providerReason = d.lastErrReason
 		errorText = d.lastErr
 	}
 	out := routeOutcomeWithReason(status, class, code, providerReason, errorText)
-	applyPendingRouteTelemetry(out, d.pr)
+	applyPendingRouteTelemetry(out, pr)
 	return out
+}
+
+func (d *dispatchState) recordProviderBodyTooLargeRoute(
+	provider *registry.Provider,
+	pr *registry.PendingRequest,
+	decision registry.RoutingDecision,
+) {
+	if provider == nil || pr == nil {
+		return
+	}
+	d.recordRoutingDecisionFor(
+		provider, pr, pr.RequestID, pr.Attempt, decision, "", "")
+	d.s.updateInferenceRouteOutcomeForPending(pr, dispatchFailedPendingRouteOutcome(
+		pr, errorClassClientError, http.StatusRequestEntityTooLarge))
 }
 
 func routeOutcomeUsesProviderErrorText(class string) bool {
@@ -518,6 +547,43 @@ func (d *dispatchState) setLastError(errText string, statusCode int) {
 	// fault): clear any budget captured from a prior attempt so it never bleeds
 	// into a later classification.
 	d.lastErrProviderBudget = 0
+}
+
+func (d *dispatchState) noteProviderBodyTooLarge(errText string, bodyBytes int) {
+	d.providerBodyTooLargeErr = errText
+	d.providerBodyTooLargeBytes = bodyBytes
+	d.setLastError(errText, http.StatusRequestEntityTooLarge)
+}
+
+func (d *dispatchState) preflightLegacyCacheBust() {
+	_, err := minimumLegacyCacheBustOverflow(d.rawBody, d.requiresVision)
+	if errors.Is(err, errProviderBodyTooLarge) {
+		d.minPrefixCacheProtocol = 1
+	}
+}
+
+func (d *dispatchState) noteProviderBodyTooLargeFor(
+	provider *registry.Provider,
+	errText string,
+) {
+	if provider == nil {
+		return
+	}
+	if d.excludeProviders == nil {
+		d.excludeProviders = make(map[string]struct{})
+	}
+	d.excludeProviders[provider.ID] = struct{}{}
+	bodyBytes, _ := providerBodySizeError(
+		d.rawBody, d.requiresVision, provider)
+	d.noteProviderBodyTooLarge(errText, bodyBytes)
+}
+
+func (d *dispatchState) latchProviderBodyTooLarge(errText string) {
+	d.noteProviderBodyTooLarge(errText, d.providerBodyTooLargeBytes)
+	d.terminalClientError = true
+	d.terminalClientErrorCode = http.StatusRequestEntityTooLarge
+	d.terminalClientErrorReason = "payload_too_large"
+	d.terminalClientErrorMessage = errText
 }
 
 // setLastInferenceError records a pre-content provider rejection as the dispatch
@@ -551,6 +617,10 @@ func providerReportedBudget(provider *registry.Provider, model string) int64 {
 // pre-dispatch failures (queue reservation DB error, invalid key, keygen, send
 // failure) and coordinator-side timeouts are NOT flagged.
 func (d *dispatchState) providerFailedRoutingOutcome() *store.InferenceRouteOutcome {
+	return d.providerFailedRoutingOutcomeFor(d.pr)
+}
+
+func (d *dispatchState) providerFailedRoutingOutcomeFor(pr *registry.PendingRequest) *store.InferenceRouteOutcome {
 	if isTerminalClientErrorCode(d.lastErrCode) || isNonProviderFaultErrorReason(d.lastErrReason) {
 		// Deterministic non-provider fault: a 4xx status the provider maps for
 		// malformed bodies, OR a structured non-provider-fault reason (jinja_*
@@ -560,13 +630,13 @@ func (d *dispatchState) providerFailedRoutingOutcome() *store.InferenceRouteOutc
 		// reputation and breaker exemptions (isNonProviderFaultErrorReason).
 		// The structured reason survives on the row (see
 		// routeOutcomeUsesProviderErrorText).
-		return d.errorRoutingOutcome("error", errorClassClientError, d.lastErrCode)
+		return d.errorRoutingOutcomeFor(pr, "error", errorClassClientError, d.lastErrCode)
 	}
 	class := "provider_error"
 	if providerDisconnectedError(d.lastErr, d.lastErrCode) {
 		class = "provider_disconnect_pre_commit"
 	}
-	out := d.errorRoutingOutcome("error", class, d.lastErrCode)
+	out := d.errorRoutingOutcomeFor(pr, "error", class, d.lastErrCode)
 	out.AdmittedButFailed = true
 	return out
 }
@@ -602,6 +672,9 @@ func isTerminalClientErrorCode(code int) bool {
 }
 
 func dispatchErrorClass(errText string) string {
+	if strings.Contains(errText, errProviderBodyTooLarge.Error()) {
+		return errorClassClientError
+	}
 	switch errText {
 	case "insufficient funds for provider price":
 		return "insufficient_funds"
@@ -620,7 +693,7 @@ func dispatchErrorClass(errText string) string {
 }
 
 func (d *dispatchState) rejectionInfo(stage, reason string, status, retryAfterMs int) rejectionInfo {
-	return rejectionInfo{
+	info := rejectionInfo{
 		r:                     d.r,
 		stage:                 stage,
 		reasonCode:            reason,
@@ -638,6 +711,13 @@ func (d *dispatchState) rejectionInfo(stage, reason string, status, retryAfterMs
 		preferOwner:           d.policy.prefer,
 		retryAfterMs:          retryAfterMs,
 	}
+	if reason == "payload_too_large" {
+		info.servabilityComputed = true
+		if d.providerBodyTooLargeBytes > 0 {
+			info.requestBodyBytes = d.providerBodyTooLargeBytes
+		}
+	}
+	return info
 }
 
 func (d *dispatchState) rejectionInfoWithDecision(stage, reason string, status, retryAfterMs int, decision registry.RoutingDecision) rejectionInfo {
@@ -651,8 +731,51 @@ func (d *dispatchState) rejectionInfoWithDecision(stage, reason string, status, 
 	return info
 }
 
-// updateRoutingOutcome writes a final outcome update for the current attempt
-// asynchronously. It is a no-op when there is no request ID to correlate.
+// dispatchRoutingAttempt is immutable identity captured before a wait path can
+// clear or promote mutable dispatchState provider/request fields.
+type dispatchRoutingAttempt struct {
+	provider  *registry.Provider
+	pending   *registry.PendingRequest
+	requestID string
+	attempt   int
+}
+
+func routingAttempt(provider *registry.Provider, pr *registry.PendingRequest, requestID string, attempt int) dispatchRoutingAttempt {
+	return dispatchRoutingAttempt{provider: provider, pending: pr, requestID: requestID, attempt: attempt}
+}
+
+func (d *dispatchState) currentOrCapturedRoutingAttempt(captured dispatchRoutingAttempt) dispatchRoutingAttempt {
+	if d.pr == nil {
+		// A cleared request ID is an intentional no-op sentinel: speculative
+		// sub-waits clear all three fields after recording each racer's terminal
+		// outcome themselves. Restoring captured here would attribute the
+		// surviving racer's later failure or timeout to the already-finalized
+		// primary. Ordinary single-attempt fallbacks retain requestID and still
+		// use captured below.
+		if d.requestID == "" {
+			return dispatchRoutingAttempt{}
+		}
+		return captured
+	}
+	return routingAttempt(d.provider, d.pr, d.routingOutcomeKey(), d.attempt)
+}
+
+func (d *dispatchState) updateRoutingOutcomeForAttempt(target dispatchRoutingAttempt, outcome *store.InferenceRouteOutcome) {
+	requestID, attempt := target.requestID, target.attempt
+	if requestID == "" {
+		return
+	}
+	providerMatches := target.provider == nil ||
+		(target.pending != nil && target.pending.ProviderID != "" && target.pending.ProviderID == target.provider.ID)
+	if target.pending != nil && target.pending.RequestID == requestID && target.pending.Attempt == attempt && providerMatches {
+		d.s.updateInferenceRouteOutcomeForPending(target.pending, outcome)
+		return
+	}
+	d.s.updateInferenceRouteOutcomeWithModel(requestID, attempt, d.model, outcome)
+}
+
+// updateRoutingOutcome writes an outcome update for the current attempt. It is
+// a no-op when there is no request ID to correlate.
 func (d *dispatchState) updateRoutingOutcome(outcome *store.InferenceRouteOutcome) {
 	requestID := d.routingOutcomeKey()
 	if requestID == "" {
@@ -661,7 +784,7 @@ func (d *dispatchState) updateRoutingOutcome(outcome *store.InferenceRouteOutcom
 	// Capture attempt on the dispatch goroutine: the closure runs on a telemetry
 	// sink worker, while run()'s retry loop concurrently advances d.attempt.
 	attempt := d.attempt
-	d.s.updateInferenceRouteOutcomeWithModel(requestID, attempt, d.model, outcome)
+	d.updateRoutingOutcomeForAttempt(routingAttempt(d.provider, d.pr, requestID, attempt), outcome)
 }
 
 func (d *dispatchState) markSpeculativeLoser(pr *registry.PendingRequest) {
@@ -722,13 +845,15 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 	routeRecorded := false
 	routeRequestID := ""
 	routeAttempt := attempt
+	var routeProvider *registry.Provider
 	d.provider, d.pr, decision, dispatchErr, dispatchErrCode = s.dispatchOneProvider(
 		r, d.model, d.publicModel, d.rawBody, d.consumerKey, d.consumerLocation, d.reservedMicroUSD,
 		d.estimatedPromptTokens, d.requestedMaxTokens, d.tokenAdmission, d.requiresVision,
 		d.traits(),
-		d.allowedProviderSerials, d.isResponsesAPI, d.policy, d.timing, d.serviceReservation, d.cacheRoute, d.excludeProviders,
+		d.allowedProviderSerials, d.isResponsesAPI, d.policy, d.timing, d.serviceReservation, d.cachePlan, d.excludeProviders,
 		d.attempt,
 		func(provider *registry.Provider, pr *registry.PendingRequest, decision registry.RoutingDecision) {
+			routeProvider = provider
 			routeRecorded = true
 			if pr != nil {
 				routeRequestID = pr.RequestID
@@ -743,6 +868,9 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 		d.recordRoutingDecision(decision, dispatchErr, "")
 	}
 	if d.provider == nil {
+		if dispatchErrCode == http.StatusRequestEntityTooLarge {
+			d.noteProviderBodyTooLargeFor(routeProvider, dispatchErr)
+		}
 		if routeRecorded {
 			d.s.updateInferenceRouteOutcomeWithModel(routeRequestID, routeAttempt, d.model, d.errorRoutingOutcome("error", dispatchErrorClass(dispatchErr), dispatchErrCode))
 		}
@@ -753,6 +881,9 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			s.ddIncr("routing.decisions", []string{"model:" + d.model, "model_type:" + s.registry.ModelType(d.model), "outcome:model_too_large"})
 			d.setLastError(dispatchErr, dispatchErrCode)
 			return outcomeFailFast
+		}
+		if dispatchErrCode == http.StatusRequestEntityTooLarge {
+			return outcomeRetry
 		}
 
 		// Providers are available but all exceed the TTFT ceiling. This
@@ -803,7 +934,13 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 		// to come back won't help. Break and return the last error.
 		// Don't overwrite lastErr/lastErrCode from the real provider
 		// error — preserve the original status code.
-		if attempt > 0 {
+		if d.providerBodyTooLargeErr != "" &&
+			d.lastErrCode == http.StatusRequestEntityTooLarge &&
+			decision.CapacityRejections == 0 {
+			d.latchProviderBodyTooLarge(d.providerBodyTooLargeErr)
+			return outcomeFailFast
+		}
+		if attempt > 0 && !d.shouldQueueCompatibleProvider(decision) {
 			if d.lastErr == "" {
 				d.setLastError(dispatchErr, dispatchErrCode)
 			}
@@ -831,7 +968,8 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			BaseReservedMicroUSD:   d.reservedMicroUSD,
 			ServiceReservation:     d.serviceReservation,
 			AllowedProviderSerials: d.allowedProviderSerials,
-			CacheRoute:             d.cacheRoute,
+			ExcludedProviderIDs:    d.excludedProviderIDs(),
+			CachePlan:              d.cachePlan,
 			SelfRouteOnly:          d.policy.enabled,
 			PreferOwner:            d.policy.prefer,
 			OwnerAccountID:         d.policy.ownerAccountID,
@@ -1009,11 +1147,38 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			d.updateRoutingOutcome(d.errorRoutingOutcome("error", "provider_error", 0))
 			return outcomeRetry
 		}
-		// Version-gated penalty strip (see bodyForProvider). The queued path seals
-		// here, separately from dispatchOneProvider.
-		sealedBody := bodyForProvider(d.rawBody, d.requiresVision, d.provider)
+		if err := s.registry.PrepareCacheAttempt(d.pr, d.provider); err != nil {
+			s.registry.ForgetCacheAttempt(d.pr)
+			d.provider.RemovePending(d.requestID)
+			s.registry.SetProviderIdle(d.provider.ID)
+			s.refundProviderExtra(d.pr)
+			d.setLastError("failed to prepare cache-safe request", http.StatusInternalServerError)
+			d.updateRoutingOutcome(d.errorRoutingOutcome("error", "provider_error", http.StatusInternalServerError))
+			return outcomeRetry
+		}
+		// Version-gated penalty strip plus protocol-0 cache isolation. The queued
+		// path seals here, separately from dispatchOneProvider.
+		sealedBody, err := bodyForCacheAttempt(d.rawBody, d.requiresVision, d.provider, d.pr)
+		if err != nil {
+			s.registry.ForgetCacheAttempt(d.pr)
+			d.provider.RemovePending(d.requestID)
+			s.registry.SetProviderIdle(d.provider.ID)
+			s.refundProviderExtra(d.pr)
+			if errors.Is(err, errProviderBodyTooLarge) {
+				d.excludeProviders[d.provider.ID] = struct{}{}
+				d.noteProviderBodyTooLarge(err.Error(), oversizedProviderBodyBytes(err))
+				d.updateRoutingOutcome(d.errorRoutingOutcome(
+					"error", errorClassClientError, http.StatusRequestEntityTooLarge))
+				return outcomeRetry
+			}
+			d.setLastError("failed to prepare provider request", http.StatusInternalServerError)
+			d.updateRoutingOutcome(d.errorRoutingOutcome(
+				"error", "provider_error", http.StatusInternalServerError))
+			return outcomeRetry
+		}
 		encrypted, err := e2e.Encrypt(sealedBody, providerPubKey, sessionKeys)
 		if err != nil {
+			s.registry.ForgetCacheAttempt(d.pr)
 			d.provider.RemovePending(d.requestID)
 			s.registry.SetProviderIdle(d.provider.ID)
 			s.refundProviderExtra(d.pr)
@@ -1022,23 +1187,8 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			return outcomeRetry
 		}
 		d.timing.EncryptedAt = time.Now()
-		if err := s.registry.PrepareCacheAttempt(d.pr, d.provider); err != nil {
-			s.registry.ForgetCacheAttempt(d.pr)
-			s.ddIncr("routing.cache_prepare_error", nil)
-			s.logger.Warn("cache routing attempt disabled", "request_id", d.requestID, "provider_id", d.provider.ID, "error", err)
-		}
-		wireMsg := map[string]any{
-			"type":       protocol.TypeInferenceRequest,
-			"request_id": d.requestID,
-			"encrypted_body": map[string]string{
-				"ephemeral_public_key": encrypted.EphemeralPublicKey,
-				"ciphertext":           encrypted.Ciphertext,
-			},
-		}
-		if d.pr.CacheReceiptNonce != "" && d.pr.CacheScope != "" {
-			wireMsg["cache_receipt_nonce"] = d.pr.CacheReceiptNonce
-			wireMsg["cache_scope"] = d.pr.CacheScope
-		}
+		wireMsg := providerInferenceWireMessage(
+			d.requestID, encrypted.EphemeralPublicKey, encrypted.Ciphertext, d.pr)
 		d.pr.SessionPrivKey = &sessionKeys.PrivateKey
 		// pr.ReservedMicroUSD was already set in the struct literal and may
 		// have been increased by reserveAdditionalForProvider. Don't overwrite.
@@ -1269,21 +1419,23 @@ func (d *dispatchState) waitFirstChunk() (outcome dispatchOutcome) {
 	s := d.s
 	r := d.r
 	provider, pr := d.provider, d.pr
+	captured := routingAttempt(provider, pr, pr.RequestID, pr.Attempt)
 
 	defer func() {
+		target := d.currentOrCapturedRoutingAttempt(captured)
 		switch outcome {
 		case outcomeCommitted:
-			d.updateRoutingOutcome(d.successRoutingOutcome())
+			d.updateRoutingOutcomeForAttempt(target, d.successRoutingOutcomeFor(target.pending))
 		case outcomeRetry:
 			if d.lastErrCode == http.StatusGatewayTimeout {
-				d.updateRoutingOutcome(d.errorRoutingOutcome("timeout", "first_chunk_timeout", d.lastErrCode))
+				d.updateRoutingOutcomeForAttempt(target, d.errorRoutingOutcomeFor(target.pending, "timeout", "first_chunk_timeout", d.lastErrCode))
 			} else {
 				// Post-dispatch provider failure (incl. OOM/model-load): admitted but failed.
-				d.updateRoutingOutcome(d.providerFailedRoutingOutcome())
+				d.updateRoutingOutcomeForAttempt(target, d.providerFailedRoutingOutcomeFor(target.pending))
 			}
 		case outcomeClientGone:
 			d.emitClientGone(phaseBeforeFirstToken)
-			d.updateRoutingOutcome(d.errorRoutingOutcome("cancelled", "client_gone", 0))
+			d.updateRoutingOutcomeForAttempt(target, d.errorRoutingOutcomeFor(target.pending, "cancelled", "client_gone", 0))
 		}
 	}()
 
@@ -1427,6 +1579,7 @@ func (d *dispatchState) runSpeculative() dispatchOutcome {
 	s.registry.RecordWarmPoolSpeculativeStarted(d.model)
 
 	var backupProvider *registry.Provider
+	var attemptedBackupProvider *registry.Provider
 	var backupPR *registry.PendingRequest
 	var backupErr string
 	var backupErrCode int
@@ -1463,10 +1616,11 @@ func (d *dispatchState) runSpeculative() dispatchOutcome {
 			d.allowedProviderSerials, d.isResponsesAPI, d.policy,
 			&registry.RequestTiming{ReceivedAt: d.timing.ReceivedAt},
 			d.serviceReservation,
-			d.cacheRoute,
+			d.cachePlan,
 			backupExclude,
 			d.attempt,
 			func(provider *registry.Provider, pr *registry.PendingRequest, decision registry.RoutingDecision) {
+				attemptedBackupProvider = provider
 				if pr != nil {
 					backupRouteRecorded = true
 					backupRouteRequestID = pr.RequestID
@@ -1478,6 +1632,9 @@ func (d *dispatchState) runSpeculative() dispatchOutcome {
 	}
 
 	if backupProvider == nil {
+		if backupErrCode == http.StatusRequestEntityTooLarge && attemptedBackupProvider != nil {
+			d.noteProviderBodyTooLargeFor(attemptedBackupProvider, backupErr)
+		}
 		if backupRouteRecorded {
 			d.s.updateInferenceRouteOutcomeWithModel(backupRouteRequestID, backupRouteAttempt, d.model, d.errorRoutingOutcome("error", dispatchErrorClass(backupErr), backupErrCode))
 		}
@@ -2091,25 +2248,27 @@ func (d *dispatchState) waitAccepted() (outcome dispatchOutcome) {
 	s := d.s
 	r := d.r
 	provider, pr := d.provider, d.pr
+	captured := routingAttempt(provider, pr, pr.RequestID, pr.Attempt)
 
 	defer func() {
+		target := d.currentOrCapturedRoutingAttempt(captured)
 		switch outcome {
 		case outcomeCommitted:
-			d.updateRoutingOutcome(d.successRoutingOutcome())
+			d.updateRoutingOutcomeForAttempt(target, d.successRoutingOutcomeFor(target.pending))
 		case outcomeRetry:
 			if d.lastErrCode == http.StatusGatewayTimeout {
 				if d.preambleLiveness {
-					d.updateRoutingOutcome(d.errorRoutingOutcome("timeout", "preamble_liveness_timeout", d.lastErrCode))
+					d.updateRoutingOutcomeForAttempt(target, d.errorRoutingOutcomeFor(target.pending, "timeout", "preamble_liveness_timeout", d.lastErrCode))
 				} else {
-					d.updateRoutingOutcome(d.errorRoutingOutcome("timeout", "accepted_timeout", d.lastErrCode))
+					d.updateRoutingOutcomeForAttempt(target, d.errorRoutingOutcomeFor(target.pending, "timeout", "accepted_timeout", d.lastErrCode))
 				}
 			} else {
 				// Post-dispatch provider failure (incl. OOM/model-load): admitted but failed.
-				d.updateRoutingOutcome(d.providerFailedRoutingOutcome())
+				d.updateRoutingOutcomeForAttempt(target, d.providerFailedRoutingOutcomeFor(target.pending))
 			}
 		case outcomeClientGone:
 			d.emitClientGone(phaseBeforeFirstToken)
-			d.updateRoutingOutcome(d.errorRoutingOutcome("cancelled", "client_gone", 0))
+			d.updateRoutingOutcomeForAttempt(target, d.errorRoutingOutcomeFor(target.pending, "cancelled", "client_gone", 0))
 		}
 	}()
 
@@ -2243,6 +2402,7 @@ func (d *dispatchState) waitAccepted() (outcome dispatchOutcome) {
 func (d *dispatchState) run() {
 	s := d.s
 	w, r := d.w, d.r
+	d.preflightLegacyCacheBust()
 
 	// Stop any prefill keepalive goroutine on every exit path. Idempotent and
 	// nil-safe (no-op when keepalives are disabled or the writer already took over).
@@ -2346,6 +2506,10 @@ exhausted:
 		// 200. Once committed, a status-coded error can no longer be sent — the
 		// failure goes out in-band as an SSE error event instead.
 		keepaliveCommitted := d.keepalive.takeOver()
+		if d.providerBodyTooLargeErr != "" &&
+			d.lastErrCode == http.StatusRequestEntityTooLarge {
+			d.latchProviderBodyTooLarge(d.providerBodyTooLargeErr)
+		}
 		statusCode := d.lastErrCode
 		reason := "dispatch_exhausted"
 		if d.terminalClientError {
@@ -2442,10 +2606,15 @@ exhausted:
 			// latches leave the message empty) keep the exact legacy in-band
 			// shapes below.
 			if d.terminalClientError && d.terminalClientErrorMessage != "" {
+				errorCode := "model_capability"
+				if d.terminalClientErrorReason == "payload_too_large" {
+					errorCode = "payload_too_large"
+				}
 				if d.isResponsesAPI {
 					writeResponsesSSEErrorEvent(w, "invalid_request_error", d.terminalClientErrorMessage)
 				} else {
-					writeSSEErrorEvent(w, errorResponse("invalid_request_error", d.terminalClientErrorMessage, withCode("model_capability")))
+					writeSSEErrorEvent(w, errorResponse(
+						"invalid_request_error", d.terminalClientErrorMessage, withCode(errorCode)))
 				}
 				return
 			}
@@ -2476,7 +2645,12 @@ exhausted:
 			// the curated model_capability message instead of the provider's raw
 			// template backtrace.
 			if d.terminalClientErrorMessage != "" {
-				writeJSON(w, statusCode, errorResponse("invalid_request_error", d.terminalClientErrorMessage, withCode("model_capability")))
+				errorCode := "model_capability"
+				if d.terminalClientErrorReason == "payload_too_large" {
+					errorCode = "payload_too_large"
+				}
+				writeJSON(w, statusCode, errorResponse(
+					"invalid_request_error", d.terminalClientErrorMessage, withCode(errorCode)))
 			} else {
 				writeJSON(w, statusCode, errorResponse("invalid_request_error", d.lastErr))
 			}
@@ -2548,6 +2722,10 @@ func adjustLatencyForPrefill(raw time.Duration, promptTokens int, prefillTPS flo
 	return raw
 }
 
+func shouldRecordReputationLatency(pr *registry.PendingRequest, firstChunk string) bool {
+	return pr != nil && pr.Timing != nil && firstChunk != "" && !pr.CacheRoutingParticipates()
+}
+
 func (d *dispatchState) writeCommittedResponse() {
 	s := d.s
 	w, r := d.w, d.r
@@ -2569,7 +2747,7 @@ func (d *dispatchState) writeCommittedResponse() {
 	// prompt-size prefill is removed using the coordinator-side prompt estimate
 	// (known up front, adequate for normalization) and the provider's benchmarked
 	// PrefillTPS (set once at registration, read-only thereafter).
-	if pr.Timing != nil && d.firstChunk != "" {
+	if shouldRecordReputationLatency(pr, d.firstChunk) {
 		// FirstContentAt was already stamped at the content-commit site
 		// (commitFirstContent), earlier in THIS goroutine, so contentLatency reads
 		// a set value here. No re-stamp needed; just read it for the reputation

@@ -10,7 +10,9 @@ public enum CoordinatorClientCodec {
         version: String = ProviderCore.version,
         privacyCapabilities: PrivacyCapabilities? = nil,
         apnsDeviceTokenOverride: String? = nil,
-        modelWeightHashOverrides: [String: String] = [:]
+        modelWeightHashOverrides: [String: String]? = nil,
+        prefixCacheProtocol: Int = 1,
+        prefixCacheV2Models: [PrefixCacheV2Capability]? = nil
     ) -> ProviderMessage {
         // A token that arrived after the config was built (APNs slow at startup)
         // overrides the config value so a reconnect re-registers WITH it.
@@ -18,24 +20,20 @@ public enum CoordinatorClientCodec {
         let effectiveEnv = apnsDeviceTokenOverride != nil
             ? (config.apnsEnvironment ?? "production")
             : config.apnsEnvironment
-        // Weight hashes refreshed after a model (re)load override the
-        // daemon-start values so a reconnect registers with the hashes of the
-        // weights actually on disk (the coordinator's per-model catalog filter
-        // keys off models[].weight_hash).
-        // The advertised set may be overridden on a reconnect (prefetch re-advertise);
-        // weight-hash overrides are then patched on top of whichever set we send.
+        // Once the provider loop supplies a live hash snapshot, it is
+        // authoritative: missing entries clear daemon-start hashes that could
+        // no longer be verified. The advertised set may still be overridden on
+        // reconnect; the live snapshot is applied to whichever set we send.
         let baseModels = models ?? config.models
         let effectiveModels: [ModelInfo]
-        if modelWeightHashOverrides.isEmpty {
-            effectiveModels = baseModels
-        } else {
+        if let modelWeightHashOverrides {
             effectiveModels = baseModels.map { model in
                 var patched = model
-                if let fresh = modelWeightHashOverrides[model.id] {
-                    patched.weightHash = fresh
-                }
+                patched.weightHash = modelWeightHashOverrides[model.id]
                 return patched
             }
+        } else {
+            effectiveModels = baseModels
         }
         return .register(ProviderMessage.Register(
             hardware: config.hardware,
@@ -54,7 +52,8 @@ public enum CoordinatorClientCodec {
             privateOnly: config.privateOnly,
             apnsDeviceToken: effectiveToken,
             apnsEnvironment: effectiveEnv,
-            prefixCacheProtocol: 1
+            prefixCacheProtocol: prefixCacheProtocol,
+            prefixCacheV2Models: prefixCacheV2Models
         ))
     }
 
@@ -64,7 +63,9 @@ public enum CoordinatorClientCodec {
         version: String = ProviderCore.version,
         privacyCapabilities: PrivacyCapabilities? = nil,
         apnsDeviceTokenOverride: String? = nil,
-        modelWeightHashOverrides: [String: String] = [:]
+        modelWeightHashOverrides: [String: String]? = nil,
+        prefixCacheProtocol: Int = 1,
+        prefixCacheV2Models: [PrefixCacheV2Capability]? = nil
     ) throws -> Data {
         try ProviderProtocolCodec.encodeProviderMessage(
             registrationMessage(
@@ -73,7 +74,9 @@ public enum CoordinatorClientCodec {
                 version: version,
                 privacyCapabilities: privacyCapabilities,
                 apnsDeviceTokenOverride: apnsDeviceTokenOverride,
-                modelWeightHashOverrides: modelWeightHashOverrides
+                modelWeightHashOverrides: modelWeightHashOverrides,
+                prefixCacheProtocol: prefixCacheProtocol,
+                prefixCacheV2Models: prefixCacheV2Models
             )
         )
     }
@@ -86,7 +89,9 @@ public enum CoordinatorClientCodec {
         systemMetrics: SystemMetrics,
         backendCapacity: BackendCapacity?,
         apnsDeviceToken: String? = nil,
-        apnsEnvironment: String? = nil
+        apnsEnvironment: String? = nil,
+        prefixCacheProtocol: Int? = nil,
+        prefixCacheV2Models: [PrefixCacheV2Capability]? = nil
     ) -> ProviderMessage {
         .heartbeat(ProviderMessage.Heartbeat(
             status: status,
@@ -96,7 +101,9 @@ public enum CoordinatorClientCodec {
             systemMetrics: systemMetrics,
             backendCapacity: backendCapacity,
             apnsDeviceToken: apnsDeviceToken,
-            apnsEnvironment: apnsEnvironment
+            apnsEnvironment: apnsEnvironment,
+            prefixCacheProtocol: prefixCacheProtocol,
+            prefixCacheV2Models: prefixCacheV2Models
         ))
     }
 
@@ -112,10 +119,17 @@ public enum CoordinatorClientCodec {
                 encryptedData: encryptedData
             ))
 
-        case .inferenceComplete(let requestId, let usage, let seSignature, let responseHash):
+        case .inferenceComplete(
+            let requestId,
+            let usage,
+            let stopSequence,
+            let seSignature,
+            let responseHash
+        ):
             return .inferenceComplete(ProviderMessage.InferenceComplete(
                 requestId: requestId,
                 usage: usage,
+                stopSequence: stopSequence,
                 seSignature: seSignature,
                 responseHash: responseHash
             ))
@@ -186,7 +200,7 @@ public enum CoordinatorClientCodec {
 
         case .prefixCacheReady(
             let requestId, let nonce, let readyTokens,
-            let requiredRecomputeTokens, let expectedPrefillTokensSaved, let tier
+            let requiredRecomputeTokens, let expectedPrefillTokensSaved, let tier, let stageMs
         ):
             return .prefixCacheReady(ProviderMessage.PrefixCacheReady(
                 requestId: requestId,
@@ -194,8 +208,15 @@ public enum CoordinatorClientCodec {
                 readyTokens: readyTokens,
                 requiredRecomputeTokens: requiredRecomputeTokens,
                 expectedPrefillTokensSaved: expectedPrefillTokensSaved,
-                tier: tier
+                tier: tier,
+                stageMs: stageMs
             ))
+
+        case .prefixCacheLookupV2(let message):
+            return .prefixCacheLookupV2(message)
+
+        case .prefixCacheReadyV2(let message):
+            return .prefixCacheReadyV2(message)
         }
     }
 

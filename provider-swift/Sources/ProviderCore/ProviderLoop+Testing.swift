@@ -22,8 +22,42 @@ extension ProviderLoop {
     /// Test seam: whether a model id is currently advertised.
     func isModelAdvertised(_ id: String) -> Bool { advertisedModels[id] != nil }
 
+    func advertisedModelWeightHashForTesting(_ id: String) -> String? {
+        advertisedModels[id]?.weightHash
+    }
+
+    func loadedModelHashesSnapshotForTesting() -> [String: String] {
+        loadedModelHashesSnapshot()
+    }
+
     /// Test seam: recorded weight hash for a model (nil when unknown).
     func modelHashForTesting(_ id: String) -> String? { modelHashes[id] }
+
+    func liveModelHashForTesting(_ id: String) -> String? { liveModelHashes[id] }
+
+    func captureWeightHashForTesting(
+        modelId: String,
+        modelPath: URL,
+        requireFreshCryptographicHash: Bool = false
+    ) async throws -> WeightHashSnapshot {
+        try await captureWeightHash(
+            modelId: modelId,
+            modelPath: modelPath,
+            requireFreshCryptographicHash: requireFreshCryptographicHash)
+    }
+
+    func finalizeReusableSSDLoadForTesting(
+        modelId: String,
+        preLoad: WeightHashSnapshot,
+        postLoad: WeightHashSnapshot,
+        newcomer: EngineV2NewcomerBox
+    ) async throws -> String? {
+        try await finalizeReusableSSDLoad(
+            modelId: modelId,
+            preLoad: preLoad,
+            postLoad: postLoad,
+            newcomer: newcomer)
+    }
 
     /// Test seam: exposes the prefetch pre-check decision.
     func prefetchPreCheckForTesting(_ id: String) -> PrefetchPreCheck { prefetchPreCheck(modelId: id) }
@@ -288,6 +322,7 @@ extension ProviderLoop {
                 container: try newcomer.borrow(),
                 tokenizer: tokenizer,
                 sizing: sizing,
+                cacheEligibleWeightHash: nil,
                 isVLM: false,
                 modelType: modelType,
                 lastInferenceAt: .now
@@ -324,6 +359,7 @@ extension ProviderLoop {
             container: container,
             tokenizer: tokenizer,
             sizing: sizing,
+            cacheEligibleWeightHash: nil,
             isVLM: false,
             modelType: modelType,
             lastInferenceAt: .now

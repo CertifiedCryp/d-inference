@@ -153,7 +153,7 @@ func TestToolCallApplyCorruptFunctionNoPanic(t *testing.T) {
 	}
 	acc.activeByIndex = map[int]int{0: 0, 1: 1}
 
-	var frag streamedToolCallDelta
+	var frag streamToolCallDelta
 	frag.Index = 0
 	frag.Function.Arguments = `{"x":1}`
 	acc.apply(frag)
