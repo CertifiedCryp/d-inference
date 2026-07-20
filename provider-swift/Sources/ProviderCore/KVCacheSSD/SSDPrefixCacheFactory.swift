@@ -19,6 +19,18 @@ import MLXLMCommon
 import os
 #endif
 
+enum SSDPrefixCacheConstructionFailure: String, Sendable {
+    case missingWeightHash = "missing_weight_hash"
+    case unsupportedPlan = "unsupported_plan"
+    case unsafePath = "unsafe_path"
+    case keyUnavailable = "key_unavailable"
+    case ephemeralKeyUnavailable = "ephemeral_key_unavailable"
+    case blockContractMismatch = "block_contract_mismatch"
+    case epochUnavailable = "epoch_unavailable"
+    case promptContractUnavailable = "prompt_contract_unavailable"
+    case layoutUnavailable = "layout_unavailable"
+}
+
 enum SSDPrefixCacheFactory {
 
     #if canImport(os)
@@ -39,17 +51,24 @@ enum SSDPrefixCacheFactory {
     /// separate root is fully self-contained, zero coupling. Survival
     /// after a legacy sweep is pinned by tests.
     static let ssdRootDirectoryName = "darkbloom/kv3"
+    /// Testbed-only isolated root. Honored only together with the explicit
+    /// ephemeral-key escape hatch, which also forces an in-memory KEK.
+    static let testRootEnvironmentKey = "DARKBLOOM_PREFIX_CACHE_TEST_ROOT"
 
-    static func cacheDirectory(modelId: String) -> URL {
+    static func cacheDirectory(
+        modelId: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
         let modelKey = SHA256.hash(data: Data(modelId.utf8))
             .map { String(format: "%02x", $0) }.joined().prefix(12)
-        let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return root.appendingPathComponent(
-            "\(Self.ssdRootDirectoryName)/\(modelKey)", isDirectory: true)
+        return cacheRootDirectory(environment: environment)
+            .appendingPathComponent(String(modelKey), isDirectory: true)
     }
 
-    static func cacheRootDirectory() -> URL {
+    static func cacheRootDirectory(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
+        if let root = isolatedTestRoot(environment: environment) { return root }
         let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         return root.appendingPathComponent(Self.ssdRootDirectoryName, isDirectory: true)
@@ -59,7 +78,7 @@ enum SSDPrefixCacheFactory {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         intervalSeconds: Int = 60
     ) {
-        let root = cacheRootDirectory()
+        let root = cacheRootDirectory(environment: environment)
         let ttl = SSDPrefixCachePolicy.ttlSeconds(environment: environment)
         SSDWholeRootMaintainer.shared.startPeriodicMaintenance(
             root: root,
@@ -77,6 +96,21 @@ enum SSDPrefixCacheFactory {
         SSDWholeRootMaintainer.shared.stopPeriodicMaintenance(root: cacheRootDirectory())
     }
 
+    private static func ephemeralAllowed(environment: [String: String]) -> Bool {
+        let raw = environment["DARKBLOOM_PREFIX_CACHE_ALLOW_EPHEMERAL"]?
+            .trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+        return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+    }
+
+    private static func isolatedTestRoot(environment: [String: String]) -> URL? {
+        guard ephemeralAllowed(environment: environment),
+            let raw = environment[testRootEnvironmentKey]?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !raw.isEmpty
+        else { return nil }
+        return URL(fileURLWithPath: raw, isDirectory: true).standardizedFileURL
+    }
+
     /// Build the SSD tier for a supported model slot. Reusable ciphertext is
     /// permitted only when it can be bound to the verified hash of the live
     /// weights. A missing/blank hash disables the tier instead of degrading to
@@ -86,30 +120,36 @@ enum SSDPrefixCacheFactory {
         promptContractID: String,
         weightHash: String?,
         layerKinds: [CBv2LayerKind],
+        prefixReuseCapability: CBv2PrefixReuseCapability,
         kvBudget: GlobalKVCacheBudget?,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        onConstructionFailure:
+            (@Sendable (SSDPrefixCacheConstructionFailure) -> Void)? = nil
     ) async -> SSDPrefixCache? {
         guard let weightHash = verifiedWeightHash(weightHash) else {
+            onConstructionFailure?(.missingWeightHash)
             #if canImport(os)
             logger.warning(
                 "ssd prefix cache disabled for \(modelId, privacy: .public): verified live weight hash unavailable")
             #endif
             return nil
         }
-        guard PrefixCachePolicy.supportsReusablePrefixes(layerKinds: layerKinds) else {
+        guard prefixReuseCapability.isSupported else {
+            onConstructionFailure?(.unsupportedPlan)
             #if canImport(os)
             logger.info(
-                "ssd prefix cache disabled for \(modelId, privacy: .public): hybrid attention layout requires full replay")
+                "ssd prefix cache disabled for \(modelId, privacy: .public): prefix reuse unsupported (\(prefixReuseCapability.unsupportedReason?.rawValue ?? "unknown", privacy: .public), backend=\(prefixReuseCapability.backend.rawValue, privacy: .public))")
             #endif
             return nil
         }
-        let wholeRoot = cacheRootDirectory()
-        let dir = cacheDirectory(modelId: modelId)
+        let wholeRoot = cacheRootDirectory(environment: environment)
+        let dir = cacheDirectory(modelId: modelId, environment: environment)
         do {
             try SSDBlockStore.prepareModelRoot(
                 dedicatedRoot: wholeRoot,
                 modelRoot: dir)
         } catch {
+            onConstructionFailure?(.unsafePath)
             #if canImport(os)
             logger.warning(
                 "ssd prefix cache disabled for \(modelId, privacy: .public): unsafe cache path (\(String(describing: error), privacy: .public))")
@@ -120,39 +160,62 @@ enum SSDPrefixCacheFactory {
         // — restart warmth is the feature). Same construction + escape
         // hatch as the legacy tier.
         let kekKey: SymmetricKey
-        do {
-            let se = try PersistentEnclaveKey.loadOrCreate()
-            let kek = KVCacheKEK(
-                wrapper: SecureEnclaveKeyWrappingService(enclaveKey: se),
-                storage: KeychainWrappedKEKStorage())
-            kekKey = try await kek.loadOrCreate()
-        } catch {
-            let ephEnv = environment["DARKBLOOM_PREFIX_CACHE_ALLOW_EPHEMERAL"]?
-                .trimmingCharacters(in: .whitespaces).lowercased() ?? ""
-            let allowEphemeral =
-                ephEnv == "1" || ephEnv == "true" || ephEnv == "yes" || ephEnv == "on"
-            guard allowEphemeral else {
-                #if canImport(os)
-                logger.warning(
-                    "ssd prefix cache disabled for \(modelId, privacy: .public): KEK unavailable (\(String(describing: error), privacy: .public))")
-                #endif
-                return nil
-            }
+        var usedEphemeral = false
+        let forceEphemeral = isolatedTestRoot(environment: environment) != nil
+        if forceEphemeral {
             let kek = KVCacheKEK(
                 wrapper: InMemoryKeyWrappingService(),
                 storage: InMemoryWrappedKEKStorage(identifier: "ephemeral-ssd"))
-            guard let ephKey = try? await kek.loadOrCreate() else { return nil }
+            guard let key = try? await kek.loadOrCreate() else {
+                onConstructionFailure?(.ephemeralKeyUnavailable)
+                return nil
+            }
+            kekKey = key
+            usedEphemeral = true
+        } else {
+            do {
+                let se = try PersistentEnclaveKey.loadOrCreate()
+                let kek = KVCacheKEK(
+                    wrapper: SecureEnclaveKeyWrappingService(enclaveKey: se),
+                    storage: KeychainWrappedKEKStorage())
+                kekKey = try await kek.loadOrCreate()
+            } catch {
+                guard ephemeralAllowed(environment: environment) else {
+                    onConstructionFailure?(.keyUnavailable)
+                    #if canImport(os)
+                    logger.warning(
+                        "ssd prefix cache disabled for \(modelId, privacy: .public): KEK unavailable (\(String(describing: error), privacy: .public))")
+                    #endif
+                    return nil
+                }
+                let kek = KVCacheKEK(
+                    wrapper: InMemoryKeyWrappingService(),
+                    storage: InMemoryWrappedKEKStorage(identifier: "ephemeral-ssd"))
+                guard let ephKey = try? await kek.loadOrCreate() else {
+                    onConstructionFailure?(.ephemeralKeyUnavailable)
+                    return nil
+                }
+                kekKey = ephKey
+                usedEphemeral = true
+            }
+        }
+        if usedEphemeral {
             #if canImport(os)
-            logger.warning(
-                "ssd prefix cache (\(modelId, privacy: .public)): EPHEMERAL in-memory KEK (DARKBLOOM_PREFIX_CACHE_ALLOW_EPHEMERAL) — files do not survive restart; TEST/STRESS ONLY")
+            if forceEphemeral {
+                logger.warning(
+                    "ssd prefix cache (\(modelId, privacy: .public)): isolated TEST root with ephemeral in-memory KEK — files do not survive process exit")
+            } else {
+                logger.warning(
+                    "ssd prefix cache (\(modelId, privacy: .public)): EPHEMERAL in-memory KEK (DARKBLOOM_PREFIX_CACHE_ALLOW_EPHEMERAL) — files do not survive restart; TEST/STRESS ONLY")
+            }
             #endif
-            kekKey = ephKey
         }
 
         let blockSize = PrefixCachePolicy.blockSize
         guard PromptContractIdentity.blockHashVersion == CBv2BlockHasher.version,
             PromptContractIdentity.blockSize == UInt32(blockSize)
         else {
+            onConstructionFailure?(.blockContractMismatch)
             #if canImport(os)
             logger.warning(
                 "ssd prefix cache disabled for \(modelId, privacy: .public): prompt-contract/block-hasher binary mismatch")
@@ -178,6 +241,7 @@ enum SSDPrefixCacheFactory {
                     layoutEpoch: layoutEpoch,
                     keyFingerprint: keyFingerprint))
         } catch {
+            onConstructionFailure?(.epochUnavailable)
             #if canImport(os)
             logger.warning(
                 "ssd prefix cache disabled for \(modelId, privacy: .public): cache epoch unavailable (\(String(describing: error), privacy: .public))")
@@ -189,13 +253,16 @@ enum SSDPrefixCacheFactory {
             promptContractID: promptContractID,
             weightHash: weightHash,
             blockSize: blockSize,
-            adoptionBoundTokens: PrefixCachePolicy.adoptionBoundTokens(layerKinds: layerKinds),
+            adoptionBoundTokens: prefixReuseCapability.conservativeReplayBoundTokens,
+            nominalFullKVBytesPerToken: prefixReuseCapability.fullKVBytesPerToken,
             layoutEpoch: layoutEpoch,
             epochStore: epochStore,
             root: dir,
             dedicatedRoot: wholeRoot,
             ttlSeconds: SSDPrefixCachePolicy.ttlSeconds(environment: environment),
-            minEffectiveTokens: SSDPrefixCachePolicy.minEffectiveTokens(environment: environment),
+            minEffectiveTokens: PrefixCachePolicy.minEffectiveTokens(
+                capability: prefixReuseCapability,
+                environment: environment),
             maxStageBytes: SSDPrefixCachePolicy.maxStageBytes(environment: environment),
             maxStageMillis: SSDPrefixCachePolicy.maxStageMillis(environment: environment),
             nowSeconds: { Int64(Date().timeIntervalSince1970) })
@@ -224,7 +291,7 @@ enum SSDPrefixCacheFactory {
         startWholeRootMaintenance(environment: environment)
         #if canImport(os)
         logger.info(
-            "ssd prefix cache active for \(modelId, privacy: .public) at \(dir.path, privacy: .public): ttl \(config.ttlSeconds)s sliding, box-wide disk budget \(PrefixCachePolicy.ssdDiskBudgetBytes(environment: environment, freeBytes: PrefixCachePolicy.volumeFreeBytes(at: dir))) B, adoption bound \(config.adoptionBoundTokens) tok — HMAC-keyed names (T-041 leak #2 closed), no memory carve")
+            "ssd prefix cache active for \(modelId, privacy: .public) at \(dir.path, privacy: .public): strategy \(prefixReuseCapability.strategy?.rawValue ?? "none", privacy: .public), backend \(prefixReuseCapability.backend.rawValue, privacy: .public), ttl \(config.ttlSeconds)s sliding, box-wide disk budget \(PrefixCachePolicy.ssdDiskBudgetBytes(environment: environment, freeBytes: PrefixCachePolicy.volumeFreeBytes(at: dir))) B, replay bound \(config.adoptionBoundTokens) tok — HMAC-keyed names (T-041 leak #2 closed), no memory carve")
         #endif
         return cache
     }

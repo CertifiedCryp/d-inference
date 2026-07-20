@@ -21,10 +21,20 @@
 // are limited to `makeEngineOverride` (scripted engines, no weights).
 
 import Foundation
+import MLXLLM
 import MLXLMCommon
 import ProviderCoreFoundation
 
 enum EngineV2SlotFactory {
+
+    /// Narrow assembly seams for production-order regression tests. Normal
+    /// callers use the empty value and execute only concrete production code.
+    struct AssemblyOverrides {
+        var promptContractID: String? = nil
+        var pagedPreflight: (([CBv2LayerKind]) throws -> Void)? = nil
+        var makePrefixCache:
+            (([CBv2LayerKind], CBv2PrefixReuseCapability) async -> SSDPrefixCache?)? = nil
+    }
 
     /// Human-readable cache state for the slot-serving log line.
     static func prefixCacheStateDescription(
@@ -66,8 +76,8 @@ enum EngineV2SlotFactory {
     ///   - kvBudget: process-wide shared KV reservation ledger (nil ⇒ no
     ///     shared gating — unit tests only; both production callers pass
     ///     their ledger).
-    ///   - kvQuantConfigured: operator set `kv_quant` — v2 is fp16-only,
-    ///     so a WARN telemetry event fires once per load.
+    ///   - kvQuantConfigured: operator set `kv_quant` — v2 uses unquantized
+    ///     native-float KV, so a WARN telemetry event fires once per load.
     ///   - weightHash: the slot's verified weight hash binding for SSD
     ///     artifacts. Nil or blank disables reusable SSD caching.
     ///   - environment: prefix-cache policy environment
@@ -147,6 +157,7 @@ enum EngineV2SlotFactory {
         weightHash: String? = nil,
         specDecPreparation: SpecDecPreparation,
         preparedModel: EngineV2PreparedModel? = nil,
+        assemblyOverrides: AssemblyOverrides = AssemblyOverrides(),
         environment: [String: String] = ProcessInfo.processInfo.environment,
         emitTelemetry: (@Sendable (TelemetryEvent) -> Void)? = nil,
         makeEngineOverride: (@Sendable (String, Int) throws -> any CBv2Engine)? = nil,
@@ -229,8 +240,33 @@ enum EngineV2SlotFactory {
 
         // SSD offload never carves the live KV grant.
         let engineKVBytesCapacity = kvBytesCapacity
-        let promptContractID = modelDirectory.flatMap {
-            try? PromptContractIdentity.compute(modelDirectory: $0)
+        let promptContractID =
+            assemblyOverrides.promptContractID
+            ?? modelDirectory.flatMap {
+                try? PromptContractIdentity.compute(modelDirectory: $0)
+            }
+        let preparedBackend: EngineV2Factory.ProductionBackendPreparation?
+        if makeEngineOverride == nil {
+            do {
+                preparedBackend = try EngineV2Factory.prepareProductionBackend(
+                    model: servingModel,
+                    kvBytesCapacity: engineKVBytesCapacity,
+                    maxConcurrentRequests: maxConcurrentRequests,
+                    kvBackend: kvBackendSelection,
+                    maxContextLength: sizing.maxContextLength > 0
+                        ? sizing.maxContextLength : nil,
+                    environment: environment,
+                    pagedPreflightOverride: assemblyOverrides.pagedPreflight)
+            } catch {
+                EngineV2Factory.emitRefusalTelemetry(
+                    modelId: modelId,
+                    reason: EngineV2RefusalReason.classify(error),
+                    error: error,
+                    emitTelemetry: emitTelemetry)
+                throw error
+            }
+        } else {
+            preparedBackend = nil
         }
 
         // Encrypted SSD is the only production prefix-cache tier.
@@ -252,23 +288,53 @@ enum EngineV2SlotFactory {
         // unsupportedModel at engine build anyway).
         var ssdPrefixCache: SSDPrefixCache?
         if makeEngineOverride == nil, PrefixCachePolicy.isEnabled(environment: environment) {
-            let ssdLayerKinds: [CBv2LayerKind]?
-            ssdLayerKinds = EngineV2Factory.cbv2LayerKinds(model: servingModel)
-            if let ssdLayerKinds {
+            if let preparedBackend {
+                let ssdLayerKinds = preparedBackend.layerKinds
+                let resolvedSelection: EngineV2KVBackendSelection =
+                    preparedBackend.kind == .paged ? .paged : .contiguous
+                let prefixReuseCapability = PrefixCachePolicy.prefixReuseCapability(
+                    layerKinds: ssdLayerKinds,
+                    backendSelection: resolvedSelection)
                 if let promptContractID {
-                    ssdPrefixCache = await SSDPrefixCacheFactory.make(
-                        modelId: modelId,
-                        promptContractID: promptContractID,
-                        weightHash: weightHash,
-                        layerKinds: ssdLayerKinds,
-                        kvBudget: kvBudget,
-                        environment: environment)
+                    if let makePrefixCache = assemblyOverrides.makePrefixCache {
+                        ssdPrefixCache = await makePrefixCache(
+                            ssdLayerKinds, prefixReuseCapability)
+                    } else {
+                        ssdPrefixCache = await SSDPrefixCacheFactory.make(
+                            modelId: modelId,
+                            promptContractID: promptContractID,
+                            weightHash: weightHash,
+                            layerKinds: ssdLayerKinds,
+                            prefixReuseCapability: prefixReuseCapability,
+                            kvBudget: kvBudget,
+                            environment: environment,
+                            onConstructionFailure: { failure in
+                                Self.emitPrefixCacheConstructionFailure(
+                                    modelId: modelId,
+                                    capability: prefixReuseCapability,
+                                    failure: failure,
+                                    emitTelemetry: emitTelemetry)
+                            })
+                    }
                 } else {
+                    Self.emitPrefixCacheConstructionFailure(
+                        modelId: modelId,
+                        capability: prefixReuseCapability,
+                        failure: .promptContractUnavailable,
+                        emitTelemetry: emitTelemetry)
                     logWarning(
                         "engine_v2: SSD prefix cache skipped for \(modelId) — "
                             + "prompt contract could not be computed from local artifacts")
                 }
             } else {
+                let unavailableCapability = PrefixCachePolicy.prefixReuseCapability(
+                    layerKinds: [],
+                    backendSelection: .contiguous)
+                Self.emitPrefixCacheConstructionFailure(
+                    modelId: modelId,
+                    capability: unavailableCapability,
+                    failure: .layoutUnavailable,
+                    emitTelemetry: emitTelemetry)
                 logInfo(
                     "engine_v2: SSD prefix cache skipped for \(modelId) — no "
                         + "derivable CBv2 layer kinds (non-adapted family)")
@@ -288,23 +354,34 @@ enum EngineV2SlotFactory {
                     kvBackendFallbackReason: nil)
             }
         } else {
+            guard let preparedBackend else {
+                preconditionFailure("production backend preparation missing")
+            }
             makeEngine = {
-                return try EngineV2Factory.makeProductionBuild(
+                try EngineV2Factory.assembleProductionBuild(
                     model: servingModel,
                     tokenizer: tokenizer.inner,
-                    kvBytesCapacity: engineKVBytesCapacity,
                     prefixCache: enginePrefixCache,
                     maxConcurrentRequests: maxConcurrentRequests,
                     mtpDrafter: assistantHandle?.drafter,
                     mtpConfig: mtpConfig,
-                    kvBackend: kvBackendSelection,
-                    // Sizes the paged pool's per-group split
-                    // (`nominalMaxSequenceLength`); 0/unknown → factory
-                    // default.
-                    maxContextLength: sizing.maxContextLength > 0
-                        ? sizing.maxContextLength : nil,
-                    environment: environment)
+                    preparedBackend: preparedBackend)
             }
+        }
+
+        let processKVBytesPerToken: Int
+        if let preparedBackend {
+            let capability = CBv2PrefixReuseCapability.derive(
+                layerKinds: preparedBackend.layerKinds,
+                backend: .contiguousUnquantized)
+            processKVBytesPerToken = EngineV2Factory.nativeKVBytesPerToken(
+                nominalFP16BytesPerToken: sizing.fp16KVBytesPerToken,
+                fp16FullKVBytesPerToken: capability.fullKVBytesPerToken,
+                fullRowsUseFP32:
+                    preparedBackend.kind == .contiguous
+                    && servingModel is GPTOSSModel)
+        } else {
+            processKVBytesPerToken = sizing.fp16KVBytesPerToken
         }
 
         let bridge = try EngineV2Factory.makeBridge(
@@ -314,7 +391,7 @@ enum EngineV2SlotFactory {
             extraEOSTokens: snapshot.extraEOSTokens,
             defaultMaxTokens: sizing.defaultMaxTokens,
             maxConcurrentRequests: maxConcurrentRequests,
-            kvBytesPerToken: sizing.fp16KVBytesPerToken,
+            kvBytesPerToken: processKVBytesPerToken,
             // Shared KV ledger: v2 submissions RESERVE their worst-case
             // KV here before engine admission (process-wide gate) and the
             // reservation is what the model-LOAD gate subtracts.
@@ -336,7 +413,7 @@ enum EngineV2SlotFactory {
                     ssdCache: ssdPrefixCache))
 
         // WARN once (per load) that kv_quant is ignored on the v2 path
-        // (fp16 caches are what the engine builds).
+        // (unquantized native-float caches are what the engine builds).
         if kvQuantConfigured {
             EngineV2Factory.emitKVQuantUnsupportedTelemetry(
                 modelId: modelId, emitTelemetry: emitTelemetry)
@@ -354,5 +431,34 @@ enum EngineV2SlotFactory {
             assistantBytes: mtpStatus.assistantBytes,
             mtpArtifact: prepared.mtpArtifact,
             mtpStatus: mtpStatus)
+    }
+
+    private static func emitPrefixCacheConstructionFailure(
+        modelId: String,
+        capability: CBv2PrefixReuseCapability,
+        failure: SSDPrefixCacheConstructionFailure,
+        emitTelemetry: (@Sendable (TelemetryEvent) -> Void)?
+    ) {
+        var event = TelemetryEvent(
+            source: .provider,
+            severity: .warn,
+            kind: .engineHealth,
+            message: "engine_v2: SSD prefix cache construction failed"
+        )
+        event.fields = TelemetryFieldFilter.filter([
+            "component": .string("engine"),
+            "operation": .string("prefix_cache_construction"),
+            "backend": .string(capability.backend.rawValue),
+            "model": .string(modelId),
+            "prefix_reuse_strategy": .string(
+                capability.strategy?.rawValue ?? "none"),
+            "prefix_construction_failure": .string(failure.rawValue),
+            "prefix_cold_fallback": .bool(true),
+        ])
+        if let emitTelemetry {
+            emitTelemetry(event)
+        } else {
+            TelemetryClient.shared.emit(event)
+        }
     }
 }

@@ -95,10 +95,10 @@ public actor EngineV2Bridge {
     let maxConcurrentRequests: Int
     /// Per-token KV byte cost for bytes→tokens capacity derivation
     /// (0 = unknown; capacity then falls back to the engine's token counts).
-    /// This is the unquantized fp16 rate: v0.7.5 rejects `kv_quant` intent with
-    /// a warning and EngineV2 builds only fp16 caches, so heartbeat budgets and
-    /// the shared-budget reservation below are
-    /// sized to the caches actually built — see `EngineV2KVSizing`.
+    /// This is the resolved native serving rate. Contiguous GPT-OSS adds the
+    /// fp32 owning-full-row delta to the nominal fp16 sizing rate; Gemma and
+    /// paged slots remain fp16. Heartbeats and process-wide reservations use
+    /// the same value so neither can overstate capacity.
     let kvBytesPerToken: Int
     /// Process-wide KV reservation ledger shared by every EngineV2 slot.
     /// When set (production), each v2 submission must RESERVE its worst-case
@@ -155,6 +155,8 @@ public actor EngineV2Bridge {
     /// This counter is a separate namespace: advancing it must never perturb
     /// engine idMap/cancellation or sampler reproducibility.
     var nextPrefixCacheReceiptRawId: UInt64 = 1
+    var prefixCacheHitTelemetrySeen: UInt64 = 0
+    var prefixCacheFallbackTelemetrySeen: UInt64 = 0
     /// Live per-request pump tasks, so `shutdown()` can cancel any that
     /// outlive the engine drain (defense against a leaked stream). Keyed by
     /// the (normalized) provider request-id; each entry removes itself when
@@ -357,6 +359,32 @@ public actor EngineV2Bridge {
             return stream
         }
 
+        // Translate with a PLACEHOLDER engine id — the real id is minted
+        // below, AFTER the shared-budget await, in the same synchronous
+        // stretch as `engine.submit` and the `idMap` registration. Validate
+        // total token arithmetic before minting cache tickets or staging.
+        var cbv2Request = EngineV2Translation.cbv2Request(
+            id: CBv2RequestID(0),
+            promptTokens: promptTokens,
+            request: request,
+            defaultMaxTokens: defaultMaxTokens,
+            stopTokenIds: stopTokenIds,
+            cacheScope: cacheScope,
+            cacheEnabled: cacheEnabled,
+            multimodal: multimodal
+        )
+        let (worstCaseTokens, tokenCountOverflow) = promptTokens.count.addingReportingOverflow(
+            cbv2Request.maxTokens)
+        guard !tokenCountOverflow else {
+            usageSignal?.finalizeLookup(
+                failure: .capacity,
+                fallbackTier: ssdPrefixCache == nil ? .memory : .ssd)
+            continuation.yield(.error(
+                "token_budget_exhausted: request token count overflow"))
+            continuation.finish()
+            return stream
+        }
+
         // The SSD staging ticket must be submission-unique even when seeded
         // sampling intentionally reuses a deterministic engine request id.
         // Mint it before staging and pass the same identity through
@@ -388,6 +416,7 @@ public actor EngineV2Bridge {
         // where lookup never ran (rejections below, pump terminals).
         // Vision requests never stage (engine policy symmetry).
         var ssdStaged = false
+        var ssdReuseAttempted = false
         if !cacheEnabled {
             usageSignal?.recordCacheDisabled(tier: ssdPrefixCache == nil ? .memory : .ssd)
         } else if multimodal != nil {
@@ -400,7 +429,14 @@ public actor EngineV2Bridge {
                 promptTokens: promptTokens,
                 cacheScope: cacheScope)
             usageSignal?.record(stageResult: stageResult)
+            if case .skippedCapacity = stageResult.disposition {
+                emitPrefixCacheColdFallback(
+                    requestId: id,
+                    reason: "stage_capacity",
+                    capacityRefusal: true)
+            }
             ssdStaged = stageResult.staged
+            ssdReuseAttempted = stageResult.staged
             // `stage` suspended this actor — re-check the duplicate guard
             // (same discipline as the shared-budget gate below).
             guard active[id] == nil else {
@@ -414,28 +450,11 @@ public actor EngineV2Bridge {
                 return stream
             }
         }
-
-        // Translate with a PLACEHOLDER engine id — the real id is minted
-        // below, AFTER the shared-budget await, in the same synchronous
-        // stretch as `engine.submit` and the `idMap` registration. Minting
-        // before the suspension would let two concurrent IDENTICAL seeded
-        // submissions both pass the collision check and hand the engine
-        // duplicate live ids.
-        var cbv2Request = EngineV2Translation.cbv2Request(
-            id: CBv2RequestID(0),
-            promptTokens: promptTokens,
-            request: request,
-            defaultMaxTokens: defaultMaxTokens,
-            stopTokenIds: stopTokenIds,
-            cacheScope: cacheScope,
-            cacheEnabled: cacheEnabled,
-            multimodal: multimodal
-        )
         cbv2Request.prefixCacheReceiptID = prefixCacheReceiptID
 
         // SHARED-BUDGET ADMISSION GATE: reserve this request's worst-case KV
-        // footprint (prompt + maxTokens at the fp16 rate — the caches v2
-        // actually builds) in the process-wide ledger BEFORE handing the
+        // footprint (prompt + maxTokens at the resolved native serving rate)
+        // in the process-wide ledger BEFORE handing the
         // request to the engine. The engine's private byte ledger
         // (`AdmissionV2`, sized to its own `kvBytesCapacity`) only knows its
         // own slot; when another slot (legacy or v2) already has live KV
@@ -453,7 +472,6 @@ public actor EngineV2Bridge {
         // (unit tests / standalone), the per-token rate is unknown (0), or
         // maxTokens ≤ 0 (degenerate request — the engine finishes it
         // immediately without allocating any KV).
-        let worstCaseTokens = promptTokens.count + cbv2Request.maxTokens
         var sharedKVReserved = false
         // PAGED slots skip the per-request shared-KV reserve: the pool is
         // physically committed at construction (`materializeSlabs`) and
@@ -478,8 +496,20 @@ public actor EngineV2Bridge {
                     requestID: id,
                     kvBytesPerToken: kvBytesPerToken,
                     tokenCount: worstCaseTokens)
+                if sharedKVReserved {
+                    emitPrefixCacheColdFallback(
+                        requestId: id,
+                        reason: "shared_kv_capacity",
+                        capacityRefusal: true)
+                }
             }
             guard sharedKVReserved else {
+                if ssdReuseAttempted {
+                    emitPrefixCacheColdFallback(
+                        requestId: id,
+                        reason: "shared_kv_capacity",
+                        capacityRefusal: true)
+                }
                 if let prefixCacheReceiptID {
                     if ssdStaged {
                         await ssdPrefixCache?.abandonStaging(requestID: prefixCacheReceiptID)
@@ -852,6 +882,9 @@ public actor EngineV2Bridge {
                 usageSignal?.record(
                     usage: usage,
                     fallbackTier: ssdPrefixCache == nil ? .memory : .ssd)
+                ssdPrefixCache?.recordPrefillTokensSaved(
+                    usage.prefixCachePrefillTokensSaved)
+                emitPrefixReuseTelemetry(requestId: id, usage: usage)
                 finishAndEmit(
                     id: id, reason: reason, usage: usage,
                     sawFirstToken: sawFirstToken, continuation: continuation

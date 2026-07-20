@@ -47,8 +47,12 @@ The production branch now includes:
 - A depth-zero, batch-bucketed goodput controller with isolated target-only
   probes, conditional acceptance, bounded exploration, hysteresis, and exact
   seed-cost attribution.
-- Safe hybrid prefix-cache policy: full replay whenever a storage-owning full
-  layer follows sliding attention.
+- Exact hybrid prefix reuse: contiguous unquantized full rows remain immutable through
+  M while finite-window state rebuilds from C
+  (`libs/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/ContiguousKVBackend.swift:162-230`;
+  `libs/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/FrozenReplayFullSequenceKV.swift:54-99`);
+  paged hybrids fail cold during typed capability derivation
+  (`libs/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/PrefixReusePlan.swift:127-153`).
 - Provider local/catalog resolution, mandatory immutable catalog anchors,
   bounded nonblocking prefetch, assistant-owned quantization, exact target
   binding, fail-open target-only fallback, memory accounting, slot lifetime,
@@ -64,7 +68,11 @@ Review-driven correctness defects found and fixed during implementation:
 - Mixed terminal depths changed quantized MoE target batch cadence.
 - Mixed eligible/ineligible rows split one target decode batch into different
   shapes.
-- Hybrid prefix-cache partial replay permanently cached polluted activations.
+- Mutating C-bound hybrid replay permanently cached polluted activations;
+  frozen-full replay removes that write path and remains target-authoritative
+  with MTP active or inactive
+  (`libs/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/FrozenReplayFullSequenceKV.swift:73-99`;
+  `libs/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/EngineLoopV2+MTPFinalize.swift:45-149`).
 - The oldest retained sliding key at `anchor-window` was incorrectly visible
   to the assistant.
 - Depth-zero timing included chained neighbor work while MTP timing did not.

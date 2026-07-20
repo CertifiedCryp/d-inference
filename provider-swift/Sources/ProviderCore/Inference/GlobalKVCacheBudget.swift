@@ -200,6 +200,39 @@ public actor GlobalKVCacheBudget {
         return commit(requestID: requestID, bytes: bytes)
     }
 
+    /// Compatibility surface for callers that grow an existing raw-byte
+    /// reservation. Production contiguous KV now reserves its native width
+    /// atomically up front; SSD staging uses `resizeReservationBytes`.
+    @available(*, deprecated, message: "Reserve native KV up front or use resizeReservationBytes")
+    public func increaseReservation(requestID: String, additionalBytes: UInt64) -> Bool {
+        guard additionalBytes > 0, let current = reservations[requestID] else {
+            return additionalBytes == 0 && reservations[requestID] != nil
+        }
+        let (target, overflow) = current.bytes.addingReportingOverflow(additionalBytes)
+        guard !overflow else { return false }
+        return resizeReservationBytes(requestID: requestID, bytes: target)
+    }
+
+    /// Atomically resize an existing raw-byte reservation after encrypted file
+    /// estimates have been rehydrated into exact MLX arrays.
+    public func resizeReservationBytes(requestID: String, bytes: UInt64) -> Bool {
+        guard bytes > 0, var current = reservations[requestID] else { return false }
+        if bytes > current.bytes {
+            let additional = bytes - current.bytes
+            let available = availableReservationBytes()
+            guard additional <= available else {
+                reclaimer.scheduleReclaim(shortfall: additional - available)
+                recordCommitRejection()
+                return false
+            }
+        }
+        current.bytes = bytes
+        reservations[requestID] = current
+        rejectionStreakStart = nil
+        lastRejectionAt = nil
+        return true
+    }
+
     /// Reserve a loading model's WEIGHT footprint for the duration of its load,
     /// unconditionally. A model's weights are not yet visible in MLX active/cache
     /// while `loadModelContainer` is still allocating them, so a KV reservation
