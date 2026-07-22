@@ -197,6 +197,15 @@ import Testing
     // This is the ATTESTED registration (production-common): every Register field
     // must survive this path too, or it silently drops on the wire.
     let raw = #"{"signature":"sig","blob":{"a":1,"b":[true,false]}}"#
+    let capability = PrefixCacheV2Capability(
+        modelId: "model",
+        modelAggregateHash: String(repeating: "a", count: 64),
+        promptContractId: String(repeating: "b", count: 64),
+        blockHashVersion: "dbk3",
+        blockSize: 256,
+        cacheEpoch: "11111111-1111-1111-1111-111111111111",
+        enabled: true,
+        ready: true)
     let message = ProviderMessage.register(ProviderMessage.Register(
         hardware: sampleHardware(),
         models: [sampleModel()],
@@ -204,13 +213,21 @@ import Testing
         attestation: RawJSON(rawBytes: Data(raw.utf8)),
         privateOnly: true,
         apnsDeviceToken: "cb1ceb489ec9",
-        apnsEnvironment: "production"
+        apnsEnvironment: "production",
+        prefixCacheProtocol: 2,
+        prefixCacheV2Models: [capability],
+        toolConstraintProtocol: 1,
+        toolConstraintModels: ["model"]
     ))
     let data = try ProviderProtocolCodec.encodeProviderMessage(message)
     let object = try jsonObject(data)
     #expect(object["apns_device_token"] as? String == "cb1ceb489ec9")
     #expect(object["apns_environment"] as? String == "production")
     #expect(object["private_only"] as? Bool == true)
+    #expect(object["prefix_cache_protocol"] as? Int == 2)
+    #expect((object["prefix_cache_v2_models"] as? [[String: Any]])?.count == 1)
+    #expect(object["tool_constraint_protocol"] as? Int == 1)
+    #expect(object["tool_constraint_models"] as? [String] == ["model"])
     // Raw attestation bytes preserved verbatim (the reason this path exists).
     let json = String(data: data, encoding: .utf8) ?? ""
     #expect(json.contains(#""attestation":\#(raw)"#))
@@ -220,6 +237,9 @@ import Testing
     #expect(r.apnsDeviceToken == "cb1ceb489ec9")
     #expect(r.apnsEnvironment == "production")
     #expect(r.privateOnly == true)
+    #expect(r.prefixCacheV2Models == [capability])
+    #expect(r.toolConstraintProtocol == 1)
+    #expect(r.toolConstraintModels == ["model"])
 }
 
 @Test func codeAttestationResponseEncodesSnakeCaseAndRoundTrips() throws {
@@ -993,12 +1013,14 @@ import Testing
         encryptedBody: EncryptedPayload(ephemeralPublicKey: "a", ciphertext: "b"),
         cacheReceiptNonce: "nonce-1",
         cacheScope: "account-route-key",
-        prefixCacheProtocol: 2))
+        prefixCacheProtocol: 2,
+        toolSchemaMetadataProtocol: 1))
     let data = try ProviderProtocolCodec.encodeCoordinatorMessage(scoped)
     let object = try jsonObject(data)
     #expect(object["cache_receipt_nonce"] as? String == "nonce-1")
     #expect(object["cache_scope"] as? String == "account-route-key")
     #expect(object["prefix_cache_protocol"] as? Int == 2)
+    #expect(object["tool_schema_metadata_protocol"] as? Int == 1)
     #expect(try ProviderProtocolCodec.decodeCoordinatorMessage(from: data) == scoped)
 
     let legacy = #"{"type":"inference_request","request_id":"r","body":null}"#
@@ -1008,6 +1030,7 @@ import Testing
     #expect(decoded.cacheReceiptNonce == nil)
     #expect(decoded.cacheScope == nil)
     #expect(decoded.prefixCacheProtocol == nil)
+    #expect(decoded.toolSchemaMetadataProtocol == nil)
 }
 
 @Test func prefixCacheReceiptMessagesMatchWireContract() throws {

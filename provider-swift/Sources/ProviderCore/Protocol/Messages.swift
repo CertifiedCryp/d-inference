@@ -103,6 +103,10 @@ public enum ProviderMessage: Sendable, Equatable {
         /// providers; only version 2 carries exact, provider-proven ownership.
         public var prefixCacheProtocol: Int?
         public var prefixCacheV2Models: [PrefixCacheV2Capability]?
+        /// Inference-time tool grammar capability. Protocol 1 is advertised
+        /// only with concrete model IDs whose Gemma contract is enforced.
+        public var toolConstraintProtocol: Int?
+        public var toolConstraintModels: [String]?
 
         public init(
             hardware: HardwareInfo,
@@ -124,7 +128,9 @@ public enum ProviderMessage: Sendable, Equatable {
             apnsDeviceToken: String? = nil,
             apnsEnvironment: String? = nil,
             prefixCacheProtocol: Int? = nil,
-            prefixCacheV2Models: [PrefixCacheV2Capability]? = nil
+            prefixCacheV2Models: [PrefixCacheV2Capability]? = nil,
+            toolConstraintProtocol: Int? = nil,
+            toolConstraintModels: [String]? = nil
         ) {
             self.hardware = hardware
             self.models = models
@@ -146,6 +152,8 @@ public enum ProviderMessage: Sendable, Equatable {
             self.apnsEnvironment = apnsEnvironment
             self.prefixCacheProtocol = prefixCacheProtocol
             self.prefixCacheV2Models = prefixCacheV2Models
+            self.toolConstraintProtocol = toolConstraintProtocol
+            self.toolConstraintModels = toolConstraintModels
         }
     }
 
@@ -468,13 +476,22 @@ public enum ProviderMessage: Sendable, Equatable {
     /// routing to it -- without the disruption of a full re-`register` (which
     /// would reset reputation and restart the attestation challenge loop).
     ///
-    /// `models` reuses the SAME `ModelInfo` encoding as `register`'s `models[]`,
-    /// so the wire form is `{"type":"models_update","models":[{...}]}`.
+    /// `models` reuses the SAME `ModelInfo` encoding as `register`'s `models[]`.
+    /// Current providers also refresh model-scoped tool-constraint capability;
+    /// legacy updates omit those additive fields.
     public struct ModelsUpdate: Sendable, Equatable {
         public var models: [ModelInfo]
+        public var toolConstraintProtocol: Int?
+        public var toolConstraintModels: [String]?
 
-        public init(models: [ModelInfo]) {
+        public init(
+            models: [ModelInfo],
+            toolConstraintProtocol: Int? = nil,
+            toolConstraintModels: [String]? = nil
+        ) {
             self.models = models
+            self.toolConstraintProtocol = toolConstraintProtocol
+            self.toolConstraintModels = toolConstraintModels
         }
     }
 
@@ -581,6 +598,8 @@ extension ProviderMessage: Codable {
         case apnsEnvironment = "apns_environment"
         case prefixCacheProtocol = "prefix_cache_protocol"
         case prefixCacheV2Models = "prefix_cache_v2_models"
+        case toolConstraintProtocol = "tool_constraint_protocol"
+        case toolConstraintModels = "tool_constraint_models"
         // Heartbeat
         case status
         case activeModel = "active_model"
@@ -668,6 +687,11 @@ extension ProviderMessage: Codable {
                 try container.encode(version, forKey: .prefixCacheProtocol)
             }
             try container.encodeIfPresent(r.prefixCacheV2Models, forKey: .prefixCacheV2Models)
+            if let version = r.toolConstraintProtocol, version != 0 {
+                try container.encode(version, forKey: .toolConstraintProtocol)
+            }
+            try container.encodeIfPresent(
+                r.toolConstraintModels, forKey: .toolConstraintModels)
 
         case .heartbeat(let h):
             try container.encode(TypeValue.heartbeat, forKey: .type)
@@ -762,6 +786,12 @@ extension ProviderMessage: Codable {
             try container.encode(TypeValue.modelsUpdate, forKey: .type)
             // Reuse the ModelInfo encoding shared with `register`'s models[].
             try container.encode(u.models, forKey: .models)
+            if let version = u.toolConstraintProtocol, version != 0 {
+                try container.encode(
+                    version, forKey: .toolConstraintProtocol)
+            }
+            try container.encodeIfPresent(
+                u.toolConstraintModels, forKey: .toolConstraintModels)
 
         case .prefixCacheLookup(let receipt):
             try container.encode(TypeValue.prefixCacheLookup, forKey: .type)
@@ -849,7 +879,11 @@ extension ProviderMessage: Codable {
                 apnsEnvironment: try container.decodeIfPresent(String.self, forKey: .apnsEnvironment),
                 prefixCacheProtocol: try container.decodeIfPresent(Int.self, forKey: .prefixCacheProtocol),
                 prefixCacheV2Models: try container.decodeIfPresent(
-                    [PrefixCacheV2Capability].self, forKey: .prefixCacheV2Models)
+                    [PrefixCacheV2Capability].self, forKey: .prefixCacheV2Models),
+                toolConstraintProtocol: try container.decodeIfPresent(
+                    Int.self, forKey: .toolConstraintProtocol),
+                toolConstraintModels: try container.decodeIfPresent(
+                    [String].self, forKey: .toolConstraintModels)
             ))
 
         case .heartbeat:
@@ -954,7 +988,11 @@ extension ProviderMessage: Codable {
 
         case .modelsUpdate:
             self = .modelsUpdate(ModelsUpdate(
-                models: try container.decode([ModelInfo].self, forKey: .models)
+                models: try container.decode([ModelInfo].self, forKey: .models),
+                toolConstraintProtocol: try container.decodeIfPresent(
+                    Int.self, forKey: .toolConstraintProtocol),
+                toolConstraintModels: try container.decodeIfPresent(
+                    [String].self, forKey: .toolConstraintModels)
             ))
 
         case .prefixCacheLookup:
@@ -1044,6 +1082,7 @@ public enum CoordinatorMessage: Sendable, Equatable {
         public var cacheReceiptNonce: String?
         public var cacheScope: String?
         public var prefixCacheProtocol: Int?
+        public var toolSchemaMetadataProtocol: Int?
 
         public init(
             requestId: String,
@@ -1051,7 +1090,8 @@ public enum CoordinatorMessage: Sendable, Equatable {
             encryptedBody: EncryptedPayload? = nil,
             cacheReceiptNonce: String? = nil,
             cacheScope: String? = nil,
-            prefixCacheProtocol: Int? = nil
+            prefixCacheProtocol: Int? = nil,
+            toolSchemaMetadataProtocol: Int? = nil
         ) {
             self.requestId = requestId
             self.body = body
@@ -1059,6 +1099,7 @@ public enum CoordinatorMessage: Sendable, Equatable {
             self.cacheReceiptNonce = cacheReceiptNonce
             self.cacheScope = cacheScope
             self.prefixCacheProtocol = prefixCacheProtocol
+            self.toolSchemaMetadataProtocol = toolSchemaMetadataProtocol
         }
     }
 
@@ -1173,6 +1214,7 @@ extension CoordinatorMessage: Codable {
         case cacheReceiptNonce = "cache_receipt_nonce"
         case cacheScope = "cache_scope"
         case prefixCacheProtocol = "prefix_cache_protocol"
+        case toolSchemaMetadataProtocol = "tool_schema_metadata_protocol"
         case nonce, timestamp
         case verified, mismatches
         case modelId = "model_id"
@@ -1194,6 +1236,9 @@ extension CoordinatorMessage: Codable {
             try container.encodeIfPresent(r.cacheReceiptNonce, forKey: .cacheReceiptNonce)
             try container.encodeIfPresent(r.cacheScope, forKey: .cacheScope)
             try container.encodeIfPresent(r.prefixCacheProtocol, forKey: .prefixCacheProtocol)
+            try container.encodeIfPresent(
+                r.toolSchemaMetadataProtocol,
+                forKey: .toolSchemaMetadataProtocol)
 
         case .cancel(let c):
             try container.encode(TypeValue.cancel, forKey: .type)
@@ -1250,7 +1295,9 @@ extension CoordinatorMessage: Codable {
                 cacheReceiptNonce: try container.decodeIfPresent(String.self, forKey: .cacheReceiptNonce),
                 cacheScope: try container.decodeIfPresent(String.self, forKey: .cacheScope),
                 prefixCacheProtocol: try container.decodeIfPresent(
-                    Int.self, forKey: .prefixCacheProtocol)
+                    Int.self, forKey: .prefixCacheProtocol),
+                toolSchemaMetadataProtocol: try container.decodeIfPresent(
+                    Int.self, forKey: .toolSchemaMetadataProtocol)
             ))
 
         case .cancel:

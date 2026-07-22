@@ -54,10 +54,15 @@ func parseStreamChunkChoices(chunk string) []streamChunkChoice {
 // events (response.created / response.in_progress / response.completed /
 // response.incomplete). All spec-required fields are present so strict SDK
 // parsers accept the snapshot.
-func responsesSnapshot(responseID string, createdAt int64, model, status string, output []any, usage *types.ResponsesUsage, incomplete *types.ResponsesIncompleteDetail) map[string]any {
+func responsesSnapshot(responseID string, createdAt int64, model, status string, output []any, usage *types.ResponsesUsage, incomplete *types.ResponsesIncompleteDetail, policies ...registry.RequestTraits) map[string]any {
 	if output == nil {
 		output = []any{}
 	}
+	var traits registry.RequestTraits
+	if len(policies) > 0 {
+		traits = policies[0]
+	}
+	toolChoice, parallel := responsesToolPolicy(traits)
 	snap := map[string]any{
 		"id":                   responseID,
 		"object":               "response",
@@ -70,12 +75,12 @@ func responsesSnapshot(responseID string, createdAt int64, model, status string,
 		"max_output_tokens":    nil,
 		"model":                model,
 		"output":               output,
-		"parallel_tool_calls":  true,
+		"parallel_tool_calls":  parallel,
 		"previous_response_id": nil,
 		"store":                false,
 		"temperature":          nil,
 		"text":                 map[string]any{"format": map[string]any{"type": "text"}},
-		"tool_choice":          "auto",
+		"tool_choice":          toolChoice,
 		"tools":                []any{},
 		"top_p":                nil,
 		"truncation":           "disabled",
@@ -91,6 +96,25 @@ func responsesSnapshot(responseID string, createdAt int64, model, status string,
 		snap["incomplete_details"] = incomplete
 	}
 	return snap
+}
+
+func responsesToolPolicy(traits registry.RequestTraits) (any, bool) {
+	if traits.ToolChoiceMode == "" {
+		return "auto", true
+	}
+	switch traits.ToolChoiceMode {
+	case string(toolChoiceNone):
+		return "none", traits.ParallelToolCalls
+	case string(toolChoiceRequired):
+		return "required", traits.ParallelToolCalls
+	case string(toolChoiceNamed):
+		return map[string]any{
+			"type": "function",
+			"name": traits.ToolChoiceName,
+		}, traits.ParallelToolCalls
+	default:
+		return "auto", traits.ParallelToolCalls
+	}
 }
 
 // responsesStreamEmitter translates provider chat.completion.chunk deltas into
@@ -118,9 +142,9 @@ type responsesStreamEmitter struct {
 	messageItemID string
 	contentBuf    strings.Builder
 
-	fnCalls     map[int]*streamFnState
-	fnOrder     []int
-	sawToolCall bool
+	activeFnByIndex map[int]*streamFnState
+	fnOrder         []*streamFnState
+	sawToolCall     bool
 
 	finishReason string
 }
@@ -131,19 +155,20 @@ type streamFnState struct {
 	outputIndex int
 	itemID      string
 	callID      string
+	wireID      string
 	name        string
 	argsBuf     strings.Builder
 }
 
 func newResponsesStreamEmitter(w http.ResponseWriter, flusher http.Flusher, pr *registry.PendingRequest, responseID string, createdAt int64) *responsesStreamEmitter {
 	return &responsesStreamEmitter{
-		w:          w,
-		flusher:    flusher,
-		pr:         pr,
-		responseID: responseID,
-		createdAt:  createdAt,
-		model:      consumerModel(pr),
-		fnCalls:    map[int]*streamFnState{},
+		w:               w,
+		flusher:         flusher,
+		pr:              pr,
+		responseID:      responseID,
+		createdAt:       createdAt,
+		model:           consumerModel(pr),
+		activeFnByIndex: map[int]*streamFnState{},
 	}
 }
 
@@ -163,10 +188,10 @@ func (e *responsesStreamEmitter) emit(eventType string, fields map[string]any) {
 // start emits response.created and response.in_progress.
 func (e *responsesStreamEmitter) start() {
 	e.emit("response.created", map[string]any{
-		"response": responsesSnapshot(e.responseID, e.createdAt, e.model, "in_progress", nil, nil, nil),
+		"response": responsesSnapshot(e.responseID, e.createdAt, e.model, "in_progress", nil, nil, nil, e.pr.Traits),
 	})
 	e.emit("response.in_progress", map[string]any{
-		"response": responsesSnapshot(e.responseID, e.createdAt, e.model, "in_progress", nil, nil, nil),
+		"response": responsesSnapshot(e.responseID, e.createdAt, e.model, "in_progress", nil, nil, nil, e.pr.Traits),
 	})
 }
 
@@ -334,12 +359,29 @@ func (e *responsesStreamEmitter) closeMessage() {
 // for several calls may interleave, so each index gets its own item state and
 // reserved output_index.
 func (e *responsesStreamEmitter) appendToolCall(tc streamToolCallDelta) {
-	st, ok := e.fnCalls[tc.Index]
-	if !ok {
+	st := e.activeFnByIndex[tc.Index]
+	// Legacy provider builds emit every parallel call at wire index 0 (the
+	// engine at this branch's pin assigns distinct indices — see
+	// MLXOpenAIService.nextToolCallIndex — but the fleet updates slowly). A
+	// different non-empty ID on an active index starts a new logical call;
+	// later ID-less argument fragments continue the newest call. This is the
+	// same identity rule used by the non-streaming toolCallAccumulator.
+	if st != nil && tc.ID != "" && st.wireID != "" && tc.ID != st.wireID {
+		st = nil
+	}
+	if st == nil {
+		// Same cap as the non-streaming accumulator: past the limit the new
+		// logical call is dropped and its wire index forgotten, so the
+		// dropped call's later id-less fragments can never accumulate onto
+		// a kept call (they re-enter here and are dropped again).
+		if len(e.fnOrder) >= maxLogicalToolCalls {
+			delete(e.activeFnByIndex, tc.Index)
+			return
+		}
 		e.closeReasoning()
 		e.closeMessage()
 		e.sawToolCall = true
-		st = &streamFnState{outputIndex: e.outputIndex}
+		st = &streamFnState{outputIndex: e.outputIndex, wireID: tc.ID}
 		e.outputIndex++
 		st.itemID = responseItemID("fc", e.pr.RequestID, st.outputIndex)
 		st.callID = tc.ID
@@ -347,8 +389,8 @@ func (e *responsesStreamEmitter) appendToolCall(tc streamToolCallDelta) {
 			st.callID = responseItemID("call", e.pr.RequestID, st.outputIndex)
 		}
 		st.name = tc.Function.Name
-		e.fnCalls[tc.Index] = st
-		e.fnOrder = append(e.fnOrder, tc.Index)
+		e.activeFnByIndex[tc.Index] = st
+		e.fnOrder = append(e.fnOrder, st)
 		e.emit("response.output_item.added", map[string]any{
 			"output_index": st.outputIndex,
 			"item": map[string]any{
@@ -362,6 +404,7 @@ func (e *responsesStreamEmitter) appendToolCall(tc streamToolCallDelta) {
 		})
 	}
 	if tc.ID != "" {
+		st.wireID = tc.ID
 		st.callID = tc.ID
 	}
 	if tc.Function.Name != "" {
@@ -380,11 +423,11 @@ func (e *responsesStreamEmitter) appendToolCall(tc streamToolCallDelta) {
 // closeFunctionCalls finalizes all open function_call items in the order they
 // were opened, which matches their reserved output indexes.
 func (e *responsesStreamEmitter) closeFunctionCalls() {
-	for _, idx := range e.fnOrder {
-		e.closeFunctionCall(e.fnCalls[idx])
-		delete(e.fnCalls, idx)
+	for _, state := range e.fnOrder {
+		e.closeFunctionCall(state)
 	}
 	e.fnOrder = nil
+	clear(e.activeFnByIndex)
 }
 
 func (e *responsesStreamEmitter) closeFunctionCall(st *streamFnState) {
@@ -424,7 +467,7 @@ func (e *responsesStreamEmitter) hasToolCalls() bool {
 // (response.completed, or response.incomplete when generation was truncated).
 func (e *responsesStreamEmitter) finish(usage protocol.UsageInfo) {
 	finishReason := effectiveFinishReason(e.finishReason, e.hasToolCalls(), usage, e.pr.RequestedMaxTokens)
-	if len(e.output) == 0 && !e.messageOpen && !e.reasoningOpen && len(e.fnCalls) == 0 {
+	if len(e.output) == 0 && !e.messageOpen && !e.reasoningOpen && len(e.fnOrder) == 0 {
 		e.ensureMessageOpen()
 	}
 	e.closeOpenItems()
@@ -439,7 +482,9 @@ func (e *responsesStreamEmitter) finish(usage protocol.UsageInfo) {
 		status = "incomplete"
 		eventType = "response.incomplete"
 	}
-	snap := responsesSnapshot(e.responseID, e.createdAt, e.model, status, e.output, &u, incomplete)
+	snap := responsesSnapshot(
+		e.responseID, e.createdAt, e.model, status, e.output, &u, incomplete,
+		e.pr.Traits)
 	if e.pr.SESignature != "" {
 		snap["se_signature"] = e.pr.SESignature
 		snap["response_hash"] = e.pr.ResponseHash

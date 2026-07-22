@@ -558,9 +558,17 @@ func rewriteChunkModel(chunk string, pr *registry.PendingRequest) string {
 // pass through unchanged (publicModel == buildModel). ok=false means the alias
 // currently has no usable build; the caller should surface a model_unavailable
 // error.
-func (s *Server) resolveRequestedModel(parsed map[string]any, rawBody []byte, requested string, allowedProviderSerials []string, policy selfRoutePolicy) (buildModel, publicModel string, newRawBody []byte, ok bool) {
-	buildID, isAlias, resolved := s.registry.ResolveModelConstrained(
-		requested, allowedProviderSerials, policy.ownerAccountID, policy.enabled, policy.prefer)
+func (s *Server) resolveRequestedModel(
+	parsed map[string]any,
+	rawBody []byte,
+	requested string,
+	allowedProviderSerials []string,
+	policy selfRoutePolicy,
+	traits registry.RequestTraits,
+) (buildModel, publicModel string, newRawBody []byte, ok bool) {
+	buildID, isAlias, resolved := s.registry.ResolveModelConstrainedWithTraits(
+		requested, allowedProviderSerials, policy.ownerAccountID,
+		policy.enabled, policy.prefer, traits)
 	if !resolved {
 		return "", requested, rawBody, false
 	}
@@ -1366,6 +1374,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawBody := prelude.rawBody
+	originalRawBody := prelude.originalRawBody
 	parsed := prelude.parsed
 	model := prelude.model
 
@@ -1433,13 +1442,55 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// coordinator-stamped provider AccountID, so nothing here is forgeable.
 	policy := s.resolveSelfRoutePolicy(r)
 
+	// Derive request-shape traits before alias resolution. During a
+	// mixed-version rollout Desired may have ordinary providers while Previous
+	// has the only provider capable of enforcing this exact tool policy.
+	requiresVision := detectMediaRequirement(parsed)
+	hasTools := requestHasTools(parsed)
+	isResponsesAPI := input != nil && len(messages) == 0
+	constraintBody := originalRawBody
+	if isResponsesAPI {
+		constraintBody, err = promptcontract.LowerProviderBody(
+			promptcontract.EndpointResponses, originalRawBody)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorResponse(
+				"invalid_request_error", err.Error()))
+			return
+		}
+	}
+	validatedPolicy, validationErr := validateToolConstraintPolicy(constraintBody)
+	if validationErr != nil {
+		s.recordToolConstraintMetric(validatedPolicy.mode, "compile_rejection")
+		writeToolConstraintValidationError(w, validationErr)
+		return
+	}
+	validatedMode := validatedPolicy.mode
+	toolChoiceName := validatedPolicy.name
+	parallelToolCalls := validatedPolicy.parallel
+	s.recordToolConstraintMetric(validatedMode, "requested")
+	requiresToolConstraint := validatedMode.requiresGrammar()
+	if requiresToolConstraint && requiresVision {
+		writeJSON(w, http.StatusBadRequest, errorResponse(
+			"invalid_request_error",
+			"inference-enforced tool_choice is not supported for multimodal requests",
+			withParam("tool_choice")))
+		return
+	}
+	aliasTraits := registry.RequestTraits{
+		HasTools:               hasTools,
+		RequiresToolConstraint: requiresToolConstraint,
+		ToolChoiceMode:         string(validatedMode),
+		ToolChoiceName:         toolChoiceName,
+		ParallelToolCalls:      parallelToolCalls,
+	}
+
 	// Resolve a public alias (e.g. "gemma-4-26b") to a concrete build id, now
 	// that routing constraints (serial allowlist / self-route) are known so the
 	// pick only considers builds the constrained provider set can actually
 	// serve. From here on `model` is the build (routing/billing/serving) while
 	// `publicModel` is echoed back so the consumer never sees the quant.
 	buildModel, publicModel, resolvedBody, ok := s.resolveRequestedModel(
-		parsed, rawBody, model, allowedProviderSerials, policy)
+		parsed, rawBody, model, allowedProviderSerials, policy, aliasTraits)
 	if !ok {
 		s.recordRejection(rejectionInfo{
 			r:               r,
@@ -1457,20 +1508,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	model, rawBody = buildModel, resolvedBody
 
-	// Vision gating: a request carrying image/video input must land on a provider
-	// advertising a vision-capable (VLM) build of this model, or the media is
-	// silently dropped and the answer is image-blind. Fail fast with a clear error
-	// when the fleet has no such provider (e.g. before the gemma fleet finishes
-	// updating to 0.6.0); the routing layer enforces the same gate per dispatch.
-	requiresVision := detectMediaRequirement(parsed)
-	// Tool-bearing requests are routed only to providers that can render tool
-	// schemas without crashing (version floor + template_render_ok gate);
-	// detected here, alongside the media gate, while the parsed body is hot.
-	hasTools := requestHasTools(parsed)
 	// Shared media/tools fail-fast. Chat completions additionally rejects media
 	// sent via the Responses API surface (input-without-messages), because the
 	// Responses→chat lowering doesn't carry image/video parts through.
 	if s.visionToolsFailFast(w, model, publicModel, requiresVision, hasTools,
+		requiresToolConstraint,
 		input != nil && len(messages) == 0, policy, allowedProviderSerials) {
 		return
 	}
@@ -1479,8 +1521,6 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if s.rejectRemoteMediaURLs(w, r, parsed, model, publicModel, requiresVision, hasTools) {
 		return
 	}
-
-	isResponsesAPI := input != nil && len(messages) == 0
 
 	// Inject model-specific defaults from the registry: reasoning_parser
 	// and max_tokens bound. Single DB lookup (cached for platform prices).
@@ -1567,10 +1607,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	routingTraitsForModel := func(candidateModel string) registry.RequestTraits {
 		candidateBody, bodyErr := providerBodyForModel(candidateModel)
 		if bodyErr != nil {
-			return registry.RequestTraits{HasTools: hasTools}
+			return registry.RequestTraits{
+				HasTools:               hasTools,
+				RequiresToolConstraint: requiresToolConstraint,
+				ToolChoiceMode:         string(validatedMode),
+				ToolChoiceName:         toolChoiceName,
+				ParallelToolCalls:      parallelToolCalls,
+			}
 		}
 		traits, _ := routingTraitsForProviderBody(
 			hasTools, candidateBody, requiresVision)
+		traits.RequiresToolConstraint = requiresToolConstraint
+		traits.ToolChoiceMode = string(validatedMode)
+		traits.ToolChoiceName = toolChoiceName
+		traits.ParallelToolCalls = parallelToolCalls
 		return traits
 	}
 	providerBodyErrorForModel := func(candidateModel string) error {
@@ -1750,6 +1800,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		requestedMaxTokens:     requestedMaxTokens,
 		requiresVision:         requiresVision,
 		hasTools:               hasTools,
+		requiresToolConstraint: requiresToolConstraint,
+		toolChoiceMode:         string(validatedMode),
+		toolChoiceName:         toolChoiceName,
+		parallelToolCalls:      parallelToolCalls,
 		isResponsesAPI:         isResponsesAPI,
 		stream:                 stream,
 		policy:                 policy,
@@ -2210,7 +2264,9 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 										writeJSON(w, http.StatusBadGateway, errorResponse("provider_error", "invalid provider response"))
 										return
 									}
-									respObj := chatCompletionToResponses(chatResp, consumerModel(pr), pr.SESignature, pr.ResponseHash)
+									respObj := chatCompletionToResponses(
+										chatResp, consumerModel(pr), pr.SESignature,
+										pr.ResponseHash, pr.Traits)
 									s.noteInferenceSuccess(pr)
 									writeJSON(w, http.StatusOK, respObj)
 									return
@@ -2247,7 +2303,10 @@ func (s *Server) handleNonStreamingResponseWithFirstChunk(w http.ResponseWriter,
 					}
 					var resp any
 					if pr.IsResponsesAPI {
-						resp = buildResponsesResponse(pr.RequestID, consumerModel(pr), msg, usage, pr.RequestedMaxTokens, pr.SESignature, pr.ResponseHash)
+						resp = buildResponsesResponse(
+							pr.RequestID, consumerModel(pr), msg, usage,
+							pr.RequestedMaxTokens, pr.SESignature, pr.ResponseHash,
+							pr.Traits)
 					} else if pr.ConsumerEndpoint == completionsEndpoint ||
 						pr.ConsumerEndpoint == messagesEndpoint {
 						resp = buildGenericEndpointResponse(pr, msg, usage)
@@ -2528,9 +2587,11 @@ func toolCallWireIndex(tc map[string]any) int {
 
 // toolCallAccumulator reconstructs logical tool calls from streamed deltas.
 // Logical calls are kept in ARRIVAL order (calls) because a wire index is
-// NOT unique: our engine emits every parallel call with index 0 (E6), so
-// index-keyed storage alone would let a second call overwrite the first's
-// id/name and concatenate both argument streams into one corrupted call.
+// NOT unique: legacy provider builds emit every parallel call with index 0
+// (E6; the engine at this branch's pin assigns distinct indices, but the
+// fleet updates slowly), so index-keyed storage alone would let a second
+// call overwrite the first's id/name and concatenate both argument streams
+// into one corrupted call.
 // activeByIndex maps each wire index to the position (in calls) of its
 // CURRENT logical call — the one still receiving that index's id-less
 // argument fragments; a delta whose non-empty id DIFFERS from that entry's
@@ -3085,16 +3146,16 @@ func appendResponsesOutputItems(output []any, requestID string, msg extractedMes
 // finalizeResponsesEnvelope fills the spec-required envelope fields of a
 // Responses object: status derived from incomplete_details, and the
 // always-present defaults (tool_choice, tools, metadata, parallel_tool_calls).
-func finalizeResponsesEnvelope(r *types.ResponsesResponse) {
+func finalizeResponsesEnvelope(
+	r *types.ResponsesResponse,
+	traits registry.RequestTraits,
+) {
 	if r.IncompleteDetail != nil {
 		r.Status = "incomplete"
 	} else {
 		r.Status = "completed"
 	}
-	r.ParallelToolCalls = true
-	if r.ToolChoice == nil {
-		r.ToolChoice = "auto"
-	}
+	r.ToolChoice, r.ParallelToolCalls = responsesToolPolicy(traits)
 	if r.Tools == nil {
 		r.Tools = []any{}
 	}
@@ -3103,7 +3164,7 @@ func finalizeResponsesEnvelope(r *types.ResponsesResponse) {
 	}
 }
 
-func buildResponsesResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, requestedMax int, seSignature, responseHash string) types.ResponsesResponse {
+func buildResponsesResponse(requestID, model string, msg extractedMessage, usage protocol.UsageInfo, requestedMax int, seSignature, responseHash string, policies ...registry.RequestTraits) types.ResponsesResponse {
 	reasoningTokens := resolveReasoningTokens(usage, msg.Reasoning)
 	finishReason := effectiveFinishReason(msg.FinishReason, len(msg.ToolCalls) > 0, usage, requestedMax)
 	resp := types.ResponsesResponse{
@@ -3115,7 +3176,11 @@ func buildResponsesResponse(requestID, model string, msg extractedMessage, usage
 		Usage:            buildResponsesUsage(uint64(usage.PromptTokens), uint64(usage.CompletionTokens), reasoningTokens, uint64(usage.CachedTokens)),
 		IncompleteDetail: buildResponsesIncompleteDetails(finishReason),
 	}
-	finalizeResponsesEnvelope(&resp)
+	var traits registry.RequestTraits
+	if len(policies) > 0 {
+		traits = policies[0]
+	}
+	finalizeResponsesEnvelope(&resp, traits)
 	if seSignature != "" {
 		resp.SESignature = seSignature
 		resp.ResponseHash = responseHash
@@ -3144,7 +3209,7 @@ func chatUsageToResponsesUsage(resp types.ChatCompletionResponse, reasoning stri
 	return buildResponsesUsage(uint64(resp.Usage.PromptTokens), uint64(resp.Usage.CompletionTokens), uint64(reasoningTokens), uint64(cachedTokens))
 }
 
-func chatCompletionToResponses(resp types.ChatCompletionResponse, requestedModel, seSignature, responseHash string) types.ResponsesResponse {
+func chatCompletionToResponses(resp types.ChatCompletionResponse, requestedModel, seSignature, responseHash string, policies ...registry.RequestTraits) types.ResponsesResponse {
 	requestID := strings.TrimPrefix(resp.ID, "chatcmpl-")
 	if requestID == "" {
 		requestID = uuid.NewString()
@@ -3174,7 +3239,11 @@ func chatCompletionToResponses(resp types.ChatCompletionResponse, requestedModel
 	if finishReason != "" && finishReason != "stop" {
 		r.IncompleteDetail = buildResponsesIncompleteDetails(finishReason)
 	}
-	finalizeResponsesEnvelope(&r)
+	var traits registry.RequestTraits
+	if len(policies) > 0 {
+		traits = policies[0]
+	}
+	finalizeResponsesEnvelope(&r, traits)
 	if seSignature != "" {
 		r.SESignature = seSignature
 		r.ResponseHash = responseHash
@@ -3487,8 +3556,13 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	rawBody := prelude.rawBody
+	originalRawBody := prelude.originalRawBody
 	parsed := prelude.parsed
 	model := prelude.model
+	endpointKind := promptcontract.EndpointCompletions
+	if endpoint == "/v1/messages" {
+		endpointKind = promptcontract.EndpointMessages
+	}
 
 	allowedProviderSerials, hasProviderAllowlist, err := parseProviderSerialAllowlist(parsed)
 	if err != nil {
@@ -3512,11 +3586,53 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 	// "Use my own machine, for free" opt-in (see handleChatCompletions).
 	policy := s.resolveSelfRoutePolicy(r)
 
+	// Constraint validation needs the lowered chat shape. Endpoint-native
+	// shapes the contract lowering cannot express — multi-prompt completions,
+	// media-bearing messages — have always been forwarded verbatim (see the
+	// inferenceBody fallback below), so a lowering failure is only terminal
+	// for requests that actually carry tool policy to validate; tool-less
+	// unsupported shapes keep the pre-existing native-forward behavior with
+	// the neutral auto defaults.
+	validatedPolicy := validatedToolConstraintPolicy{
+		mode: toolChoiceAuto, parallel: true,
+	}
+	constraintBody, constraintLowerErr := promptcontract.LowerProviderBody(
+		endpointKind, originalRawBody)
+	if constraintLowerErr == nil {
+		var validationErr error
+		validatedPolicy, validationErr = validateToolConstraintPolicy(constraintBody)
+		if validationErr != nil {
+			s.recordToolConstraintMetric(validatedPolicy.mode, "compile_rejection")
+			writeToolConstraintValidationError(w, validationErr)
+			return
+		}
+	} else if _, hasToolChoice := parsed["tool_choice"]; hasToolChoice || requestHasTools(parsed) {
+		s.recordToolConstraintMetric(validatedPolicy.mode, "compile_rejection")
+		writeJSON(w, http.StatusBadRequest, errorResponse(
+			"invalid_request_error", constraintLowerErr.Error()))
+		return
+	}
+	validatedMode := validatedPolicy.mode
+	toolChoiceName := validatedPolicy.name
+	parallelToolCalls := validatedPolicy.parallel
+	s.recordToolConstraintMetric(validatedMode, "requested")
+	requiresToolConstraint := validatedMode.requiresGrammar()
+	requiresVision := detectMediaRequirement(parsed)
+	hasTools := requestHasTools(parsed)
+	aliasTraits := registry.RequestTraits{
+		HasTools:               hasTools,
+		RequiresToolConstraint: requiresToolConstraint,
+		ToolChoiceMode:         string(validatedMode),
+		ToolChoiceName:         toolChoiceName,
+		ParallelToolCalls:      parallelToolCalls,
+	}
+
 	// Resolve a public alias to a concrete build id, constraint-aware (after
 	// allowlist/self-route are known). resolveRequestedModel rewrites
 	// parsed["model"] to the build; this handler builds the provider body fresh
 	// from `parsed` (inferenceBody below), so rawBody isn't threaded here.
-	buildModel, publicModel, _, ok := s.resolveRequestedModel(parsed, rawBody, model, allowedProviderSerials, policy)
+	buildModel, publicModel, _, ok := s.resolveRequestedModel(
+		parsed, rawBody, model, allowedProviderSerials, policy, aliasTraits)
 	if !ok {
 		s.recordRejection(rejectionInfo{
 			r:               r,
@@ -3550,13 +3666,11 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			fmt.Sprintf("model %q is not available — see /v1/models for supported models", publicModel), withParam("model")))
 		return
 	}
-
 	// Shared media/tools fail-fast (see visionToolsFailFast). Completions and
 	// Anthropic bodies share the top-level "tools" field; neither has the
 	// Responses-API media surface, so rejectResponsesMedia is false here.
-	requiresVision := detectMediaRequirement(parsed)
-	hasTools := requestHasTools(parsed)
 	if s.visionToolsFailFast(w, model, publicModel, requiresVision, hasTools,
+		requiresToolConstraint,
 		false, policy, allowedProviderSerials) {
 		return
 	}
@@ -3653,10 +3767,6 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		return info
 	}
 
-	endpointKind := promptcontract.EndpointCompletions
-	if endpoint == "/v1/messages" {
-		endpointKind = promptcontract.EndpointMessages
-	}
 	lowerGenericBodyForModel := func(candidateModel string) ([]byte, []byte, error) {
 		candidateParsed := make(map[string]any, len(parsed))
 		for key, value := range parsed {
@@ -3675,6 +3785,10 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		_, candidateBody, _ := lowerGenericBodyForModel(candidateModel)
 		traits, _ := routingTraitsForProviderBody(
 			hasTools, candidateBody, requiresVision)
+		traits.RequiresToolConstraint = requiresToolConstraint
+		traits.ToolChoiceMode = string(validatedMode)
+		traits.ToolChoiceName = toolChoiceName
+		traits.ParallelToolCalls = parallelToolCalls
 		return traits
 	}
 	providerBodyErrorForModel := func(candidateModel string) error {
@@ -3691,6 +3805,10 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 		endpointBody, inferenceBody, loweringErr = lowerGenericBodyForModel(newModel)
 		routingTraits, _ = routingTraitsForProviderBody(
 			hasTools, inferenceBody, requiresVision)
+		routingTraits.RequiresToolConstraint = requiresToolConstraint
+		routingTraits.ToolChoiceMode = string(validatedMode)
+		routingTraits.ToolChoiceName = toolChoiceName
+		routingTraits.ParallelToolCalls = parallelToolCalls
 		return true
 	}
 	refreshGenericBody(model)
@@ -3847,22 +3965,26 @@ func (s *Server) handleGenericInference(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		routeState := &dispatchState{
-			s:                     s,
-			r:                     r,
-			model:                 model,
-			publicModel:           publicModel,
-			consumerKey:           consumerKey,
-			consumerLocation:      consumerLocation,
-			estimatedPromptTokens: estimatedPromptTokens,
-			requestedMaxTokens:    requestedMaxTokens,
-			requiresVision:        requiresVision,
-			hasTools:              hasTools,
-			policy:                policy,
-			cachePlan:             cachePlan,
-			requestID:             requestID,
-			attempt:               pr.Attempt,
-			provider:              provider,
-			pr:                    pr,
+			s:                      s,
+			r:                      r,
+			model:                  model,
+			publicModel:            publicModel,
+			consumerKey:            consumerKey,
+			consumerLocation:       consumerLocation,
+			estimatedPromptTokens:  estimatedPromptTokens,
+			requestedMaxTokens:     requestedMaxTokens,
+			requiresVision:         requiresVision,
+			hasTools:               hasTools,
+			requiresToolConstraint: requiresToolConstraint,
+			toolChoiceMode:         string(validatedMode),
+			toolChoiceName:         toolChoiceName,
+			parallelToolCalls:      parallelToolCalls,
+			policy:                 policy,
+			cachePlan:              cachePlan,
+			requestID:              requestID,
+			attempt:                pr.Attempt,
+			provider:               provider,
+			pr:                     pr,
 		}
 		if bodyTooLarge {
 			routeState.recordProviderBodyTooLargeRoute(provider, pr, decision)
@@ -4019,21 +4141,25 @@ reserveProvider:
 		s.kickColdDispatch(model)
 		s.ddIncr("routing.decisions", []string{"model:" + model, "model_type:" + s.registry.ModelType(model), "outcome:queued"})
 		routeState := &dispatchState{
-			s:                     s,
-			r:                     r,
-			model:                 model,
-			publicModel:           publicModel,
-			consumerKey:           consumerKey,
-			consumerLocation:      consumerLocation,
-			estimatedPromptTokens: estimatedPromptTokens,
-			requestedMaxTokens:    requestedMaxTokens,
-			requiresVision:        requiresVision,
-			hasTools:              hasTools,
-			policy:                policy,
-			cachePlan:             cachePlan,
-			requestID:             requestID,
-			attempt:               pr.Attempt,
-			pr:                    pr,
+			s:                      s,
+			r:                      r,
+			model:                  model,
+			publicModel:            publicModel,
+			consumerKey:            consumerKey,
+			consumerLocation:       consumerLocation,
+			estimatedPromptTokens:  estimatedPromptTokens,
+			requestedMaxTokens:     requestedMaxTokens,
+			requiresVision:         requiresVision,
+			hasTools:               hasTools,
+			requiresToolConstraint: requiresToolConstraint,
+			toolChoiceMode:         string(validatedMode),
+			toolChoiceName:         toolChoiceName,
+			parallelToolCalls:      parallelToolCalls,
+			policy:                 policy,
+			cachePlan:              cachePlan,
+			requestID:              requestID,
+			attempt:                pr.Attempt,
+			pr:                     pr,
 		}
 		routeState.recordRoutingDecisionFor(nil, pr, requestID, pr.Attempt, decision, "", "queued")
 		provider, err = s.registry.Queue().WaitForProviderContext(r.Context(), queuedReq)
@@ -4058,6 +4184,24 @@ reserveProvider:
 				refundReservation()
 				s.recordRejection(rejectionForGenericWithDecision("queue", "ttft_too_slow", http.StatusTooManyRequests, retryAfter*1000, queuedReq.Decision))
 				s.writeTTFTTooSlow(w, model, publicModel, bestTTFT, genericDeadline)
+				return
+			}
+			if errors.Is(err, registry.ErrQueueToolConstraintUnavailable) {
+				s.recordWarmPoolQueueState(model)
+				s.updateInferenceRouteOutcomeForPending(
+					pr, pendingRouteOutcome(
+						pr, "error", "model_capability_unsupported",
+						http.StatusServiceUnavailable))
+				refundReservation()
+				s.recordRejection(rejectionForGenericWithDecision(
+					"queue", "model_capability_unsupported",
+					http.StatusServiceUnavailable, 0, queuedReq.Decision))
+				writeJSON(w, http.StatusServiceUnavailable, errorResponse(
+					"model_unavailable",
+					fmt.Sprintf(
+						"no online provider for model %q supports inference-time tool_choice enforcement",
+						publicModel),
+					withParam("model")))
 				return
 			}
 			s.updateInferenceRouteOutcomeForPending(pr, pendingRouteOutcome(pr, "timeout", "queue_timeout", http.StatusTooManyRequests))
@@ -4104,22 +4248,26 @@ reserveProvider:
 		s.ddGauge("routing.effective_decode_tps", decision.EffectiveTPS, []string{"provider_id:" + provider.ID})
 	}
 	routeState := &dispatchState{
-		s:                     s,
-		r:                     r,
-		model:                 model,
-		publicModel:           publicModel,
-		consumerKey:           consumerKey,
-		consumerLocation:      consumerLocation,
-		estimatedPromptTokens: estimatedPromptTokens,
-		requestedMaxTokens:    requestedMaxTokens,
-		requiresVision:        requiresVision,
-		hasTools:              hasTools,
-		policy:                policy,
-		cachePlan:             cachePlan,
-		requestID:             requestID,
-		attempt:               pr.Attempt,
-		provider:              provider,
-		pr:                    pr,
+		s:                      s,
+		r:                      r,
+		model:                  model,
+		publicModel:            publicModel,
+		consumerKey:            consumerKey,
+		consumerLocation:       consumerLocation,
+		estimatedPromptTokens:  estimatedPromptTokens,
+		requestedMaxTokens:     requestedMaxTokens,
+		requiresVision:         requiresVision,
+		hasTools:               hasTools,
+		requiresToolConstraint: requiresToolConstraint,
+		toolChoiceMode:         string(validatedMode),
+		toolChoiceName:         toolChoiceName,
+		parallelToolCalls:      parallelToolCalls,
+		policy:                 policy,
+		cachePlan:              cachePlan,
+		requestID:              requestID,
+		attempt:                pr.Attempt,
+		provider:               provider,
+		pr:                     pr,
 	}
 	routeState.recordRoutingDecisionFor(provider, pr, requestID, pr.Attempt, decision, "", "")
 	pendingCleanup := true
@@ -4230,21 +4378,12 @@ reserveProvider:
 		return
 	}
 	timing.EncryptedAt = time.Now()
-	wireMsg := map[string]any{
-		"type":       protocol.TypeInferenceRequest,
-		"request_id": requestID,
-		"encrypted_body": map[string]string{
-			"ephemeral_public_key": encrypted.EphemeralPublicKey,
-			"ciphertext":           encrypted.Ciphertext,
-		},
-	}
-	if pr.CacheReceiptNonce != "" && pr.CacheScope != "" {
-		wireMsg["cache_receipt_nonce"] = pr.CacheReceiptNonce
-		wireMsg["cache_scope"] = pr.CacheScope
-		if pr.PrefixCacheProtocol > 0 {
-			wireMsg["prefix_cache_protocol"] = pr.PrefixCacheProtocol
-		}
-	}
+	wireMsg := providerInferenceWireMessage(
+		requestID,
+		encrypted.EphemeralPublicKey,
+		encrypted.Ciphertext,
+		pr,
+	)
 
 	pr.SessionPrivKey = &sessionKeys.PrivateKey
 	data, err := json.Marshal(wireMsg)

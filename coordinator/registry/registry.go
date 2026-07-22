@@ -526,6 +526,11 @@ type Provider struct {
 	// PrefixCacheV2Models is the validated, connection-scoped capability set
 	// keyed by concrete model ID. It is authoritative for v2 receipt identity.
 	PrefixCacheV2Models map[string]protocol.PrefixCacheV2Capability
+	// ToolConstraintProtocol advertises inference-time tool grammar support.
+	// ToolConstraintModels is the explicit concrete-model allowlist; required,
+	// named, and none choices never route by binary version inference alone.
+	ToolConstraintProtocol int
+	ToolConstraintModels   map[string]struct{}
 	// prefixCacheRevision changes whenever capability identity or quarantine
 	// state changes. Scheduler hints snapshot it and revalidate under p.mu so a
 	// concurrent heartbeat/proof failure cannot apply a stale cache discount.
@@ -1807,9 +1812,22 @@ func (r *Registry) ResolveModel(requested string) (buildID string, isAlias bool,
 // but absent from the request's allowed provider set (which would then fail at
 // dispatch). With no constraints it is identical to ResolveModel.
 func (r *Registry) ResolveModelConstrained(requested string, allowedSerials []string, ownerAccountID string, selfRouteOnly, preferOwner bool) (buildID string, isAlias bool, ok bool) {
-	if len(allowedSerials) == 0 && !selfRouteOnly && !preferOwner {
-		return r.ResolveModel(requested)
-	}
+	return r.ResolveModelConstrainedWithTraits(
+		requested, allowedSerials, ownerAccountID, selfRouteOnly, preferOwner,
+		RequestTraits{})
+}
+
+// ResolveModelConstrainedWithTraits extends ResolveModelConstrained with the
+// same request-shape gates used at dispatch. During a mixed-version rollout an
+// alias must not resolve to Desired merely because an old provider can serve
+// ordinary text when Previous has a provider capable of the requested shape.
+func (r *Registry) ResolveModelConstrainedWithTraits(
+	requested string,
+	allowedSerials []string,
+	ownerAccountID string,
+	selfRouteOnly, preferOwner bool,
+	traits RequestTraits,
+) (buildID string, isAlias bool, ok bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -1829,26 +1847,38 @@ func (r *Registry) ResolveModelConstrained(requested string, allowedSerials []st
 	now := time.Now()
 	hardConstrained := len(allowed) > 0 || selfRouteOnly
 	if preferOwner && ownerAccountID != "" {
-		if r.anyEligibleProviderCanRouteLocked(t.Desired, nil, ownerAccountID, true, true, now) {
+		if r.anyEligibleProviderCanRouteWithTraitsLocked(
+			t.Desired, nil, ownerAccountID, true, true, now, traits,
+		) {
 			return t.Desired, true, true
 		}
-		if t.Previous != "" && r.anyEligibleProviderCanRouteLocked(t.Previous, nil, ownerAccountID, true, true, now) {
+		if t.Previous != "" && r.anyEligibleProviderCanRouteWithTraitsLocked(
+			t.Previous, nil, ownerAccountID, true, true, now, traits,
+		) {
 			return t.Previous, true, true
 		}
 	}
 	if !hardConstrained {
-		if r.anyProviderCanRouteBuildLocked(t.Desired) {
+		if r.anyEligibleProviderCanRouteWithTraitsLocked(
+			t.Desired, nil, "", false, false, now, traits,
+		) {
 			return t.Desired, true, true
 		}
-		if t.Previous != "" && r.anyProviderCanRouteBuildLocked(t.Previous) {
+		if t.Previous != "" && r.anyEligibleProviderCanRouteWithTraitsLocked(
+			t.Previous, nil, "", false, false, now, traits,
+		) {
 			return t.Previous, true, true
 		}
 		return t.Desired, true, true
 	}
-	if t.Desired != "" && r.anyEligibleProviderCanRouteLocked(t.Desired, allowed, ownerAccountID, selfRouteOnly, preferOwner, now) {
+	if t.Desired != "" && r.anyEligibleProviderCanRouteWithTraitsLocked(
+		t.Desired, allowed, ownerAccountID, selfRouteOnly, preferOwner, now, traits,
+	) {
 		return t.Desired, true, true
 	}
-	if t.Previous != "" && r.anyEligibleProviderCanRouteLocked(t.Previous, allowed, ownerAccountID, selfRouteOnly, preferOwner, now) {
+	if t.Previous != "" && r.anyEligibleProviderCanRouteWithTraitsLocked(
+		t.Previous, allowed, ownerAccountID, selfRouteOnly, preferOwner, now, traits,
+	) {
 		return t.Previous, true, true
 	}
 	// Only HARD-constrained requests (serial pin / self-route-only) reach here —
@@ -1860,11 +1890,18 @@ func (r *Registry) ResolveModelConstrained(requested string, allowedSerials []st
 	return "", true, false
 }
 
-// anyEligibleProviderCanRouteLocked reports whether some provider both matches
-// the request's constraint (serial allowlist and/or self-route ownership) and
-// can route the build. Self-route to an OWNED machine relaxes trust and allows
-// private-only providers, mirroring snapshotProviderLocked. Caller holds r.mu.
-func (r *Registry) anyEligibleProviderCanRouteLocked(buildID string, allowedSerials map[string]struct{}, ownerAccountID string, selfRouteOnly, preferOwner bool, now time.Time) bool {
+// anyEligibleProviderCanRouteWithTraitsLocked reports whether some provider
+// matches the request's routing constraints and exact capability traits.
+// Self-route to an owned machine relaxes trust and allows private-only
+// providers, mirroring snapshotProviderLocked. Caller holds r.mu.
+func (r *Registry) anyEligibleProviderCanRouteWithTraitsLocked(
+	buildID string,
+	allowedSerials map[string]struct{},
+	ownerAccountID string,
+	selfRouteOnly, preferOwner bool,
+	now time.Time,
+	traits RequestTraits,
+) bool {
 	for _, p := range r.providers {
 		p.mu.Lock()
 		ok := func() bool {
@@ -1889,7 +1926,8 @@ func (r *Registry) anyEligibleProviderCanRouteLocked(buildID string, allowedSeri
 				minTrust = TrustNone
 				allowPrivate = true
 			}
-			return r.providerCanRouteBuildLocked(p, buildID, minTrust, now, allowPrivate)
+			return r.providerCanRouteBuildLocked(p, buildID, minTrust, now, allowPrivate) &&
+				r.providerEligibleForTraitsLocked(p, buildID, traits)
 		}()
 		p.mu.Unlock()
 		if ok {
@@ -1899,15 +1937,18 @@ func (r *Registry) anyEligibleProviderCanRouteLocked(buildID string, allowedSeri
 	return false
 }
 
-// providerCanRouteBuildLocked is the single source of truth for "could this
-// provider actually serve this build right now" — the same gates
-// snapshotProviderLocked applies (advertises the build + in catalog, not
-// offline/untrusted, public, trust ≥ floor, runtime verified, private-text
-// capable, fresh challenge, the dedicated-box rule, AND the model fits the
-// provider's RAM), minus the per-request capacity/headroom checks. Cold-but-
-// healthy providers pass (no warm slot required — they load on first demand).
-// Caller holds r.mu (RLock) and p.mu.
-func (r *Registry) providerCanRouteBuildLocked(p *Provider, buildID string, minTrust TrustLevel, now time.Time, allowPrivate bool) bool {
+// providerStructurallyCanRouteBuildLocked reports whether a provider has every
+// non-capacity prerequisite for serving a build. Transient load cooldowns and
+// slot states are intentionally excluded so queued requests can wait for a
+// reloading capable provider instead of being misreported as capability-
+// unavailable. Caller holds r.mu (RLock) and p.mu.
+func (r *Registry) providerStructurallyCanRouteBuildLocked(
+	p *Provider,
+	buildID string,
+	minTrust TrustLevel,
+	now time.Time,
+	allowPrivate bool,
+) bool {
 	// Catalog membership + dedicated-box isolation, mirroring
 	// providerPassesRoutingGatesLockedEx so alias routability (and rollout/drop
 	// measurement) matches actual dispatch routability: a dedicated-family build
@@ -1919,13 +1960,50 @@ func (r *Registry) providerCanRouteBuildLocked(p *Provider, buildID string, minT
 	if !r.providerServesRoutableModelLocked(p, buildID, allowPrivate) {
 		return false
 	}
-	if r.dispatchLoadCooldownActiveLocked(p.ID, buildID, now) {
-		return false
-	}
 	// Liveness/trust/privacy core. allowPrivate marks the owner self-route
 	// context (relax private-only admission); the trust-floor relaxation is
 	// folded into the minTrust the caller passes (TrustNone for owner routes).
 	if !r.providerLivenessGateLocked(p, minTrust, allowPrivate, now) {
+		return false
+	}
+	// Hardware fit: don't count a provider whose RAM can't hold the build (e.g.
+	// migrating to a larger build than the source). totalMemory prefers the
+	// backend-reported figure, matching snapshotProviderLocked. A resident
+	// running/idle slot has already demonstrated fit and must bypass the
+	// heuristic. Owner-only off-catalog models use their advertised size.
+	totalMemoryGB := float64(p.Hardware.MemoryGB)
+	slotState := "unknown"
+	if p.BackendCapacity != nil && p.BackendCapacity.TotalMemoryGB > 0 {
+		totalMemoryGB = p.BackendCapacity.TotalMemoryGB
+	}
+	if p.BackendCapacity != nil {
+		for _, slot := range p.BackendCapacity.Slots {
+			if slot.Model == buildID {
+				slotState = slot.State
+				break
+			}
+		}
+	}
+	return slotStateModelLoaded(slotState) ||
+		modelFitsHardware(
+			r.catalogMinRAMGbLocked(buildID),
+			r.modelSizeGBForFitLocked(p, buildID),
+			totalMemoryGB)
+}
+
+// providerCanRouteBuildLocked is the single source of truth for "could this
+// provider actually serve this build right now". It adds transient cooldown and
+// slot-state gates to providerStructurallyCanRouteBuildLocked, while still
+// omitting per-request capacity/headroom checks. Cold-but-healthy providers
+// pass (no warm slot required — they load on first demand). Caller holds r.mu
+// (RLock) and p.mu.
+func (r *Registry) providerCanRouteBuildLocked(p *Provider, buildID string, minTrust TrustLevel, now time.Time, allowPrivate bool) bool {
+	if !r.providerStructurallyCanRouteBuildLocked(
+		p, buildID, minTrust, now, allowPrivate,
+	) {
+		return false
+	}
+	if r.dispatchLoadCooldownActiveLocked(p.ID, buildID, now) {
 		return false
 	}
 	if p.BackendCapacity != nil {
@@ -1939,14 +2017,7 @@ func (r *Registry) providerCanRouteBuildLocked(p *Provider, buildID string, minT
 			break
 		}
 	}
-	// Hardware fit: don't count a provider whose RAM can't hold the build (e.g.
-	// migrating to a larger build than the source). totalMemory prefers the
-	// backend-reported figure, matching snapshotProviderLocked.
-	totalMemoryGB := float64(p.Hardware.MemoryGB)
-	if p.BackendCapacity != nil && p.BackendCapacity.TotalMemoryGB > 0 {
-		totalMemoryGB = p.BackendCapacity.TotalMemoryGB
-	}
-	return modelFitsHardware(r.catalogMinRAMGbLocked(buildID), r.catalogSizeGBLocked(buildID), totalMemoryGB)
+	return true
 }
 
 // anyProviderCanRouteBuildLocked reports whether at least one provider could
@@ -1980,9 +2051,37 @@ func (r *Registry) anyProviderCanRouteBuildLocked(buildID string) bool {
 // prefetch/swap can never take traffic. Returns build ids that were merged and
 // build ids that were dropped from this provider.
 func (r *Registry) MergeProviderModels(providerID string, models []protocol.ModelInfo) (merged, dropped []string) {
+	return r.mergeProviderModels(providerID, models, 0, nil)
+}
+
+// MergeProviderModelsWithCapabilities is the current-provider models_update
+// path. Capability fields are authoritative for the concrete models carried by
+// this update; omitted fields preserve legacy-provider behavior.
+func (r *Registry) MergeProviderModelsWithCapabilities(
+	providerID string,
+	models []protocol.ModelInfo,
+	toolConstraintProtocol int,
+	toolConstraintModels []string,
+) (merged, dropped []string) {
+	return r.mergeProviderModels(
+		providerID,
+		models,
+		toolConstraintProtocol,
+		toolConstraintModels,
+	)
+}
+
+func (r *Registry) mergeProviderModels(
+	providerID string,
+	models []protocol.ModelInfo,
+	toolConstraintProtocol int,
+	toolConstraintModels []string,
+) (merged, dropped []string) {
 	if len(models) == 0 {
 		return nil, nil
 	}
+	updatedToolConstraintModels := toolConstraintModelSet(
+		toolConstraintModels, models)
 	r.mu.RLock()
 	p, ok := r.providers[providerID]
 	// hasCatalog mirrors modelAllowedByCatalogLocked: a nil catalog (dev/test
@@ -2053,6 +2152,17 @@ func (r *Registry) MergeProviderModels(providerID string, models []protocol.Mode
 		}
 		merged = append(merged, m.ID)
 		present[m.ID] = struct{}{}
+		if toolConstraintProtocol != 0 {
+			p.ToolConstraintProtocol = toolConstraintProtocol
+			if _, supported := updatedToolConstraintModels[m.ID]; toolConstraintProtocol == ToolConstraintProtocolV1 && supported {
+				if p.ToolConstraintModels == nil {
+					p.ToolConstraintModels = make(map[string]struct{})
+				}
+				p.ToolConstraintModels[m.ID] = struct{}{}
+			} else {
+				delete(p.ToolConstraintModels, m.ID)
+			}
+		}
 	}
 	// Compute the hard-swap drop set: a VALIDATED desired build authorizes
 	// dropping only that alias's previous build. This is intentionally
@@ -2080,6 +2190,7 @@ func (r *Registry) MergeProviderModels(providerID string, models []protocol.Mode
 				r.logger.Info("models_update hard-swap: dropping retired build",
 					"provider_id", providerID, "model_id", m.ID)
 				dropped = append(dropped, m.ID)
+				delete(p.ToolConstraintModels, m.ID)
 				continue
 			}
 			kept = append(kept, m)
@@ -2634,6 +2745,8 @@ func (r *Registry) Register(id string, conn *websocket.Conn, msg *protocol.Regis
 		DecodeTPS:               msg.DecodeTPS,
 		PrefixCacheProtocol:     msg.PrefixCacheProtocol,
 		PrefixCacheV2Models:     prefixCacheV2CapabilityMap(msg.PrefixCacheV2Models),
+		ToolConstraintProtocol:  msg.ToolConstraintProtocol,
+		ToolConstraintModels:    toolConstraintModelSet(msg.ToolConstraintModels, msg.Models),
 		TrustLevel:              TrustNone,
 		RuntimeVerified:         true,  // default to verified; API layer sets false when manifest check fails
 		RuntimeManifestChecked:  true,  // default to true; API layer sets false when no manifest is configured
@@ -3577,6 +3690,7 @@ func mergeHeartbeatSessionStats(previous, current protocol.HeartbeatStats) proto
 
 // Disconnect removes a provider from the registry and cleans up pending requests.
 func (r *Registry) Disconnect(id string) {
+	var disconnectedModels []string
 	r.mu.Lock()
 	p, ok := r.providers[id]
 	if ok {
@@ -3626,6 +3740,10 @@ func (r *Registry) Disconnect(id string) {
 			}
 		}
 		delete(r.faultKeyBySession, id)
+		disconnectedModels = make([]string, 0, len(p.Models))
+		for _, m := range p.Models {
+			disconnectedModels = append(disconnectedModels, m.ID)
+		}
 		if p.Status != StatusUntrusted {
 			r.onlineCount.Add(-1)
 			for _, m := range p.Models {
@@ -3639,6 +3757,11 @@ func (r *Registry) Disconnect(id string) {
 	if !ok {
 		return
 	}
+	// Removing the last capable provider can turn a queued constrained request
+	// from temporarily capacity-blocked into permanently unservable. Re-run
+	// the canonical drain after removal so those waiters receive the immediate
+	// capability-unavailable result instead of sleeping until maxWait.
+	r.drainQueuedRequestsForModels(disconnectedModels)
 	// Cache holders and nonce-bound attempts are connection-scoped. Clear them
 	// after releasing registry/provider locks.
 	r.cacheRouting.disconnect(id)

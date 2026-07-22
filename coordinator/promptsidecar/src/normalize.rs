@@ -1,5 +1,8 @@
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use thiserror::Error;
+
+pub(crate) const ORIGINAL_BOOLEAN_SCHEMA_KEY: &str = "x-darkbloom-original-boolean-schema";
 
 #[derive(Clone, Debug)]
 pub struct NormalizedRequest {
@@ -32,6 +35,7 @@ pub fn normalize(
         .ok_or(NormalizeError::MissingModel)?
         .to_owned();
 
+    validate_raw_auto_tool_schemas(&body)?;
     normalize_tool_parameter_types(&mut body);
     normalize_legacy_function_calls(&mut body)?;
     let mut messages = template_messages(&body)?;
@@ -268,6 +272,25 @@ fn validate_function_definition(
     Ok(function.clone())
 }
 
+fn validate_raw_auto_tool_schemas(body: &Map<String, Value>) -> Result<(), NormalizeError> {
+    let choice = body.get("tool_choice");
+    let mode = choice.and_then(Value::as_str).or_else(|| {
+        choice
+            .and_then(Value::as_object)
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+    });
+    if choice.is_some() && mode != Some("auto") {
+        return Ok(());
+    }
+    let tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    crate::tool_constraint::validate_auto_tool_patterns(tools)
+}
+
 fn normalize_legacy_function_calls(body: &mut Map<String, Value>) -> Result<(), NormalizeError> {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return Ok(());
@@ -339,8 +362,23 @@ fn normalize_tool_parameter_types(body: &mut Map<String, Value>) {
 }
 
 fn inject_schema_types(node: &mut Value, positional: bool) {
-    if positional && node.is_boolean() {
-        *node = json!({"type": "string"});
+    if positional && let Some(accepts) = node.as_bool() {
+        *node = json!({
+            "type": "string",
+            (ORIGINAL_BOOLEAN_SCHEMA_KEY): accepts
+        });
+        return;
+    }
+    // An EMPTY positional map is the `{}` "anything" schema — semantically
+    // identical to the boolean `true` schema, so it gets the same render-safe
+    // rewrite: a string type for the template plus the marker so provider
+    // auto validation restores allow-all semantics instead of enforcing the
+    // synthetic string type.
+    if positional && node.as_object().is_some_and(Map::is_empty) {
+        *node = json!({
+            "type": "string",
+            (ORIGINAL_BOOLEAN_SCHEMA_KEY): true
+        });
         return;
     }
     if let Some(array) = node.as_array_mut() {
@@ -380,15 +418,39 @@ fn inject_schema_types(node: &mut Value, positional: bool) {
             }
         }
     }
+    if positional && let Some((accepts, annotations)) = constant_marked_combinator(object) {
+        object.clear();
+        object.insert("type".into(), Value::String("string".into()));
+        object.insert(ORIGINAL_BOOLEAN_SCHEMA_KEY.into(), Value::Bool(accepts));
+        object.extend(annotations);
+        return;
+    }
+    if !object.contains_key("type")
+        && nullable_combinator_union(object)
+        && object.get("nullable") != Some(&Value::Bool(true))
+    {
+        object.insert("nullable".into(), Value::Bool(true));
+    }
+    // A typeless node whose const/enum admits null beside a concrete value
+    // keeps null validity through the standard `nullable` key, exactly like
+    // the array-form type collapse below.
+    if !object.contains_key("type")
+        && let Some((concrete, saw_null)) = finite_value_types(object)
+        && saw_null
+        && !concrete.is_empty()
+        && object.get("nullable") != Some(&Value::Bool(true))
+    {
+        object.insert("nullable".into(), Value::Bool(true));
+    }
     if let Some(Value::Array(types)) = object.get("type") {
         let members = types
             .iter()
             .filter_map(Value::as_str)
-            .map(str::to_owned)
+            .map(str::to_ascii_lowercase)
             .collect::<Vec<_>>();
         if members.iter().any(|value| value == "null")
             && members.iter().any(|value| value != "null")
-            && !object.contains_key("nullable")
+            && object.get("nullable") != Some(&Value::Bool(true))
         {
             object.insert("nullable".into(), Value::Bool(true));
         }
@@ -435,6 +497,110 @@ fn inject_schema_types(node: &mut Value, positional: bool) {
     }
 }
 
+const SCHEMA_ANNOTATION_KEYS: [&str; 11] = [
+    "$anchor",
+    "$comment",
+    "$id",
+    "$schema",
+    "default",
+    "deprecated",
+    "description",
+    "examples",
+    "readOnly",
+    "title",
+    "writeOnly",
+];
+
+fn is_schema_annotation(key: &str) -> bool {
+    SCHEMA_ANNOTATION_KEYS.contains(&key)
+}
+
+fn render_marker_boolean(object: &Map<String, Value>) -> Option<bool> {
+    if object.get("type").and_then(Value::as_str) != Some("string") {
+        return None;
+    }
+    let marker = object
+        .get(ORIGINAL_BOOLEAN_SCHEMA_KEY)
+        .and_then(Value::as_bool)?;
+    if object.keys().any(|key| {
+        key != "type" && key != ORIGINAL_BOOLEAN_SCHEMA_KEY && !is_schema_annotation(key)
+    }) {
+        return None;
+    }
+    Some(marker)
+}
+
+fn constant_marked_combinator(object: &Map<String, Value>) -> Option<(bool, Map<String, Value>)> {
+    let mut combinator = None;
+    for key in object.keys() {
+        if ["anyOf", "oneOf", "allOf"].contains(&key.as_str()) {
+            if combinator.replace(key.as_str()).is_some() {
+                return None;
+            }
+        } else if !is_schema_annotation(key) {
+            return None;
+        }
+    }
+    let combinator = combinator?;
+    let variants = object.get(combinator)?.as_array()?;
+    if variants.is_empty() {
+        return None;
+    }
+    let known = variants
+        .iter()
+        .filter_map(Value::as_object)
+        .filter_map(render_marker_boolean)
+        .collect::<Vec<_>>();
+    let true_count = known.iter().filter(|value| **value).count();
+    let accepts = match combinator {
+        "allOf" if known.iter().any(|value| !value) => false,
+        "allOf" if known.len() == variants.len() => true,
+        "anyOf" if true_count > 0 => true,
+        "anyOf" if known.len() == variants.len() => false,
+        "oneOf" if known.len() == variants.len() => true_count == 1,
+        _ => return None,
+    };
+    let annotations = object
+        .iter()
+        .filter(|(key, _)| is_schema_annotation(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    Some((accepts, annotations))
+}
+
+fn nullable_combinator_union(object: &Map<String, Value>) -> bool {
+    for key in ["anyOf", "oneOf"] {
+        let Some(variants) = object.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut has_null = false;
+        let mut has_concrete = false;
+        for variant in variants {
+            let Some(variant) = variant.as_object() else {
+                continue;
+            };
+            has_null |= variant.get("nullable") == Some(&Value::Bool(true));
+            match variant.get("type") {
+                Some(Value::String(member)) => {
+                    has_null |= member.eq_ignore_ascii_case("null");
+                    has_concrete |= !member.eq_ignore_ascii_case("null");
+                }
+                Some(Value::Array(members)) => {
+                    for member in members.iter().filter_map(Value::as_str) {
+                        has_null |= member.eq_ignore_ascii_case("null");
+                        has_concrete |= !member.eq_ignore_ascii_case("null");
+                    }
+                }
+                _ => {}
+            }
+        }
+        if has_null && has_concrete {
+            return true;
+        }
+    }
+    false
+}
+
 fn inferred_schema_type(object: &Map<String, Value>) -> String {
     if object.contains_key("properties")
         || object.contains_key("patternProperties")
@@ -448,17 +614,141 @@ fn inferred_schema_type(object: &Map<String, Value>) -> String {
     for key in ["anyOf", "oneOf", "allOf"] {
         if let Some(variants) = object.get(key).and_then(Value::as_array)
             && let Some(kind) = variants.iter().find_map(|variant| {
-                variant
-                    .as_object()?
-                    .get("type")?
-                    .as_str()
-                    .filter(|kind| *kind != "null")
+                let variant = variant.as_object()?;
+                if render_marker_boolean(variant).is_some() {
+                    return None;
+                }
+                variant.get("type")?.as_str().filter(|kind| *kind != "null")
             })
         {
             return kind.into();
         }
     }
+    // A typeless `{"const":1}` accepts 1, so the injected render type must be
+    // "number", not "string" — the string default would make every
+    // schema-valid emission fail post-generation validation.
+    if let Some((concrete, saw_null)) = finite_value_types(object) {
+        if concrete.len() == 1 {
+            return concrete.into_iter().next().expect("single member");
+        }
+        if concrete.is_empty() && saw_null {
+            return "null".into();
+        }
+    }
+    // Likewise a typeless `{"minimum":5}` accepts 6: infer the type its
+    // assertion keywords constrain instead of the string default.
+    let families = assertion_family_types(object);
+    if families.len() == 1 {
+        return (*families.iter().next().expect("single family")).into();
+    }
     "string".into()
+}
+
+/// Type-scoped assertion keyword -> the instance type it constrains.
+const ASSERTION_FAMILY_BY_KEYWORD: [(&str, &str); 17] = [
+    ("minimum", "number"),
+    ("maximum", "number"),
+    ("exclusiveMinimum", "number"),
+    ("exclusiveMaximum", "number"),
+    ("multipleOf", "number"),
+    ("minLength", "string"),
+    ("maxLength", "string"),
+    ("pattern", "string"),
+    ("minItems", "array"),
+    ("maxItems", "array"),
+    ("uniqueItems", "array"),
+    ("contains", "array"),
+    ("minContains", "array"),
+    ("maxContains", "array"),
+    ("minProperties", "object"),
+    ("maxProperties", "object"),
+    ("required", "object"),
+];
+
+fn assertion_family_types(object: &Map<String, Value>) -> HashSet<&'static str> {
+    ASSERTION_FAMILY_BY_KEYWORD
+        .iter()
+        .filter(|(keyword, _)| object.contains_key(*keyword))
+        .map(|(_, family)| *family)
+        .collect()
+}
+
+/// Whether a typeless node's assertions cannot determine a single renderable
+/// type: either its assertion keywords span more than one type family (e.g.
+/// `{"minimum":5,"minLength":2}`) or its only assertion is `not` (e.g.
+/// `{"not":{"type":"string"}}`, which accepts every non-string — no injected
+/// type can preserve that, and the string default would make the schema
+/// unsatisfiable). Callers reject these before normalization. Structural,
+/// union, or finite-value evidence takes priority.
+pub(crate) fn typeless_assertion_families_ambiguous(object: &Map<String, Value>) -> bool {
+    for key in [
+        "properties",
+        "patternProperties",
+        "additionalProperties",
+        "items",
+        "prefixItems",
+    ] {
+        if object.contains_key(key) {
+            return false;
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(variants) = object.get(key).and_then(Value::as_array)
+            && variants.iter().any(|variant| {
+                variant
+                    .as_object()
+                    .and_then(|variant| variant.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind != "null")
+            })
+        {
+            return false;
+        }
+    }
+    let families = assertion_family_types(object);
+    if families.len() > 1 {
+        return true;
+    }
+    families.is_empty() && object.contains_key("not")
+}
+
+/// JSON type names of a node's const/enum values: the set of concrete
+/// (non-null) member types plus whether null appears. `None` when the node
+/// carries no const and no non-empty enum array.
+pub(crate) fn finite_value_types(object: &Map<String, Value>) -> Option<(HashSet<String>, bool)> {
+    let values: Vec<&Value> = if let Some(constant) = object.get("const") {
+        vec![constant]
+    } else if let Some(members) = object.get("enum").and_then(Value::as_array) {
+        if members.is_empty() {
+            return None;
+        }
+        members.iter().collect()
+    } else {
+        return None;
+    };
+    let mut concrete = HashSet::new();
+    let mut saw_null = false;
+    for value in values {
+        match value {
+            Value::Null => saw_null = true,
+            Value::Bool(_) => {
+                concrete.insert("boolean".to_owned());
+            }
+            Value::Number(_) => {
+                concrete.insert("number".to_owned());
+            }
+            Value::String(_) => {
+                concrete.insert("string".to_owned());
+            }
+            Value::Array(_) => {
+                concrete.insert("array".to_owned());
+            }
+            Value::Object(_) => {
+                concrete.insert("object".to_owned());
+            }
+        }
+    }
+    Some((concrete, saw_null))
 }
 
 fn apply_tool_choice_policy(
@@ -467,6 +757,12 @@ fn apply_tool_choice_policy(
     tools: &mut Option<Vec<Value>>,
 ) -> Result<(), NormalizeError> {
     validate_tool_names(tools.as_deref().unwrap_or_default())?;
+    if let Some(parallel) = body.get("parallel_tool_calls")
+        && !parallel.is_boolean()
+        && !parallel.is_null()
+    {
+        return Err(NormalizeError::InvalidTools);
+    }
     let choice = body.get("tool_choice");
     let mode = choice.and_then(Value::as_str).or_else(|| {
         choice
@@ -490,20 +786,19 @@ fn apply_tool_choice_policy(
         return Err(NormalizeError::InvalidTools);
     }
     let selected_name = if mode == Some("function") {
-        Some(
-            choice
-                .and_then(Value::as_object)
-                .and_then(|object| {
-                    object.get("name").and_then(Value::as_str).or_else(|| {
-                        object
-                            .get("function")
-                            .and_then(Value::as_object)
-                            .and_then(|function| function.get("name"))
-                            .and_then(Value::as_str)
-                    })
-                })
-                .ok_or(NormalizeError::InvalidTools)?,
-        )
+        let object = choice
+            .and_then(Value::as_object)
+            .ok_or(NormalizeError::InvalidTools)?;
+        let top_level = object.get("name").and_then(Value::as_str);
+        let nested = object
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str);
+        if top_level.is_some() && nested.is_some() && top_level != nested {
+            return Err(NormalizeError::InvalidTools);
+        }
+        Some(top_level.or(nested).ok_or(NormalizeError::InvalidTools)?)
     } else {
         None
     };
@@ -515,6 +810,7 @@ fn apply_tool_choice_policy(
         if !declared.iter().any(|tool| tool_name(tool) == Some(name)) {
             return Err(NormalizeError::InvalidTools);
         }
+        crate::tool_constraint::validate_selected_constrained_tool(declared, name)?;
         *tools = Some(
             declared
                 .iter()
@@ -526,11 +822,13 @@ fn apply_tool_choice_policy(
             "Call the declared function '{name}' now. You must emit a '{name}' tool call with valid arguments before any final answer, even when another function seems more relevant. Your entire response must be that tool call; a text answer is forbidden. For any required string argument without an obvious value, use the user's request text."
         )
     } else if declared.len() == 1 {
+        crate::tool_constraint::validate_constrained_tools(declared)?;
         let name = tool_name(&declared[0]).ok_or(NormalizeError::InvalidTools)?;
         format!(
             "Call the declared function '{name}' now. You must emit a tool call with valid arguments before any final answer, even when the user's request does not require the tool. Your entire response must be the tool call; a text answer is forbidden. For any required string argument without an obvious value, use the user's request text."
         )
     } else {
+        crate::tool_constraint::validate_constrained_tools(declared)?;
         "Call one of the declared tools now. You must emit a tool call with valid arguments before any final answer, even when the user's request does not require a tool. Your entire response must be the tool call; a text answer is forbidden.".into()
     };
     add_instruction(messages, &instruction, true);
@@ -579,6 +877,7 @@ fn append_content(message: &mut Value, instruction: &str) {
 }
 
 fn validate_tool_names(tools: &[Value]) -> Result<(), NormalizeError> {
+    let mut names = HashSet::new();
     for tool in tools {
         let name = tool_name(tool).ok_or(NormalizeError::InvalidTools)?;
         if name.is_empty()
@@ -587,6 +886,9 @@ fn validate_tool_names(tools: &[Value]) -> Result<(), NormalizeError> {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
         {
+            return Err(NormalizeError::InvalidTools);
+        }
+        if !names.insert(name) {
             return Err(NormalizeError::InvalidTools);
         }
     }
@@ -929,7 +1231,12 @@ mod tests {
                     "parameters":{
                         "properties":{
                             "city":{"description":"city name"},
-                            "days":{"items":{"enum":[1,2]}}
+                            "days":{"items":{"enum":[1,2]}},
+                            "optional":{
+                                "type":["STRING","NULL"],
+                                "nullable":false,
+                                "enum":[null]
+                            }
                         }
                     }
                 }
@@ -943,7 +1250,216 @@ mod tests {
         assert_eq!(parameters["type"], "object");
         assert_eq!(parameters["properties"]["city"]["type"], "string");
         assert_eq!(parameters["properties"]["days"]["type"], "array");
-        assert_eq!(parameters["properties"]["days"]["items"]["type"], "string");
+        // A typeless enum node keeps its value semantics: `[1,2]` is a number
+        // enum, so the injected render type must be "number" — the old string
+        // default made every schema-valid numeric emission fail validation.
+        assert_eq!(parameters["properties"]["days"]["items"]["type"], "number");
+        assert_eq!(parameters["properties"]["optional"]["type"], "string");
+        assert_eq!(parameters["properties"]["optional"]["nullable"], true);
+    }
+
+    #[test]
+    fn typeless_finite_values_keep_original_semantics() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"pick",
+                "parameters":{"type":"object","properties":{
+                    "count":{"const":1},
+                    "level":{"enum":[1,2,null]},
+                    "flag":{"const":true},
+                    "tag":{"enum":["a","b"]},
+                    "none":{"const":null}
+                }}
+            }}],
+            "tool_choice":"auto"
+        });
+        let normalized = normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).unwrap();
+        let tools = normalized.tools.unwrap();
+        let properties = &tools[0]["function"]["parameters"]["properties"];
+        assert_eq!(properties["count"]["type"], "number");
+        assert!(properties["count"].get("nullable").is_none());
+        assert_eq!(properties["level"]["type"], "number");
+        assert_eq!(properties["level"]["nullable"], true);
+        assert_eq!(properties["flag"]["type"], "boolean");
+        assert_eq!(properties["tag"]["type"], "string");
+        assert_eq!(properties["none"]["type"], "null");
+    }
+
+    #[test]
+    fn empty_positional_schemas_become_boolean_true_markers() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"pick",
+                "parameters":{"type":"object","properties":{"blob":{}}}
+            }}],
+            "tool_choice":"auto"
+        });
+        let normalized = normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).unwrap();
+        let tools = normalized.tools.unwrap();
+        let blob = &tools[0]["function"]["parameters"]["properties"]["blob"];
+        assert_eq!(blob["type"], "string");
+        assert_eq!(blob[ORIGINAL_BOOLEAN_SCHEMA_KEY], true);
+        assert_eq!(blob.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn constant_combinators_keep_boolean_schema_semantics() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"pick",
+                "parameters":{"type":"object","properties":{
+                    "all":{"allOf":[{}],"description":"anything"},
+                    "deny":{"allOf":[{"type":"integer"},false]}
+                }}
+            }}],
+            "tool_choice":"auto"
+        });
+        let normalized = normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).unwrap();
+        let tools = normalized.tools.unwrap();
+        let properties = &tools[0]["function"]["parameters"]["properties"];
+        for (name, accepts) in [("all", true), ("deny", false)] {
+            assert_eq!(properties[name]["type"], "string", "{name}");
+            assert_eq!(
+                properties[name][ORIGINAL_BOOLEAN_SCHEMA_KEY], accepts,
+                "{name}"
+            );
+        }
+        assert_eq!(properties["all"]["description"], "anything");
+    }
+
+    #[test]
+    fn constrained_mode_accepts_normalized_empty_schema_marker() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"pick",
+                "parameters":{"type":"object","properties":{"blob":{}}}
+            }}],
+            "tool_choice":"required"
+        });
+        assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_ok());
+
+        // Any marker-bearing shape other than the exact rewrite fails closed.
+        let forged = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"pick",
+                "parameters":{"type":"object","properties":{"blob":{
+                    "type":"string",
+                    "x-darkbloom-original-boolean-schema":false
+                }}}
+            }}],
+            "tool_choice":"required"
+        });
+        assert!(normalize(forged.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+    }
+
+    #[test]
+    fn typeless_assertion_families_keep_original_semantics() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"pick",
+                "parameters":{"type":"object","properties":{
+                    "score":{"minimum":5,"maximum":10},
+                    "steps":{"multipleOf":2},
+                    "items":{"minItems":1,"uniqueItems":true},
+                    "shape":{"required":["a"]},
+                    "code":{"pattern":"^ab$"}
+                }}
+            }}],
+            "tool_choice":"auto"
+        });
+        let normalized = normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).unwrap();
+        let tools = normalized.tools.unwrap();
+        let properties = &tools[0]["function"]["parameters"]["properties"];
+        assert_eq!(properties["score"]["type"], "number");
+        assert_eq!(properties["steps"]["type"], "number");
+        assert_eq!(properties["items"]["type"], "array");
+        assert_eq!(properties["shape"]["type"], "object");
+        assert_eq!(properties["code"]["type"], "string");
+    }
+
+    #[test]
+    fn typeless_mixed_assertion_families_are_rejected_before_normalization() {
+        for value in [
+            json!({"minimum":5,"minLength":2}),
+            json!({"not":{"type":"string"}}),
+        ] {
+            let body = json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"pick",
+                    "parameters":{"type":"object","properties":{"value":value}}
+                }}],
+                "tool_choice":"auto"
+            });
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+        }
+    }
+
+    #[test]
+    fn typeless_mixed_finite_values_are_rejected_before_normalization() {
+        for value in [json!({"enum":["a",1]}), json!({"enum":[true,"on"]})] {
+            let body = json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"pick",
+                    "parameters":{"type":"object","properties":{"value":value}}
+                }}],
+                "tool_choice":"auto"
+            });
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+        }
+    }
+
+    #[test]
+    fn unevaluated_assertions_are_rejected_before_inference() {
+        for value in [
+            json!({"type":"object","unevaluatedProperties":false}),
+            json!({"type":"array","items":{"type":"string"},"unevaluatedItems":false}),
+        ] {
+            let body = json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"pick",
+                    "parameters":{"type":"object","properties":{"value":value}}
+                }}],
+                "tool_choice":"auto"
+            });
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+        }
+    }
+
+    #[test]
+    fn dynamic_and_recursive_references_are_rejected_before_inference() {
+        for value in [
+            json!({"$dynamicRef":"#address"}),
+            json!({"$recursiveRef":"#"}),
+        ] {
+            let body = json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"pick",
+                    "parameters":{"type":"object","properties":{"value":value}}
+                }}],
+                "tool_choice":"auto"
+            });
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+        }
     }
 
     #[test]
@@ -966,6 +1482,327 @@ mod tests {
             }),
         ] {
             assert!(normalize(body.as_object().unwrap().clone(), None).is_err());
+        }
+    }
+
+    #[test]
+    fn constrained_schema_subset_matches_swift_policy() {
+        let supported = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"weather"}],
+            "parallel_tool_calls":false,
+            "tools":[{"type":"function","function":{
+                "name":"weather",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "city":{"type":"string","enum":["Paris","Tokyo"]},
+                        "days":{"type":["integer","null"]},
+                        "units":{"type":"array","items":{"type":"string"},"maxItems":3}
+                    },
+                    "required":["city"],
+                    "additionalProperties":false
+                }
+            }}],
+            "tool_choice":"required"
+        });
+        assert!(normalize(supported.as_object().unwrap().clone(), Some("gemma4_text")).is_ok());
+
+        for unsupported in [
+            json!({"oneOf":[{"type":"string"},{"type":"integer"}]}),
+            json!({"type":"string","pattern":"^x$"}),
+            json!({"type":"array","items":{"type":"string"},"maxItems":17}),
+        ] {
+            let body = json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"f",
+                    "parameters":{"type":"object","properties":{"x":unsupported}}
+                }}],
+                "tool_choice":"required"
+            });
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+        }
+    }
+
+    #[test]
+    fn preserves_boolean_schema_semantics_for_provider_validation() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"f",
+                "parameters":{"type":"object","properties":{
+                    "allow":true,
+                    "deny":false
+                }}
+            }}]
+        });
+        let normalized = normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).unwrap();
+        let properties = &normalized.tools.unwrap()[0]["function"]["parameters"]["properties"];
+        assert_eq!(properties["allow"]["type"], "string");
+        assert_eq!(properties["allow"][ORIGINAL_BOOLEAN_SCHEMA_KEY], true);
+        assert_eq!(properties["deny"]["type"], "string");
+        assert_eq!(properties["deny"][ORIGINAL_BOOLEAN_SCHEMA_KEY], false);
+    }
+
+    #[test]
+    fn combinator_union_preserves_nullability() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup",
+                "parameters":{"type":"object","properties":{
+                    "value":{"anyOf":[{"type":"string"},{"type":"null"}]},
+                    "explicit":{
+                        "type":"string",
+                        "anyOf":[{"type":"string"},{"type":"null"}]
+                    }
+                }}
+            }}],
+            "tool_choice":"auto"
+        });
+        let normalized = normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).unwrap();
+        let tools = normalized.tools.unwrap();
+        let properties = &tools[0]["function"]["parameters"]["properties"];
+        let value = &properties["value"];
+        assert_eq!(value["type"], "string");
+        assert_eq!(value["nullable"], true);
+        assert!(properties["explicit"].get("nullable").is_none());
+    }
+
+    #[test]
+    fn auto_regex_support_is_rejected_before_inference() {
+        let body = |pattern: &str| {
+            json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"lookup",
+                    "parameters":{"type":"object","properties":{
+                        "code":{"type":"string","pattern":pattern}
+                    }}
+                }}],
+                "tool_choice":"auto"
+            })
+        };
+        assert!(
+            normalize(
+                body("^city$").as_object().unwrap().clone(),
+                Some("gemma4_text")
+            )
+            .is_ok()
+        );
+        assert!(
+            normalize(
+                body("^[a-z]+$").as_object().unwrap().clone(),
+                Some("gemma4_text")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn auto_pattern_validation_distinguishes_keywords_from_property_names() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup",
+                "parameters":{"type":"object","properties":{
+                    "pattern":{"type":"string","pattern":"^city$"}
+                }}
+            }}],
+            "tool_choice":"auto"
+        });
+        assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_ok());
+    }
+
+    #[test]
+    fn auto_pattern_validation_does_not_double_count_tuple_containers() {
+        let mut item = json!({"type":"string","pattern":"^city$"});
+        for _ in 0..17 {
+            item = json!({"type":"array","items":[item]});
+        }
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup",
+                "parameters":{"type":"object","properties":{"value":item}}
+            }}],
+            "tool_choice":"auto"
+        });
+        assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_ok());
+    }
+
+    #[test]
+    fn auto_pattern_validation_bounds_malformed_nested_tuple_arrays() {
+        let mut items = json!({"type":"string","pattern":"^city$"});
+        for _ in 0..40 {
+            items = json!([items]);
+        }
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"lookup",
+                "parameters":{"type":"array","items":items}
+            }}],
+            "tool_choice":"auto"
+        });
+        assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+    }
+
+    #[test]
+    fn unsupported_auto_semantics_fail_before_render_normalization() {
+        for property_schema in [
+            json!({"type":["string","integer"]}),
+            json!({"oneOf":[{"type":"string"},{"type":"integer"}]}),
+            json!({"$ref":"#/$defs/Address"}),
+            json!({
+                "if":{"properties":{"kind":{"const":"business"}}},
+                "then":{"required":["tax_id"]}
+            }),
+            json!({
+                "type":"object",
+                "properties":{
+                    "credit_card":{"type":"string"},
+                    "billing_address":{"type":"string"}
+                },
+                "dependentSchemas":{
+                    "credit_card":{"required":["billing_address"]}
+                }
+            }),
+            json!({
+                "type":"object",
+                "dependencies":{"credit_card":["billing_address"]}
+            }),
+            json!({
+                "type":"object",
+                "dependentRequired":{"credit_card":["billing_address"]}
+            }),
+            json!({
+                "type":"object",
+                "propertyNames":{"const":"allowed"}
+            }),
+        ] {
+            let body = json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"lookup",
+                    "parameters":{"type":"object","properties":{"value":property_schema}}
+                }}],
+                "tool_choice":"auto"
+            });
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+        }
+    }
+
+    #[test]
+    fn supported_decimal_multiple_schemas_survive_preflight() {
+        for multiple in [
+            json!(1),
+            json!(0.1),
+            json!(2.5),
+            json!(1e-200),
+            json!(3e-40),
+        ] {
+            let body = json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"lookup",
+                    "parameters":{"type":"object","properties":{
+                        "value":{"type":"number","multipleOf":multiple}
+                    }}
+                }}],
+                "tool_choice":"auto"
+            });
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_ok());
+        }
+    }
+
+    #[test]
+    fn named_choice_ignores_unsupported_unselected_schema() {
+        let body = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[
+                {"type":"function","function":{
+                    "name":"selected",
+                    "parameters":{"type":"object","properties":{
+                        "value":{"type":"string"}
+                    }}
+                }},
+                {"type":"function","function":{
+                    "name":"unused",
+                    "parameters":{"type":"object","properties":{
+                        "value":{"pattern":"^x$"}
+                    }}
+                }}
+            ],
+            "tool_choice":{"type":"function","function":{"name":"selected"}}
+        });
+        let normalized = normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).unwrap();
+        let tools = normalized.tools.expect("selected tool");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], "selected");
+
+        let mut unsupported = body;
+        unsupported["tool_choice"]["function"]["name"] = json!("unused");
+        assert!(
+            normalize(
+                unsupported.as_object().unwrap().clone(),
+                Some("gemma4_text")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn constrained_parallel_policy_is_typed() {
+        let malformed = json!({
+            "model":"gemma-4-fixture",
+            "messages":[{"role":"user","content":"x"}],
+            "tools":[{"type":"function","function":{
+                "name":"f","parameters":{"type":"object"}
+            }}],
+            "tool_choice":"required",
+            "parallel_tool_calls":"false"
+        });
+        assert!(normalize(malformed.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
+    }
+
+    #[test]
+    fn constrained_enum_and_named_choice_validation_matches_swift() {
+        for body in [
+            json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{
+                    "name":"safe",
+                    "parameters":{"type":"object","properties":{
+                        "x":{"type":"string","enum":[1]}
+                    }}
+                }}],
+                "tool_choice":"required"
+            }),
+            json!({
+                "model":"gemma-4-fixture",
+                "messages":[{"role":"user","content":"x"}],
+                "tools":[{"type":"function","function":{"name":"safe"}}],
+                "tool_choice":{
+                    "type":"function",
+                    "name":"safe",
+                    "function":{"name":"other"}
+                }
+            }),
+        ] {
+            assert!(normalize(body.as_object().unwrap().clone(), Some("gemma4_text")).is_err());
         }
     }
 

@@ -166,11 +166,11 @@ func TestNormalizeToolSchemas_CollapsesArrayTypeInsideAdditionalPropertiesSchema
 	}
 }
 
-// Go-specific: an explicit `nullable` survives the array-type collapse.
-func TestNormalizeToolSchemas_ExplicitNullableLeftUntouched(t *testing.T) {
+// An explicit false cannot erase a null member from the original type union.
+func TestNormalizeToolSchemas_TypeUnionOverridesNullableFalse(t *testing.T) {
 	body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
 	  "parameters":{"type":"object","properties":{
-	    "kept":{"type":["string","null"],"nullable":false},
+	    "kept":{"type":["STRING","NULL"],"nullable":false},
 	    "set":{"type":["string","null"]}}}}}]}`)
 
 	props := tsnProps(t, NormalizeToolSchemas(body))
@@ -178,12 +178,46 @@ func TestNormalizeToolSchemas_ExplicitNullableLeftUntouched(t *testing.T) {
 	if got := tsnType(t, kept, "kept"); got != "string" {
 		t.Errorf("kept type = %q, want string", got)
 	}
-	// The explicit value is NOT clobbered, even though it disagrees.
-	if kept["nullable"] != false {
-		t.Errorf("kept nullable = %v, want explicit false preserved", kept["nullable"])
+	if kept["nullable"] != true {
+		t.Errorf("kept nullable = %v, want union-preserving true", kept["nullable"])
 	}
 	set := tsnMap(t, props["set"], "set")
 	if set["nullable"] != true {
 		t.Errorf("set nullable = %v, want synthesized true", set["nullable"])
+	}
+}
+
+func TestNormalizeToolSchemas_CombinatorUnionPreservesNullability(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
+	  "parameters":{"type":"object","properties":{
+	    "value":{"anyOf":[{"type":"string"},{"type":"null"}]},
+	    "explicit":{"type":"string","anyOf":[{"type":"string"},{"type":"null"}]}
+	  }}}}]}`)
+	properties := tsnProps(t, NormalizeToolSchemas(body))
+	value := tsnMap(t, properties["value"], "value")
+	if got := tsnType(t, value, "value"); got != "string" {
+		t.Fatalf("value type = %q, want string", got)
+	}
+	if value["nullable"] != true {
+		t.Fatalf("value nullable = %v, want true", value["nullable"])
+	}
+	explicit := tsnMap(t, properties["explicit"], "explicit")
+	if explicit["nullable"] != nil {
+		t.Fatalf("explicit parent type was widened: nullable = %v", explicit["nullable"])
+	}
+}
+
+func TestNormalizeToolSchemas_PreservesBooleanSchemaSemantics(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
+	  "parameters":{"type":"object","properties":{"allow":true,"deny":false}}}}]}`)
+	properties := tsnProps(t, NormalizeToolSchemas(body))
+	for name, want := range map[string]bool{"allow": true, "deny": false} {
+		schema := tsnMap(t, properties[name], name)
+		if got := tsnType(t, schema, name); got != "string" {
+			t.Fatalf("%s type = %q, want render-safe string", name, got)
+		}
+		if got, ok := schema[originalBooleanSchemaKey].(bool); !ok || got != want {
+			t.Fatalf("%s marker = %#v, want %v", name, schema[originalBooleanSchemaKey], want)
+		}
 	}
 }

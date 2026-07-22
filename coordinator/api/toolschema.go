@@ -60,6 +60,8 @@ const maxToolNormalizationBytes = 4 * 1024 * 1024
 // whereas the harm we are preventing is unbounded recursion on every request.
 const maxToolSchemaDepth = 64
 
+const originalBooleanSchemaKey = "x-darkbloom-original-boolean-schema"
+
 // toolsKeyNeedle is the cheap byte gate: only bodies carrying these bytes pay
 // the JSON round-trip.
 var toolsKeyNeedle = []byte(`"tools"`)
@@ -202,9 +204,10 @@ func injectDefaultTypes(node any, depth int, changed *bool) any {
 // BE a schema, so a positional value needs no marker-key evidence:
 //
 //   - a boolean (the valid JSON-Schema allow/deny-all shorthand, e.g.
-//     `"x": true` under properties) is replaced with {"type":"string"} —
-//     Gemma-style templates subscript every property value
-//     (`value['type'] | upper`), which throws on a bool;
+//     `"x": true` under properties) is replaced with a render-safe string
+//     schema carrying originalBooleanSchemaKey, so Gemma can subscript
+//     `value['type']` while provider-side auto validation retains the original
+//     allow/deny-all semantics;
 //   - a map is guaranteed a string `type` after recursion (missing →
 //     inferredType; present-but-non-string → collapsed, see the schema arm),
 //     with NO looksLikeSchemaNode gate — that heuristic previously let valid
@@ -223,7 +226,10 @@ func injectTypes(node any, depth int, changed *bool, positional bool) any {
 	case bool:
 		if positional {
 			*changed = true
-			return map[string]any{"type": "string"}
+			return map[string]any{
+				"type":                   "string",
+				originalBooleanSchemaKey: n,
+			}
 		}
 		return node
 	case []any:
@@ -251,6 +257,18 @@ func injectTypes(node any, depth int, changed *bool, positional bool) any {
 // nothing moved. positional is this NODE's own slot kind (see injectTypes);
 // values under the schema-container keys below are always positional.
 func injectDefaultTypesIntoSchema(dict map[string]any, depth int, changed *bool, positional bool) map[string]any {
+	// An EMPTY positional map is the `{}` "anything" schema — semantically
+	// identical to the boolean `true` schema, so it gets the same render-safe
+	// rewrite: a string type for the template plus the original-boolean-schema
+	// marker so provider-side auto validation restores allow-all semantics
+	// instead of enforcing the synthetic string type.
+	if positional && len(dict) == 0 {
+		*changed = true
+		return map[string]any{
+			"type":                   "string",
+			originalBooleanSchemaKey: true,
+		}
+	}
 	for _, key := range []string{"properties", "patternProperties"} {
 		if props, ok := dict[key].(map[string]any); ok {
 			for k, v := range props {
@@ -284,6 +302,42 @@ func injectDefaultTypesIntoSchema(dict map[string]any, depth int, changed *bool,
 			}
 		}
 	}
+	// Boolean/empty schemas inside combinators are rewritten to render
+	// markers above. Fold combinators whose result is therefore constant
+	// before inferring a parent type; otherwise `allOf:[{}]` inherits the
+	// marker's synthetic string type and stops accepting numbers/objects.
+	// The fold is exact for the boolean identities below and retains
+	// annotation-only siblings.
+	if positional {
+		if accepts, annotations, ok := constantMarkedCombinator(dict); ok {
+			clear(dict)
+			dict["type"] = "string"
+			dict[originalBooleanSchemaKey] = accepts
+			for key, value := range annotations {
+				dict[key] = value
+			}
+			*changed = true
+			return dict
+		}
+	}
+	if dict["type"] == nil && nullableCombinatorUnion(dict) {
+		if nullable, _ := dict["nullable"].(bool); !nullable {
+			dict["nullable"] = true
+			*changed = true
+		}
+	}
+	// A typeless node whose const/enum admits null beside a concrete value
+	// (e.g. `{"enum":[1,null]}`) keeps null validity through the standard
+	// `nullable` key, exactly like the array-form type collapse below —
+	// the injected concrete type alone would reject a schema-valid null.
+	if dict["type"] == nil {
+		if concrete, sawNull, ok := finiteValueTypes(dict); ok && sawNull && len(concrete) > 0 {
+			if nullable, _ := dict["nullable"].(bool); !nullable {
+				dict["nullable"] = true
+				*changed = true
+			}
+		}
+	}
 
 	// A type that is PRESENT but not a string crashes `| upper` just like a
 	// missing one. The common real-world shape is the JSON-Schema array form
@@ -293,13 +347,14 @@ func injectDefaultTypesIntoSchema(dict map[string]any, depth int, changed *bool,
 	// is its type would not be refilled below and would crash anyway).
 	// Nullability is preserved losslessly: the gemma template natively
 	// renders the standard `nullable` key, so collapsing away a "null"
-	// member sets it (without clobbering an explicit value).
+	// member sets it to true. An explicit false cannot override the union's
+	// null member without changing the original schema semantics.
 	if t, present := dict["type"]; present {
 		if _, isString := t.(string); !isString {
 			members := typeStringMembers(t)
 			if slices.Contains(members, "null") &&
 				slices.ContainsFunc(members, func(m string) bool { return m != "null" }) {
-				if _, hasNullable := dict["nullable"]; !hasNullable {
+				if nullable, _ := dict["nullable"].(bool); !nullable {
 					dict["nullable"] = true
 				}
 			}
@@ -337,6 +392,153 @@ func injectDefaultTypesIntoSchema(dict map[string]any, depth int, changed *bool,
 	return dict
 }
 
+var schemaAnnotationKeys = map[string]struct{}{
+	"$anchor":     {},
+	"$comment":    {},
+	"$id":         {},
+	"$schema":     {},
+	"default":     {},
+	"deprecated":  {},
+	"description": {},
+	"examples":    {},
+	"readOnly":    {},
+	"title":       {},
+	"writeOnly":   {},
+}
+
+// constantMarkedCombinator evaluates a single annotation-only combinator
+// whose boolean/empty members make its result constant. JSON Schema gives
+// these exact identities: allOf(false, X)=false, allOf(true...)=true,
+// anyOf(true, X)=true, anyOf(false...)=false, and oneOf is constant only
+// when every member is a known boolean schema.
+func constantMarkedCombinator(dict map[string]any) (accepts bool, annotations map[string]any, ok bool) {
+	combinator := ""
+	for key := range dict {
+		if slices.Contains(schemaUnionKeys, key) {
+			if combinator != "" {
+				return false, nil, false
+			}
+			combinator = key
+			continue
+		}
+		if _, annotation := schemaAnnotationKeys[key]; !annotation {
+			return false, nil, false
+		}
+	}
+	if combinator == "" {
+		return false, nil, false
+	}
+	variants, valid := dict[combinator].([]any)
+	if !valid || len(variants) == 0 {
+		return false, nil, false
+	}
+	knownCount := 0
+	trueCount := 0
+	for _, raw := range variants {
+		variant, isObject := raw.(map[string]any)
+		if !isObject {
+			continue
+		}
+		value, known := renderMarkerBoolean(variant)
+		if !known {
+			continue
+		}
+		knownCount++
+		if value {
+			trueCount++
+		}
+	}
+	switch combinator {
+	case "allOf":
+		if knownCount > trueCount {
+			accepts, ok = false, true
+		} else if knownCount == len(variants) {
+			accepts, ok = true, true
+		}
+	case "anyOf":
+		if trueCount > 0 {
+			accepts, ok = true, true
+		} else if knownCount == len(variants) {
+			accepts, ok = false, true
+		}
+	case "oneOf":
+		if knownCount == len(variants) {
+			accepts, ok = trueCount == 1, true
+		}
+	}
+	if !ok {
+		return false, nil, false
+	}
+	annotations = make(map[string]any, len(dict)-1)
+	for key, value := range dict {
+		if _, annotation := schemaAnnotationKeys[key]; annotation {
+			annotations[key] = value
+		}
+	}
+	return accepts, annotations, true
+}
+
+func renderMarkerBoolean(dict map[string]any) (bool, bool) {
+	if dict["type"] != "string" {
+		return false, false
+	}
+	marker, ok := dict[originalBooleanSchemaKey].(bool)
+	if !ok {
+		return false, false
+	}
+	for key := range dict {
+		if key == "type" || key == originalBooleanSchemaKey {
+			continue
+		}
+		if _, annotation := schemaAnnotationKeys[key]; !annotation {
+			return false, false
+		}
+	}
+	return marker, true
+}
+
+func nullableCombinatorUnion(dict map[string]any) bool {
+	for _, key := range []string{"anyOf", "oneOf"} {
+		variants, ok := dict[key].([]any)
+		if !ok {
+			continue
+		}
+		hasNull := false
+		hasConcrete := false
+		for _, rawVariant := range variants {
+			variant, ok := rawVariant.(map[string]any)
+			if !ok {
+				continue
+			}
+			if nullable, _ := variant["nullable"].(bool); nullable {
+				hasNull = true
+			}
+			switch member := variant["type"].(type) {
+			case string:
+				if strings.EqualFold(member, "null") {
+					hasNull = true
+				} else {
+					hasConcrete = true
+				}
+			case []any:
+				for _, rawType := range member {
+					if member, ok := rawType.(string); ok {
+						if strings.EqualFold(member, "null") {
+							hasNull = true
+						} else {
+							hasConcrete = true
+						}
+					}
+				}
+			}
+		}
+		if hasNull && hasConcrete {
+			return true
+		}
+	}
+	return false
+}
+
 // typeStringMembers extracts the string members of an array-form `type`
 // value. Any other shape (number, bool, object, null) yields no members,
 // pushing the collapse to structural inference.
@@ -348,7 +550,7 @@ func typeStringMembers(t any) []string {
 	members := make([]string, 0, len(arr))
 	for _, m := range arr {
 		if s, ok := m.(string); ok {
-			members = append(members, s)
+			members = append(members, strings.ToLower(s))
 		}
 	}
 	return members
@@ -390,7 +592,11 @@ func looksLikeSchemaNode(dict map[string]any) bool {
 // when it has properties / patternProperties / additionalProperties, array
 // when it has items / prefixItems, a union member's type when it is an
 // anyOf/oneOf/allOf (skipping "null" — mislabelling a union as a string would
-// be wrong), otherwise string.
+// be wrong), the single concrete type of its const/enum values when the node
+// declares finite values (a typeless `{"const":1}` accepts 1, so the injected
+// render type must be "number", not "string" — the string default would make
+// every schema-valid emission fail post-generation validation), otherwise
+// string.
 func inferredType(dict map[string]any) string {
 	for _, key := range []string{"properties", "patternProperties", "additionalProperties"} {
 		if _, ok := dict[key]; ok {
@@ -405,7 +611,134 @@ func inferredType(dict map[string]any) string {
 	if t, ok := unionMemberType(dict); ok {
 		return t
 	}
+	if concrete, sawNull, ok := finiteValueTypes(dict); ok {
+		if len(concrete) == 1 {
+			for name := range concrete {
+				return name
+			}
+		}
+		if len(concrete) == 0 && sawNull {
+			return "null"
+		}
+	}
+	if families := assertionFamilyTypes(dict); len(families) == 1 {
+		for family := range families {
+			return family
+		}
+	}
 	return "string"
+}
+
+// assertionFamilyByKeyword maps type-scoped JSON-Schema assertion keywords to
+// the instance type they constrain. A typeless `{"minimum":5}` accepts 6, so
+// the injected render type must be "number" — the string default would make
+// every schema-valid numeric emission fail post-generation validation.
+var assertionFamilyByKeyword = map[string]string{
+	"minimum":          "number",
+	"maximum":          "number",
+	"exclusiveMinimum": "number",
+	"exclusiveMaximum": "number",
+	"multipleOf":       "number",
+	"minLength":        "string",
+	"maxLength":        "string",
+	"pattern":          "string",
+	"minItems":         "array",
+	"maxItems":         "array",
+	"uniqueItems":      "array",
+	"contains":         "array",
+	"minContains":      "array",
+	"maxContains":      "array",
+	"minProperties":    "object",
+	"maxProperties":    "object",
+	"required":         "object",
+}
+
+// assertionFamilyTypes reports the instance-type families implied by a node's
+// type-scoped assertion keywords.
+func assertionFamilyTypes(dict map[string]any) map[string]struct{} {
+	families := make(map[string]struct{}, 2)
+	for keyword, family := range assertionFamilyByKeyword {
+		if _, ok := dict[keyword]; ok {
+			families[family] = struct{}{}
+		}
+	}
+	return families
+}
+
+// typelessAssertionFamiliesAmbiguous reports whether a typeless node's
+// assertions cannot determine a single renderable type: either its assertion
+// keywords span more than one type family (e.g. `{"minimum":5,"minLength":2}`)
+// or its only assertion is `not` (e.g. `{"not":{"type":"string"}}`, which
+// accepts every non-string — no injected type can preserve that, and the
+// string default would make the schema unsatisfiable). Callers reject these
+// before normalization; nodes with structural, union, or finite-value
+// evidence are typed by those higher-priority rules instead.
+func typelessAssertionFamiliesAmbiguous(dict map[string]any) bool {
+	for _, key := range []string{
+		"properties", "patternProperties", "additionalProperties",
+		"items", "prefixItems",
+	} {
+		if _, ok := dict[key]; ok {
+			return false
+		}
+	}
+	if _, ok := unionMemberType(dict); ok {
+		return false
+	}
+	families := assertionFamilyTypes(dict)
+	if len(families) > 1 {
+		return true
+	}
+	if _, negated := dict["not"]; negated && len(families) == 0 {
+		return true
+	}
+	return false
+}
+
+// finiteValueTypes reports the JSON type names of a node's const/enum values:
+// the set of concrete (non-null) member types plus whether null appears.
+// ok is false when the node carries no const and no non-empty enum array.
+func finiteValueTypes(dict map[string]any) (concrete map[string]struct{}, sawNull bool, ok bool) {
+	var values []any
+	if constant, present := dict["const"]; present {
+		values = []any{constant}
+	} else if members, isArray := dict["enum"].([]any); isArray && len(members) > 0 {
+		values = members
+	} else {
+		return nil, false, false
+	}
+	concrete = make(map[string]struct{}, 2)
+	for _, value := range values {
+		name := jsonValueTypeName(value)
+		if name == "null" {
+			sawNull = true
+			continue
+		}
+		concrete[name] = struct{}{}
+	}
+	return concrete, sawNull, true
+}
+
+// jsonValueTypeName maps a decoded JSON value to its JSON-Schema type name.
+// Integral and fractional numbers both report "number" — "number" admits
+// integers under raw validation, so the coarser name is always safe.
+func jsonValueTypeName(value any) string {
+	switch value.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "boolean"
+	case json.Number, float64:
+		return "number"
+	case string:
+		return "string"
+	case []any:
+		return "array"
+	case map[string]any:
+		return "object"
+	default:
+		return "string"
+	}
 }
 
 // unionMemberType derives a representative `type` for a union node from the
@@ -420,6 +753,11 @@ func unionMemberType(dict map[string]any) (string, bool) {
 		for _, variant := range variants {
 			v, ok := variant.(map[string]any)
 			if !ok {
+				continue
+			}
+			// Marker types exist only to keep the Gemma template renderable;
+			// they carry no instance-type evidence for their parent.
+			if _, marker := renderMarkerBoolean(v); marker {
 				continue
 			}
 			if t, ok := v["type"].(string); ok && t != "null" {

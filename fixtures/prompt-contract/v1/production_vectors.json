@@ -360,7 +360,8 @@
                     "type": "object",
                     "properties": {
                       "city": {
-                        "type": "string"
+                        "type": "string",
+                        "x-darkbloom-original-boolean-schema": true
                       },
                       "unit": {
                         "anyOf": [
@@ -371,6 +372,7 @@
                             "type": "null"
                           }
                         ],
+                        "nullable": true,
                         "type": "string"
                       }
                     },
@@ -384,7 +386,7 @@
           },
           "plan": {
             "prompt_contract_id": "775df5693a45b12a900f16bfd8775d14c080f2321fd3fef8e27ebd93bee276cf",
-            "prompt_token_count": 102,
+            "prompt_token_count": 106,
             "block_boundaries": []
           },
           "token_ids": [
@@ -423,6 +425,10 @@
             1263,
             6805,
             29616,
+            35951,
+            236787,
+            3397,
+            236764,
             2084,
             236787,
             52,
@@ -1178,7 +1184,8 @@
                     "type": "object",
                     "patternProperties": {
                       "^city$": {
-                        "type": "string"
+                        "type": "string",
+                        "x-darkbloom-original-boolean-schema": true
                       }
                     },
                     "properties": {},
@@ -1202,10 +1209,12 @@
                       "options": {
                         "prefixItems": [
                           {
-                            "type": "string"
+                            "type": "string",
+                            "x-darkbloom-original-boolean-schema": true
                           },
                           {
-                            "type": "string"
+                            "type": "string",
+                            "x-darkbloom-original-boolean-schema": false
                           }
                         ],
                         "type": "array"
@@ -3974,7 +3983,8 @@
                     "type": "object",
                     "properties": {
                       "city": {
-                        "type": "string"
+                        "type": "string",
+                        "x-darkbloom-original-boolean-schema": true
                       },
                       "unit": {
                         "anyOf": [
@@ -3985,6 +3995,7 @@
                             "type": "null"
                           }
                         ],
+                        "nullable": true,
                         "type": "string"
                       }
                     },
@@ -3998,7 +4009,7 @@
           },
           "plan": {
             "prompt_contract_id": "775df5693a45b12a900f16bfd8775d14c080f2321fd3fef8e27ebd93bee276cf",
-            "prompt_token_count": 102,
+            "prompt_token_count": 106,
             "block_boundaries": []
           },
           "token_ids": [
@@ -4037,6 +4048,10 @@
             1263,
             6805,
             29616,
+            35951,
+            236787,
+            3397,
+            236764,
             2084,
             236787,
             52,
@@ -4792,7 +4807,8 @@
                     "type": "object",
                     "patternProperties": {
                       "^city$": {
-                        "type": "string"
+                        "type": "string",
+                        "x-darkbloom-original-boolean-schema": true
                       }
                     },
                     "properties": {},
@@ -4816,10 +4832,12 @@
                       "options": {
                         "prefixItems": [
                           {
-                            "type": "string"
+                            "type": "string",
+                            "x-darkbloom-original-boolean-schema": true
                           },
                           {
-                            "type": "string"
+                            "type": "string",
+                            "x-darkbloom-original-boolean-schema": false
                           }
                         ],
                         "type": "array"
@@ -7588,7 +7606,8 @@
                     "type": "object",
                     "properties": {
                       "city": {
-                        "type": "string"
+                        "type": "string",
+                        "x-darkbloom-original-boolean-schema": true
                       },
                       "unit": {
                         "anyOf": [
@@ -7599,6 +7618,7 @@
                             "type": "null"
                           }
                         ],
+                        "nullable": true,
                         "type": "string"
                       }
                     },
@@ -7612,7 +7632,7 @@
           },
           "plan": {
             "prompt_contract_id": "260d5e73e744fb4bd023bc282702d507a7babca715ca1f6ebf5504fc9c010c55",
-            "prompt_token_count": 102,
+            "prompt_token_count": 106,
             "block_boundaries": []
           },
           "token_ids": [
@@ -7651,6 +7671,10 @@
             1263,
             6805,
             29616,
+            35951,
+            236787,
+            3397,
+            236764,
             2084,
             236787,
             52,
@@ -8406,7 +8430,8 @@
                     "type": "object",
                     "patternProperties": {
                       "^city$": {
-                        "type": "string"
+                        "type": "string",
+                        "x-darkbloom-original-boolean-schema": true
                       }
                     },
                     "properties": {},
@@ -8430,10 +8455,12 @@
                       "options": {
                         "prefixItems": [
                           {
-                            "type": "string"
+                            "type": "string",
+                            "x-darkbloom-original-boolean-schema": true
                           },
                           {
-                            "type": "string"
+                            "type": "string",
+                            "x-darkbloom-original-boolean-schema": false
                           }
                         ],
                         "type": "array"

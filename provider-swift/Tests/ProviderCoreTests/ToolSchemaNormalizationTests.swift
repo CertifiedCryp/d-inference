@@ -56,6 +56,50 @@ struct ToolSchemaNormalizationTests {
         let noTools = #"{"model":"m","messages":[]}"#.data(using: .utf8)!
         #expect(ToolSchemaNormalization.ensureParameterTypes(in: noTools) == noTools)
     }
+
+    @Test func preservesBooleanSchemaSemanticsForPostValidation() throws {
+        let body = #"""
+        {"tools":[{"type":"function","function":{"name":"f",
+          "parameters":{"type":"object","properties":{
+            "allow":true,
+            "deny":false
+          }}}}]}
+        """#.data(using: .utf8)!
+        let function = try #require(
+            (parse(ToolSchemaNormalization.ensureParameterTypes(in: body))["tools"]
+                as? [[String: Any]])?[0]["function"] as? [String: Any])
+        let properties = try #require(
+            (function["parameters"] as? [String: Any])?["properties"]
+                as? [String: Any])
+        let allow = try #require(properties["allow"] as? [String: Any])
+        let deny = try #require(properties["deny"] as? [String: Any])
+        #expect(allow["type"] as? String == "string")
+        #expect(
+            allow[ToolSchemaNormalization.originalBooleanSchemaKey] as? Bool
+                == true)
+        #expect(deny["type"] as? String == "string")
+        #expect(
+            deny[ToolSchemaNormalization.originalBooleanSchemaKey] as? Bool
+                == false)
+    }
+
+    @Test func reservedMetadataDetectionIsSchemaAware() {
+        let forged = #"""
+        {"tools":[{"type":"function","function":{"name":"f",
+          "parameters":{"type":"object","properties":{
+            "value":{"type":"string","x-darkbloom-original-boolean-schema":true}
+          }}}}]}
+        """#.data(using: .utf8)!
+        #expect(ToolSchemaNormalization.containsReservedMetadata(in: forged))
+
+        let propertyNameOnly = #"""
+        {"tools":[{"type":"function","function":{"name":"f",
+          "parameters":{"type":"object","properties":{
+            "x-darkbloom-original-boolean-schema":{"type":"string"}
+          }}}}]}
+        """#.data(using: .utf8)!
+        #expect(!ToolSchemaNormalization.containsReservedMetadata(in: propertyNameOnly))
+    }
 }
 
 extension ToolSchemaNormalizationTests {
@@ -122,6 +166,43 @@ extension ToolSchemaNormalizationTests {
         #expect(city["type"] as? String == "string")
         // Nullability preserved losslessly via the template-supported key.
         #expect(city["nullable"] as? Bool == true)
+    }
+
+    @Test func nullableUnionOverridesExplicitFalse() throws {
+        let body = #"""
+        {"tools":[{"type":"function","function":{"name":"f",
+          "parameters":{"type":"object","properties":{
+            "value":{"type":["STRING","NULL"],"nullable":false,"enum":[null]}}}}}]}
+        """#.data(using: .utf8)!
+
+        let out = ToolSchemaNormalization.ensureParameterTypes(in: body)
+        let function = try #require(
+            (parse(out)["tools"] as? [[String: Any]])?[0]["function"]
+                as? [String: Any])
+        let properties = try #require(
+            (function["parameters"] as? [String: Any])?["properties"]
+                as? [String: Any])
+        let value = try #require(properties["value"] as? [String: Any])
+        #expect(value["type"] as? String == "string")
+        #expect(value["nullable"] as? Bool == true)
+    }
+
+    @Test func combinatorUnionPreservesNullability() throws {
+        let body = #"""
+        {"tools":[{"type":"function","function":{"name":"f",
+          "parameters":{"type":"object","properties":{
+            "value":{"anyOf":[{"type":"string"},{"type":"null"}]},
+            "explicit":{"type":"string","anyOf":[{"type":"string"},{"type":"null"}]}
+          }}}}]}
+        """#.data(using: .utf8)!
+        let props = try #require(
+            toolParams(ToolSchemaNormalization.ensureParameterTypes(in: body))["properties"]
+                as? [String: Any])
+        let value = try #require(props["value"] as? [String: Any])
+        #expect(value["type"] as? String == "string")
+        #expect(value["nullable"] as? Bool == true)
+        let explicit = try #require(props["explicit"] as? [String: Any])
+        #expect(explicit["nullable"] == nil)
     }
 
     @Test func collapsesArrayTypeSkippingLeadingNull() throws {

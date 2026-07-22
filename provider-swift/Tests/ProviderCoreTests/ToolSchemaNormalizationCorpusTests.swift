@@ -29,9 +29,16 @@ struct ToolSchemaNormalizationCorpusTests {
         (node as? [String: Any])?["type"] as? String
     }
 
+    /// A bare `{}` property is the "anything" schema — semantically the
+    /// boolean `true` schema — so it gets the same render-safe rewrite with
+    /// the marker, letting auto validation restore allow-all semantics.
     @Test func emptyPropertySchemaGainsStringType() throws {
         let props = try normalizedProps(#"{"type":"object","properties":{"x":{}}}"#)
-        #expect(typeOf(props["x"]) == "string")
+        let x = try #require(props["x"] as? [String: Any])
+        #expect(x["type"] as? String == "string")
+        #expect(
+            x[ToolSchemaNormalization.originalBooleanSchemaKey] as? Bool == true)
+        #expect(x.count == 2)
     }
 
     @Test func markerlessAnnotationOnlyNodesGainStringType() throws {
@@ -42,7 +49,6 @@ struct ToolSchemaNormalizationCorpusTests {
             "format-only": #"{"format":"date-time"}"#,
             "pattern-only": #"{"pattern":"^a"}"#,
             "ref-only": ##"{"$ref":"#/$defs/x"}"##,
-            "minimum-only": #"{"minimum":1}"#,
             "maxLength-only": #"{"maxLength":10}"#,
         ]
         for (name, schema) in cases {
@@ -58,10 +64,14 @@ struct ToolSchemaNormalizationCorpusTests {
     @Test func booleanPropertySchemasBecomeStringTyped() throws {
         let props = try normalizedProps(
             #"{"type":"object","properties":{"x":true,"y":false}}"#)
-        for name in ["x", "y"] {
+        for (name, expected) in ["x": true, "y": false] {
             let node = try #require(props[name] as? [String: Any], "\(name)")
             #expect(node["type"] as? String == "string", "\(name)")
-            #expect(node.count == 1, "\(name)")
+            #expect(
+                node[ToolSchemaNormalization.originalBooleanSchemaKey] as? Bool
+                    == expected,
+                "\(name)")
+            #expect(node.count == 2, "\(name)")
         }
     }
 
@@ -71,6 +81,9 @@ struct ToolSchemaNormalizationCorpusTests {
         let arr = try #require(props["arr"] as? [String: Any])
         let items = try #require(arr["items"] as? [String: Any])
         #expect(items["type"] as? String == "string")
+        #expect(
+            items[ToolSchemaNormalization.originalBooleanSchemaKey] as? Bool
+                == true)
     }
 
     @Test func scalarNonStringTypeCollapses() throws {
@@ -105,8 +118,11 @@ struct ToolSchemaNormalizationCorpusTests {
         #expect(pair["type"] as? String == "array")
         let members = try #require(pair["prefixItems"] as? [Any])
         #expect(members.count == 3)
-        for member in members {
-            #expect(typeOf(member) == "string")
+        // `{}` and boolean members default to string; a const member keeps
+        // its value's type ("number" for const 1) so validation stays
+        // satisfiable.
+        for (index, want) in ["string", "number", "string"].enumerated() {
+            #expect(typeOf(members[index]) == want, "prefixItems[\(index)]")
         }
     }
 
@@ -123,12 +139,57 @@ struct ToolSchemaNormalizationCorpusTests {
     @Test func markerlessUnionMembersAreSchemas() throws {
         let props = try normalizedProps(
             #"{"type":"object","properties":{"u":{"anyOf":[{},{"const":3}]},"o":{"oneOf":[{"format":"uuid"}]},"a":{"allOf":[{}]}}}"#)
-        for (name, key) in [("u", "anyOf"), ("o", "oneOf"), ("a", "allOf")] {
+        for name in ["u", "a"] {
             let node = try #require(props[name] as? [String: Any], "\(name)")
-            let members = try #require(node[key] as? [Any], "\(name)")
-            for member in members {
-                #expect(typeOf(member) == "string", "\(name).\(key)")
-            }
+            #expect(
+                node[ToolSchemaNormalization.originalBooleanSchemaKey] as? Bool
+                    == true,
+                "\(name)")
+        }
+        let one = try #require(props["o"] as? [String: Any])
+        let members = try #require(one["oneOf"] as? [Any])
+        #expect(members.count == 1)
+        #expect(typeOf(members[0]) == "string")
+    }
+
+    /// A typeless node with const/enum keeps its original value semantics:
+    /// the injected render type comes from the finite values, not the string
+    /// default (which made every schema-valid non-string emission fail
+    /// post-generation validation), and a null member beside a concrete one
+    /// is preserved as nullable. Mirror of the coordinator corpus test.
+    @Test func typelessFiniteValuesKeepOriginalSemantics() throws {
+        let props = try normalizedProps(
+            #"{"type":"object","properties":{"count":{"const":1},"level":{"enum":[1,2,null]},"flag":{"const":true},"tag":{"enum":["a","b"]},"none":{"const":null}}}"#)
+        for (name, want) in [
+            ("count", "number"),
+            ("level", "number"),
+            ("flag", "boolean"),
+            ("tag", "string"),
+            ("none", "null"),
+        ] {
+            #expect(typeOf(props[name]) == want, "\(name)")
+        }
+        let level = try #require(props["level"] as? [String: Any])
+        #expect(level["nullable"] as? Bool == true)
+        let count = try #require(props["count"] as? [String: Any])
+        #expect(count["nullable"] == nil)
+    }
+
+    /// A typeless node whose only content is type-scoped assertions keeps the
+    /// family those assertions constrain: `{"minimum":5}` accepts 6, so the
+    /// injected render type must be "number", not the string default. Mirror
+    /// of the coordinator corpus test.
+    @Test func typelessAssertionFamiliesKeepOriginalSemantics() throws {
+        let props = try normalizedProps(
+            #"{"type":"object","properties":{"score":{"minimum":5,"maximum":10},"steps":{"multipleOf":2},"list":{"minItems":1,"uniqueItems":true},"shape":{"required":["a"]},"code":{"pattern":"^ab$"}}}"#)
+        for (name, want) in [
+            ("score", "number"),
+            ("steps", "number"),
+            ("list", "array"),
+            ("shape", "object"),
+            ("code", "string"),
+        ] {
+            #expect(typeOf(props[name]) == want, "\(name)")
         }
     }
 

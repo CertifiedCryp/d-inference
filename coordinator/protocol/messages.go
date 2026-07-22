@@ -136,6 +136,10 @@ type ModelInfo struct {
 	// explicit false SURVIVES the wire — false is the exclusion signal, while
 	// nil is omitted entirely.
 	TemplateRenderOK *bool `json:"template_render_ok,omitempty"`
+	// ToolConstraintTemplateHash binds inference-time grammar capability to the
+	// exact chat-template bytes the provider loaded. It is informational unless
+	// the provider also advertises the model under tool_constraint_models.
+	ToolConstraintTemplateHash string `json:"tool_constraint_template_hash,omitempty"`
 }
 
 // PrefixCacheV2Capability binds one live model slot to the exact artifacts and
@@ -171,6 +175,8 @@ type RegisterMessage struct {
 	PrivateOnly             bool                      `json:"private_only,omitempty"`              // when true, this machine serves only its owner's self-route requests, never the public fleet
 	PrefixCacheProtocol     int                       `json:"prefix_cache_protocol,omitempty"`     // provider-confirmed prefix-cache protocol version
 	PrefixCacheV2Models     []PrefixCacheV2Capability `json:"prefix_cache_v2_models,omitempty"`
+	ToolConstraintProtocol  int                       `json:"tool_constraint_protocol,omitempty"` // inference-time tool grammar protocol version
+	ToolConstraintModels    []string                  `json:"tool_constraint_models,omitempty"`   // concrete model IDs enforced by this provider
 
 	// APNs code-identity attestation (v0.6.0): the device token the coordinator
 	// pushes the E_K(nonce) code-identity challenge to, and which APNs environment
@@ -470,6 +476,10 @@ type InferenceRequestMessage struct {
 	CacheReceiptNonce   string            `json:"cache_receipt_nonce,omitempty"`
 	CacheScope          string            `json:"cache_scope,omitempty"`
 	PrefixCacheProtocol int               `json:"prefix_cache_protocol,omitempty"`
+	// ToolSchemaMetadataProtocol authenticates coordinator-owned schema
+	// metadata carried inside the encrypted body. Version 1 means the
+	// coordinator rejected client-forged reserved keys before normalization.
+	ToolSchemaMetadataProtocol int `json:"tool_schema_metadata_protocol,omitempty"`
 }
 
 // EncryptedPayload carries a NaCl Box encrypted message.
@@ -555,10 +565,13 @@ type DesiredModelsMessage struct {
 // coordinator cross-checks each WeightHash against the catalog before merging,
 // so a verified build becomes routable immediately — without the disruption of
 // a full re-register (which would reset reputation and restart the challenge
-// loop) and without bypassing weight-hash verification.
+// loop) and without bypassing weight-hash verification. Current providers also
+// refresh concrete-model tool-constraint capability; legacy updates omit it.
 type ModelsUpdateMessage struct {
-	Type   string      `json:"type"`
-	Models []ModelInfo `json:"models"`
+	Type                   string      `json:"type"`
+	Models                 []ModelInfo `json:"models"`
+	ToolConstraintProtocol int         `json:"tool_constraint_protocol,omitempty"`
+	ToolConstraintModels   []string    `json:"tool_constraint_models,omitempty"`
 }
 
 // PrefetchModelStatusMessage is the provider's progress/terminal reply to a

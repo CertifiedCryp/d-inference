@@ -16,22 +16,96 @@ import (
 // anyOf / oneOf / allOf IS a schema and is guaranteed a string `type`.
 
 // A property schema that is a bare `{}` — the "anything" schema, valid and
-// emitted by real SDKs for untyped params — must gain {"type":"string"}.
+// emitted by real SDKs for untyped params — is semantically the boolean
+// `true` schema, so it gets the same render-safe rewrite: a string type for
+// the template plus the original-boolean-schema marker so provider-side auto
+// validation restores allow-all semantics instead of enforcing the synthetic
+// string type.
 func TestNormalizeToolSchemas_Corpus_EmptyPropertySchema(t *testing.T) {
 	body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
 	  "parameters":{"type":"object","properties":{"x":{}}}}}]}`)
 
 	x := tsnMap(t, tsnProps(t, NormalizeToolSchemas(body))["x"], "x")
-	if got := tsnType(t, x, "x"); got != "string" {
-		t.Errorf("x type = %q, want string", got)
+	expected := map[string]any{
+		"type":                   "string",
+		originalBooleanSchemaKey: true,
+	}
+	if !reflect.DeepEqual(x, expected) {
+		t.Errorf("x = %#v, want %#v", x, expected)
+	}
+}
+
+func TestNormalizeToolSchemas_Corpus_ConstantCombinatorsPreserveBooleanSemantics(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
+	  "parameters":{"type":"object","properties":{
+	    "all":{"allOf":[{}],"description":"anything"},
+	    "any":{"anyOf":[{"type":"integer"},true]},
+	    "deny":{"allOf":[{"type":"integer"},false]},
+	    "one":{"oneOf":[true]}
+	  }}}}]}`)
+	props := tsnProps(t, NormalizeToolSchemas(body))
+	for name, want := range map[string]bool{
+		"all": true, "any": true, "deny": false, "one": true,
+	} {
+		node := tsnMap(t, props[name], name)
+		if got, ok := node[originalBooleanSchemaKey].(bool); !ok || got != want {
+			t.Errorf("%s marker = %#v, want %v", name, node, want)
+		}
+		if node["type"] != "string" {
+			t.Errorf("%s type = %#v, want render-safe string", name, node["type"])
+		}
+	}
+	all := tsnMap(t, props["all"], "all")
+	if all["description"] != "anything" {
+		t.Errorf("annotation lost during combinator fold: %#v", all)
+	}
+}
+
+// A required/named request with an empty `{}` property compiles as a free
+// string in grammar modes: the marker rewrite must survive constrained
+// re-validation instead of failing on the reserved key.
+func TestConstrainedValidationAcceptsNormalizedEmptySchemaMarker(t *testing.T) {
+	body := []byte(`{
+		"model":"m",
+		"messages":[{"role":"user","content":"x"}],
+		"tools":[{"type":"function","function":{
+			"name":"lookup",
+			"parameters":{"type":"object","properties":{"x":{}}}
+		}}],
+		"tool_choice":"required"
+	}`)
+	if _, err := validateToolConstraintRequest(body); err != nil {
+		t.Fatalf("pre-normalization validation: %v", err)
+	}
+	normalized := NormalizeToolSchemas(body)
+	if _, err := validateToolConstraintRequest(normalized); err != nil {
+		t.Fatalf("post-normalization validation: %v\n%s", err, normalized)
+	}
+
+	// Any marker-bearing shape other than the exact rewrite fails closed.
+	forged := []byte(`{
+		"model":"m",
+		"messages":[{"role":"user","content":"x"}],
+		"tools":[{"type":"function","function":{
+			"name":"lookup",
+			"parameters":{"type":"object","properties":{"x":{
+				"type":"string",
+				"x-darkbloom-original-boolean-schema":false
+			}}}
+		}}],
+		"tool_choice":"required"
+	}`)
+	if _, err := validateToolConstraintRequest(forged); err == nil {
+		t.Fatal("non-canonical marker shape accepted in constrained mode")
 	}
 }
 
 // Property schemas whose ONLY content is a non-marker annotation/validation
-// key (const / default / title / format / pattern / $ref / minimum /
-// maxLength) are valid JSON Schema, carried no marker key, and previously
-// stayed typeless. Every one must gain a string type with its original key
-// preserved.
+// key (const / default / title / format / pattern / $ref / maxLength) are
+// valid JSON Schema, carried no marker key, and previously stayed typeless.
+// Every one must gain a string type with its original key preserved
+// (string-family assertions like pattern/maxLength infer "string"; annotations
+// like default/title/format fall to the string default).
 func TestNormalizeToolSchemas_Corpus_MarkerlessAnnotationOnlyNodes(t *testing.T) {
 	cases := map[string]string{
 		"const-only":     `{"const":"fixed"}`,
@@ -40,7 +114,6 @@ func TestNormalizeToolSchemas_Corpus_MarkerlessAnnotationOnlyNodes(t *testing.T)
 		"format-only":    `{"format":"date-time"}`,
 		"pattern-only":   `{"pattern":"^a"}`,
 		"ref-only":       `{"$ref":"#/$defs/x"}`,
-		"minimum-only":   `{"minimum":1}`,
 		"maxLength-only": `{"maxLength":10}`,
 	}
 	for name, schema := range cases {
@@ -58,18 +131,49 @@ func TestNormalizeToolSchemas_Corpus_MarkerlessAnnotationOnlyNodes(t *testing.T)
 	}
 }
 
+// A typeless node whose only content is type-scoped assertions keeps the
+// family those assertions constrain: `{"minimum":5}` accepts 6, so the
+// injected render type must be "number" — the string default would make
+// every schema-valid emission fail post-generation validation.
+func TestNormalizeToolSchemas_Corpus_TypelessAssertionFamilies(t *testing.T) {
+	cases := map[string]struct {
+		schema string
+		want   string
+	}{
+		"minimum":       {schema: `{"minimum":1}`, want: "number"},
+		"multipleOf":    {schema: `{"multipleOf":2}`, want: "number"},
+		"minItems":      {schema: `{"minItems":1,"maxItems":4}`, want: "array"},
+		"uniqueItems":   {schema: `{"uniqueItems":true}`, want: "array"},
+		"required":      {schema: `{"required":["a"]}`, want: "object"},
+		"minProperties": {schema: `{"minProperties":1}`, want: "object"},
+	}
+	for name, tc := range cases {
+		body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
+		  "parameters":{"type":"object","properties":{"x":` + tc.schema + `}}}}]}`)
+		x := tsnMap(t, tsnProps(t, NormalizeToolSchemas(body))["x"], name)
+		if got := tsnType(t, x, name); got != tc.want {
+			t.Errorf("%s: type = %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
 // Boolean property schemas (`"x": true` / `"y": false`) are valid JSON Schema
 // (allow-all / deny-all). The template subscripts every property value, so
-// booleans must be replaced with {"type":"string"}.
+// booleans become render-safe string schemas while retaining their original
+// semantics for provider-side auto validation.
 func TestNormalizeToolSchemas_Corpus_BooleanPropertySchemas(t *testing.T) {
 	body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
 	  "parameters":{"type":"object","properties":{"x":true,"y":false}}}}]}`)
 
 	props := tsnProps(t, NormalizeToolSchemas(body))
-	for _, name := range []string{"x", "y"} {
+	for name, want := range map[string]bool{"x": true, "y": false} {
 		node := tsnMap(t, props[name], name)
-		if !reflect.DeepEqual(node, map[string]any{"type": "string"}) {
-			t.Errorf("%s = %#v, want {\"type\":\"string\"}", name, node)
+		expected := map[string]any{
+			"type":                   "string",
+			originalBooleanSchemaKey: want,
+		}
+		if !reflect.DeepEqual(node, expected) {
+			t.Errorf("%s = %#v, want %#v", name, node, expected)
 		}
 	}
 }
@@ -81,8 +185,12 @@ func TestNormalizeToolSchemas_Corpus_BooleanItems(t *testing.T) {
 
 	arr := tsnMap(t, tsnProps(t, NormalizeToolSchemas(body))["arr"], "arr")
 	items := tsnMap(t, arr["items"], "arr.items")
-	if !reflect.DeepEqual(items, map[string]any{"type": "string"}) {
-		t.Errorf("items = %#v, want {\"type\":\"string\"}", items)
+	expected := map[string]any{
+		"type":                   "string",
+		originalBooleanSchemaKey: true,
+	}
+	if !reflect.DeepEqual(items, expected) {
+		t.Errorf("items = %#v, want %#v", items, expected)
 	}
 }
 
@@ -120,10 +228,14 @@ func TestNormalizeToolSchemas_Corpus_PatternProperties(t *testing.T) {
 
 	env := tsnMap(t, tsnProps(t, NormalizeToolSchemas(body))["env"], "env")
 	pp := tsnMap(t, env["patternProperties"], "env.patternProperties")
-	for _, name := range []string{"^ENV_", "^NUM_", "^ANY_"} {
+	// `{}` and boolean values default to string; the minimum-bearing value
+	// keeps its assertion's number family so validation stays satisfiable.
+	for name, want := range map[string]string{
+		"^ENV_": "string", "^NUM_": "number", "^ANY_": "string",
+	} {
 		node := tsnMap(t, pp[name], name)
-		if got := tsnType(t, node, name); got != "string" {
-			t.Errorf("patternProperties[%q] type = %q, want string", name, got)
+		if got := tsnType(t, node, name); got != want {
+			t.Errorf("patternProperties[%q] type = %q, want %q", name, got, want)
 		}
 	}
 	// A typeless node whose only marker is patternProperties infers "object".
@@ -150,10 +262,12 @@ func TestNormalizeToolSchemas_Corpus_PrefixItems(t *testing.T) {
 	if !ok || len(prefix) != 3 {
 		t.Fatalf("prefixItems = %v, want 3 members", pair["prefixItems"])
 	}
-	for i, member := range prefix {
-		node := tsnMap(t, member, "prefixItems member")
-		if got := tsnType(t, node, "prefixItems member"); got != "string" {
-			t.Errorf("prefixItems[%d] type = %q, want string", i, got)
+	// `{}` and boolean members default to string; a const member keeps its
+	// value's type ("number" for const 1) so validation stays satisfiable.
+	for i, want := range []string{"string", "number", "string"} {
+		node := tsnMap(t, prefix[i], "prefixItems member")
+		if got := tsnType(t, node, "prefixItems member"); got != want {
+			t.Errorf("prefixItems[%d] type = %q, want %q", i, got, want)
 		}
 	}
 }
@@ -186,18 +300,24 @@ func TestNormalizeToolSchemas_Corpus_MarkerlessUnionMembers(t *testing.T) {
 	    "a":{"allOf":[{}]}}}}}]}`)
 
 	props := tsnProps(t, NormalizeToolSchemas(body))
-	for name, key := range map[string]string{"u": "anyOf", "o": "oneOf", "a": "allOf"} {
+	// anyOf containing allow-all and allOf containing only allow-all are
+	// themselves allow-all; preserve that instead of inheriting the marker's
+	// render-only string type.
+	for _, name := range []string{"u", "a"} {
 		node := tsnMap(t, props[name], name)
-		members, ok := node[key].([]any)
-		if !ok || len(members) == 0 {
-			t.Fatalf("%s.%s = %v, want non-empty array", name, key, node[key])
+		if marker, ok := node[originalBooleanSchemaKey].(bool); !ok || !marker {
+			t.Errorf("%s = %#v, want allow-all marker", name, node)
 		}
-		for i, member := range members {
-			m := tsnMap(t, member, key+" member")
-			if got := tsnType(t, m, key+" member"); got != "string" {
-				t.Errorf("%s.%s[%d] type = %q, want string", name, key, i, got)
-			}
-		}
+	}
+	// A non-constant oneOf still retains and normalizes its member.
+	o := tsnMap(t, props["o"], "o")
+	members, ok := o["oneOf"].([]any)
+	if !ok || len(members) != 1 {
+		t.Fatalf("o.oneOf = %v, want one member", o["oneOf"])
+	}
+	member := tsnMap(t, members[0], "oneOf member")
+	if got := tsnType(t, member, "oneOf member"); got != "string" {
+		t.Errorf("o.oneOf[0] type = %q, want string", got)
 	}
 }
 
@@ -227,6 +347,43 @@ func TestNormalizeToolSchemas_Corpus_RootStaysMarkerGated(t *testing.T) {
 	out := NormalizeToolSchemas(body)
 	if !bytes.Equal(out, body) {
 		t.Fatalf("marker-less roots must not be repaired (no re-encode):\n in: %s\nout: %s", body, out)
+	}
+}
+
+// A typeless node with const/enum keeps its original value semantics: the
+// injected render type comes from the finite values, not the string default
+// (which made every schema-valid non-string emission fail post-generation
+// validation), and a null member beside a concrete one is preserved as
+// nullable.
+func TestNormalizeToolSchemas_Corpus_TypelessFiniteValues(t *testing.T) {
+	body := []byte(`{"tools":[{"type":"function","function":{"name":"f",
+	  "parameters":{"type":"object","properties":{
+	    "count":{"const":1},
+	    "level":{"enum":[1,2,null]},
+	    "flag":{"const":true},
+	    "tag":{"enum":["a","b"]},
+	    "none":{"const":null}}}}}]}`)
+
+	props := tsnProps(t, NormalizeToolSchemas(body))
+	for name, want := range map[string]string{
+		"count": "number",
+		"level": "number",
+		"flag":  "boolean",
+		"tag":   "string",
+		"none":  "null",
+	} {
+		node := tsnMap(t, props[name], name)
+		if got := tsnType(t, node, name); got != want {
+			t.Errorf("%s type = %q, want %q", name, got, want)
+		}
+	}
+	level := tsnMap(t, props["level"], "level")
+	if level["nullable"] != true {
+		t.Errorf("level nullable = %v, want true", level["nullable"])
+	}
+	count := tsnMap(t, props["count"], "count")
+	if _, hasNullable := count["nullable"]; hasNullable {
+		t.Errorf("count gained a spurious nullable: %#v", count)
 	}
 }
 
