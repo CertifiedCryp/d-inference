@@ -148,5 +148,11 @@ public enum ProviderCore {
     // 0.7.13 adds bounded, privacy-safe cache eligibility and donation outcome
     // snapshots. The optional fields are forward-compatible and never gate
     // registration; strict v2 routing capabilities remain independently validated.
-    public static let version = "0.7.13"
+    // 0.7.14 replaces the CBv2 flat 120s request wall with monotonic phase
+    // leases (admission-only timeout, prefill/decode progress leases, generous
+    // safety ceiling): a request producing tokens is never expired. Terminals
+    // carry a typed terminal_cause and reconciled attempt_usage on the wire
+    // (optional fields; old coordinators ignore them). Kill-switch:
+    // DARKBLOOM_CBV2_LEGACY_REQUEST_TIMEOUT=1 restores the legacy wall.
+    public static let version = "0.7.14"
 }
