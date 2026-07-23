@@ -37,54 +37,50 @@ How to build, deploy, and update the Darkbloom coordinator and the Swift provide
 
 The live host still has stale Caddy `/acme/*` routing and lacks
 `stream_close_delay 5m`. Those are separate Caddy-maintenance changes. Do not
-reload Caddy during the v0.7.12 coordinator swap because that reconnects the
+reload Caddy during a coordinator swap because that reconnects the
 provider fleet; the static certificate and loaded config remain in place.
 
-## v0.7.12 release order
+## v0.7.13 release order
 
 Shipping code and activating optimizations are separate operations:
 
-1. Publish the signed/notarized v0.7.12 provider while the v0.7.11 coordinator
-   remains deployed. The old coordinator ignores the additive capability
-   advertisement, and the mixed-version integration gate proves candidate
-   inference still works.
-2. Wait for enough routable v0.7.12 providers per public model. The v0.7.12
-   coordinator intentionally fails `none`, `required`, and exact named tool
-   choices closed on older providers; deploying it first would create avoidable
-   503s.
-3. Deploy the v0.7.12 coordinator with
-   `EIGENINFERENCE_CACHE_ROUTING_MODE=off`,
-   `EIGENINFERENCE_PROMPT_SIDECAR_ENABLED=true`, and
-   `EIGENINFERENCE_PROMPT_SIDECAR_ARTIFACT_ROOT=/mnt/disks/userdata/prompt-contracts`.
-   `/data` is a symlink and is invalid for the symlink-rejecting artifact loader.
-4. Exercise chat completions, completions, Responses, and Anthropic Messages,
+1. Confirm the deployed coordinator already exposes
+   `providers.unreported_loaded_models`, `lifecycle.donation_outcomes`, and
+   `lifecycle.holder_removed` in `/v1/cache/status`. Do not redeploy it solely
+   for this provider release. The new fields are optional observability;
+   v0.7.12 providers omit them and remain routable.
+2. Publish the signed/notarized v0.7.13 provider. A pre-v0.7.13 coordinator
+   ignores the additive telemetry, but coordinator-first preserves each
+   provider's initial registration snapshot.
+3. Wait for enough routable v0.7.13 providers per public model. Require
+   `/v1/cache/status` to move loaded models from `unreported_loaded_models` into
+   bounded state/reason/backend/replay-strategy aggregates without registration
+   churn.
+4. Verify donation outcome counters and holder removal reasons remain monotonic,
+   identity-free, and consistent with SSD lookup/donation lifecycle totals.
+5. Exercise chat completions, completions, Responses, and Anthropic Messages,
    including auto/none/required/named tools, stop sequences, body limits, and
-   mixed-version cold fallback.
-5. Require `/v1/cache/status` to show routing off, `sidecar.ready=true`,
-   `preload.ready=true`, matching nonzero child/preload generations, bounded
-   RSS, no restart loop, and all active prompt artifacts ready with zero
-   failures.
-6. Keep exact-cache routing off. Activation requires a real positive-hit proof,
-   stable telemetry, and a new independent 256-bit
-   `EIGENINFERENCE_CACHE_MASTER_KEY`.
-7. MTP default-on remains out of v0.7.12. Keep the existing default-off
-   implementation canary-only until its separate rollout is reviewed.
+   mixed-version fallback.
+6. Provider publication must not change any operator-selected cache control:
+   routing mode, activation percentage, plan-QPS cap, holder TTL, maximum
+   holders, maximum discount, maximum cost fraction, or master key. Use the
+   complete root-only before/after environment digest in the deploy procedure,
+   not a partial visible-field comparison.
+7. MTP remains default-off and is a separate rollout.
 
 The GitHub `benchmarks` environment approval is a human release gate. Do not
 bypass or weaken it.
 
-## Post-v0.7.12 exact-cache reactivation
+## Exact-cache ongoing rollout
 
-The first production activation exposed a cold-load/restart loop, so an `on`
-status by itself is not an activation gate. The next coordinator upgrade must
-be deployed with routing `off` and these checked-in operational defaults:
+The first production activation exposed a cold-load/restart loop; PR #565
+repaired that path and production now carries an operator-selected staged
+activation. An `on` status by itself is still not a promotion gate. Provider
+releases and unrelated coordinator swaps must preserve the existing mode,
+percentage, QPS cap, TTL, holder limits, discounts, cost fraction, and master
+key exactly.
 
-```text
-EIGENINFERENCE_CACHE_ROUTING_PERCENT=1
-EIGENINFERENCE_CACHE_ROUTING_MAX_PLAN_QPS=1
-```
-
-Before changing `MODE=on`, require all of the following:
+Before changing any cache-routing control, require all of the following:
 
 1. Every active prompt artifact is ready and the sidecar has sequentially
    preloaded the complete active contract set. A contract that appears after
@@ -125,33 +121,25 @@ Interpret provider eligibility in this order:
    `capability_change`, `miss_invalidation`, and `capacity_eviction`; compare
    their deltas before diagnosing unexplained holder loss.
 
-After a human changes `MODE=on`, hold the first stage at 1% and 1 plan/second.
-Require both a 30-minute clean window and at least 100 successful plans before
-raising either cap. A clean window has zero restarts, bounded RSS, no health
-failure streak, a negligible planner-failure rate, and positive SSD
-miss/donation/hit plus cached-token and estimated-TTFT-saved evidence. Raise
-only one cap per observation window; the intended sequence is 1%, 5%, 25%, and
-100%, with the QPS cap raised separately toward the proven 25 requests/second.
+For every promotion, require both a 30-minute clean window and at least 100
+successful plans before raising another control. A clean window has zero
+restarts, bounded RSS, no health failure streak, a negligible planner-failure
+rate, and positive SSD miss/donation/hit plus cached-token and
+estimated-TTFT-saved evidence. Raise only one control per observation window.
 Any restart loop, sustained timeout/overload growth, preload failure, or memory
-growth rolls back immediately by setting `MODE=off` before changing binaries.
+growth rolls back immediately to the previously captured operator state.
 
-### Exact-cache activation gate
+### Exact-cache promotion gate
 
-Activation is a separate, human-reviewed container swap after the coordinator
-has passed the routing-off gate in step 5. Editing `/etc/d-inference/env` and
-restarting the existing container is insufficient: Docker does not reread an
-`--env-file` on restart. Change `EIGENINFERENCE_CACHE_ROUTING_MODE=on`, leave
-the first-stage caps at exactly `1` and `1`, then repeat the step 4 swap with
-the same reviewed immutable image digest. Before that swap, verify the three
-controls together:
+Every control change is a separate, human-reviewed container swap. Editing
+`/etc/d-inference/env` and restarting the existing container is insufficient:
+Docker does not reread an `--env-file` on restart. Before a swap, record every
+cache control through the root-only hash procedure in step 2, change only the
+approved control, and verify the visible activation controls together:
 
 ```bash
 sudo grep -E '^EIGENINFERENCE_CACHE_ROUTING_(MODE|PERCENT|MAX_PLAN_QPS)=' \
   /etc/d-inference/env
-# Required first-live values:
-# EIGENINFERENCE_CACHE_ROUTING_MODE=on
-# EIGENINFERENCE_CACHE_ROUTING_PERCENT=1
-# EIGENINFERENCE_CACHE_ROUTING_MAX_PLAN_QPS=1
 ```
 
 After the activated container is ready, capture a protected baseline. Capture
@@ -164,6 +152,9 @@ EXACT_CACHE_GATE_DIR="$(mktemp -d /tmp/exact-cache-gate.XXXXXX)"
 EXACT_CACHE_ADMIN_KEY="$(sudo sed -n 's/^EIGENINFERENCE_ADMIN_KEY=//p' /etc/d-inference/env)"
 curl -fsS localhost:8080/v1/cache/status \
   >"$EXACT_CACHE_GATE_DIR/start-status.json"
+EXPECTED_CACHE_MODE="$(jq -r '.routing_mode' "$EXACT_CACHE_GATE_DIR/start-status.json")"
+EXPECTED_CACHE_PERCENT="$(jq -r '.activation.percent' "$EXACT_CACHE_GATE_DIR/start-status.json")"
+EXPECTED_CACHE_MAX_PLAN_QPS="$(jq -r '.activation.max_plan_qps' "$EXACT_CACHE_GATE_DIR/start-status.json")"
 curl -fsS -H "Authorization: Bearer $EXACT_CACHE_ADMIN_KEY" \
   localhost:8080/v1/admin/metrics \
   >"$EXACT_CACHE_GATE_DIR/start-metrics.json"
@@ -188,15 +179,18 @@ intentionally fails closed when any required metric is absent.
 
 ```bash
 jq -e -n \
+  --arg expected_mode "$EXPECTED_CACHE_MODE" \
+  --argjson expected_percent "$EXPECTED_CACHE_PERCENT" \
+  --argjson expected_max_plan_qps "$EXPECTED_CACHE_MAX_PLAN_QPS" \
   --slurpfile ss "$EXACT_CACHE_GATE_DIR/start-status.json" \
   --slurpfile es "$EXACT_CACHE_GATE_DIR/end-status.json" \
   --slurpfile sm "$EXACT_CACHE_GATE_DIR/start-metrics.json" \
   --slurpfile em "$EXACT_CACHE_GATE_DIR/end-metrics.json" '
   ($ss[0]) as $s | ($es[0]) as $e |
   ($sm[0]) as $ms | ($em[0]) as $me |
-  $e.routing_mode == "on" and
-  $e.activation.percent == 1 and
-  $e.activation.max_plan_qps == 1 and
+  $e.routing_mode == $expected_mode and
+  $e.activation.percent == $expected_percent and
+  $e.activation.max_plan_qps == $expected_max_plan_qps and
   $e.sidecar.ready == true and $e.preload.ready == true and
   $e.preload.child_generation == $e.sidecar.child_generation and
   $e.preload.child_generation == $s.preload.child_generation and
@@ -235,10 +229,12 @@ jq -e -n \
 
 For every later stage, change only one of percentage or QPS, recreate the
 container from the same reviewed digest, take fresh start/end snapshots, and
-apply the same 30-minute/100-plan delta gate with the new expected cap. Advance
-the percentage through 1 -> 5 -> 25 -> 100; raise QPS separately, never above
-the proven 25 requests/second. On any gate failure, set `MODE=off` and recreate
-the container from the reviewed digest before investigating or changing code.
+apply the same 30-minute/100-plan delta gate with the new expected cap. Preserve
+the current production stage unless a separately approved promotion changes one
+control; never reset to historical 1%/1-QPS defaults. Never raise planning above
+the proven 25 requests/second. On a cache-related gate failure, recreate the
+last known-good container and env snapshot (or set `MODE=off` when no staged
+cache state is trustworthy) before investigating or changing code.
 
 ## Steps — coordinator deploy (prod)
 
@@ -318,6 +314,17 @@ Then, on the VM: pull the image and snapshot current health.
 ```bash
 sudo docker pull us-east4-docker.pkg.dev/darkbloom-mainnet/coordinator/coordinator:<TAG>
 curl -s localhost:8080/health   # note the provider count for post-swap comparison
+curl -s localhost:8080/v1/cache/status | jq -S \
+  '{routing_mode, percent:.activation.percent, max_plan_qps:.activation.max_plan_qps}' \
+  > /tmp/darkbloom-cache-controls.before.json
+sudo sh -c 'umask 077
+  awk -F= '\''$1 ~ /^EIGENINFERENCE_CACHE_ROUTING_/ ||
+             $1 == "EIGENINFERENCE_CACHE_MASTER_KEY" { print }'\'' \
+    /etc/d-inference/env |
+    LC_ALL=C sort |
+    sha256sum |
+    awk '\''{ print $1 }'\'' \
+    > /tmp/darkbloom-cache-env.pre-refresh.sha256'
 ```
 
 ### 3. Env changes (if any)
@@ -355,24 +362,37 @@ sudo REQUIRED_FILE=/usr/local/lib/darkbloom-env/required-env-keys.txt \
   DEFAULTS_FILE=/usr/local/lib/darkbloom-env/release-env-defaults \
   /usr/local/sbin/darkbloom-refresh-env --apply
 
-# Verify every non-secret rollout control. Do not proceed if stale custom
-# throttle values survived the refresh.
+# Verify every non-secret rollout control. Custom production values are
+# authoritative; do not proceed if the refresh changed an approved value.
 sudo grep -E '^EIGENINFERENCE_(CACHE_ROUTING_MODE|CACHE_ROUTING_PERCENT|CACHE_ROUTING_MAX_PLAN_QPS|PROMPT_SIDECAR_ENABLED)=' \
   /etc/d-inference/env
+# Snapshot every cache-routing value after refresh and immediately before the
+# swap. This provider release permits no cache-control edit, so require equality
+# with the pre-refresh digest. Only digests are emitted; the key is never printed.
+sudo sh -c 'umask 077
+  awk -F= '\''$1 ~ /^EIGENINFERENCE_CACHE_ROUTING_/ ||
+             $1 == "EIGENINFERENCE_CACHE_MASTER_KEY" { print }'\'' \
+    /etc/d-inference/env |
+    LC_ALL=C sort |
+    sha256sum |
+    awk '\''{ print $1 }'\'' \
+    > /tmp/darkbloom-cache-env.pre-swap.sha256'
+sudo cmp /tmp/darkbloom-cache-env.pre-refresh.sha256 \
+  /tmp/darkbloom-cache-env.pre-swap.sha256
 ```
 
 The check prints only safe key names, never existing values. The apply step
 writes a same-directory temporary file, verifies that no existing key would be
 dropped, keeps a root-only timestamped backup, and atomically renames the new
-file. It never fetches or rewrites secrets. v0.7.12 has one bounded migration:
-the exact broken `/data/prompt-contracts` artifact root becomes
+file. It never fetches or rewrites secrets. The historical v0.7.12 bounded
+migration changed the exact broken `/data/prompt-contracts` artifact root to
 `/mnt/disks/userdata/prompt-contracts`; every custom value is preserved. The
 installed oneshot validates and extends the persistent file before Docker starts
 on every reboot; a missing required variable fails the unit instead of
 constructing a truncated file.
 
-New env vars take effect only on container start. The v0.7.12 swap runs the
-sidecar with the physical persistent path while cache routing remains off.
+New env vars take effect only on container start. The live env file—not release
+defaults or historical rollout values—is authoritative for cache controls.
 
 ### 4. Swap
 
@@ -413,14 +433,26 @@ pg_terminate_backend(<pid>)`); do **not** restart the container again.
 curl -s localhost:8080/health
 # Require the deployed commit/version/date embedded by cloudbuild-prod.yaml.
 curl -s localhost:8080/health | jq -e \
-  '.version == "0.7.12" and
+  '.version == "0.7.13" and
    (.build_commit | test("^[0-9a-f]{40}$")) and
    .build_date != "unknown"'
+# Cache controls are operator state, not release defaults. Require byte-for-byte
+# preservation across the swap.
+diff -u /tmp/darkbloom-cache-controls.before.json \
+  <(curl -s localhost:8080/v1/cache/status | jq -S \
+    '{routing_mode, percent:.activation.percent, max_plan_qps:.activation.max_plan_qps}')
+sudo sh -c 'umask 077
+  awk -F= '\''$1 ~ /^EIGENINFERENCE_CACHE_ROUTING_/ ||
+             $1 == "EIGENINFERENCE_CACHE_MASTER_KEY" { print }'\'' \
+    /etc/d-inference/env |
+    LC_ALL=C sort |
+    sha256sum |
+    awk '\''{ print $1 }'\'' \
+    > /tmp/darkbloom-cache-env.after.sha256'
+sudo cmp /tmp/darkbloom-cache-env.pre-swap.sha256 \
+  /tmp/darkbloom-cache-env.after.sha256
 curl -s localhost:8080/v1/cache/status | jq -e \
-  '.routing_mode == "off" and
-   .activation.percent == 1 and
-   .activation.max_plan_qps == 1 and
-   .sidecar.enabled == true and
+  '.sidecar.enabled == true and
    .sidecar.ready == true and
    .sidecar.restarts == 0 and
    .sidecar.restart_suppressed == false and
@@ -538,7 +570,7 @@ exists** — fixed by registering the release, not by bumping code.
 Before a tag exists, run:
 
 ```bash
-./scripts/check-release-version.sh 0.7.12
+./scripts/check-release-version.sh 0.7.13
 ./scripts/sync-install-embed.sh check
 ```
 
@@ -547,7 +579,7 @@ final archived CLI, and app plist. It does not mutate source to manufacture
 agreement.
 
 ```bash
-git tag -a v0.7.12 -m "Release v0.7.12"
+git tag -a v0.7.13 -m "Release v0.7.13"
 git push origin master --tags
 ```
 
@@ -600,10 +632,10 @@ semantics is the code (`coordinator/registry/`, `coordinator/api/`); the highlig
 | `EIGENINFERENCE_MODEL_SOLO_TPS_SEED` | Cold-start solo rates, `build-id=tok/s` CSV (e.g. `gemma-4-26b-qat-4bit=14,gpt-oss-20b=30`); the in-memory TPS registry is restart-wiped |
 | `EIGENINFERENCE_WARM_POOL_*` | Warm-pool controller (active; `OBSERVE_ONLY=false`) |
 | `EIGENINFERENCE_DEDICATED_MODELS` | Static dedicated-box partition (`gemma-4`) |
-| `EIGENINFERENCE_PROMPT_SIDECAR_*` | Sidecar lifecycle, independent health/planning deadlines, failure threshold, diagnostics, preload, and resource bounds. Deploy it enabled with the physical artifact root while routing remains off. |
-| `EIGENINFERENCE_CACHE_ROUTING_MODE` | Strict product switch: `off` or `on`; keep `off` through coordinator/provider deployment and preload verification. |
-| `EIGENINFERENCE_CACHE_ROUTING_PERCENT`, `_MAX_PLAN_QPS` | Independent operational caps inside `on`; production starts at deterministic 1% and 1 plan/second. |
-| `EIGENINFERENCE_CACHE_MASTER_KEY` | Independent random 256-bit key required only for a later routing activation; never derive from or reuse `MNEMONIC`, API, release, or database keys. |
+| `EIGENINFERENCE_PROMPT_SIDECAR_*` | Sidecar lifecycle, independent health/planning deadlines, failure threshold, diagnostics, preload, and resource bounds. Keep it enabled at the physical artifact root; provider releases must not alter its operator-selected values. |
+| `EIGENINFERENCE_CACHE_ROUTING_MODE` | Strict product switch: `off` or `on`. The live env value is authoritative and must survive unrelated deploys unchanged. |
+| `EIGENINFERENCE_CACHE_ROUTING_PERCENT`, `_MAX_PLAN_QPS` | Independent staged-rollout caps inside `on`. Preserve the current approved production stage; defaults apply only when bootstrapping a fresh environment. |
+| `EIGENINFERENCE_CACHE_MASTER_KEY` | Independent random 256-bit key required whenever routing is `on`. Preserve it byte-for-byte across releases; never derive from or reuse `MNEMONIC`, API, release, or database keys. |
 | `EIGENINFERENCE_IPAPI_KEY` | ip-api.com PRO key; unset falls back to the free 45 req/min tier |
 
 ## Troubleshooting

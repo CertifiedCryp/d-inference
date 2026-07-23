@@ -2,10 +2,10 @@
 set -euo pipefail
 
 CACHE_DIR=${1:-${DARKBLOOM_RELEASE_TEST_CACHE:-${TMPDIR:-/tmp}/darkbloom-release-test-cache}}
-VERSION=0.7.11
-URL=https://pub-3d1cb668259340eeb2276e1d375c846d.r2.dev/releases/v0.7.11/darkbloom-bundle-macos-arm64.tar.gz
-BUNDLE_SHA256=b1c8f8e052da20b943c099c911ae09fc2a077ef9c211d5e974ddcdf5d5c292d7
-BINARY_SHA256=324b1a497224b04255d19e3fe9c19229d95e3f5827f6628367329a888f8aa292
+VERSION=0.7.12
+URL=https://pub-3d1cb668259340eeb2276e1d375c846d.r2.dev/releases/v0.7.12/darkbloom-bundle-macos-arm64.tar.gz
+BUNDLE_SHA256=92fadb451ee1776457e9b410b6915857239b066d605067ddf50ba4e971af2f88
+BINARY_SHA256=c74b4829454bc4e2e40a0d9791458d17ba3dd278a5238ec628145b172016584d
 METALLIB_SHA256=e2d5853b79925b3661861fed79f30b1aeb636a52ebbde15b054711ce865edfaa
 
 ARCHIVE="$CACHE_DIR/v$VERSION/darkbloom-bundle-macos-arm64.tar.gz"
@@ -39,6 +39,15 @@ METALLIB="$EXTRACTED.tmp/Darkbloom.app/Contents/MacOS/mlx.metallib"
     echo "released v$VERSION binary SHA-256 mismatch" >&2
     exit 1
 }
+# These optional wire fields first ship in v0.7.13. Proving their marker strings
+# are absent from the hash-pinned v0.7.12 executable distinguishes true omission
+# from an authoritative empty telemetry snapshot.
+for marker in prefix_cache_statuses prefix_cache_donation_outcomes; do
+    if LC_ALL=C grep -a -q -F "$marker" "$BIN"; then
+        echo "released v$VERSION unexpectedly contains candidate telemetry marker $marker" >&2
+        exit 1
+    fi
+done
 [ "$(sha256 "$METALLIB")" = "$METALLIB_SHA256" ] || {
     echo "released v$VERSION metallib SHA-256 mismatch" >&2
     exit 1
