@@ -51,6 +51,45 @@ import Testing
     #expect(status == .unavailable(reason: "csrutil: failed"))
 }
 
+@Test func checkSIPEnabledReflectsInjectedRunner() {
+    func sip(_ stdout: String) -> SecurityCommandRunner {
+        SecurityCommandRunner { path, args in
+            #expect(path == "/usr/bin/csrutil")
+            #expect(args == ["status"])
+            return SecurityCommandResult(terminationStatus: 0, stdout: stdout)
+        }
+    }
+    #expect(checkSIPEnabled(runner: sip("System Integrity Protection status: enabled.\n")))
+    #expect(!checkSIPEnabled(runner: sip("System Integrity Protection status: disabled.\n")))
+    #expect(checkSIPEnabled(runner: sip(
+        """
+        System Integrity Protection status: enabled (Custom Configuration).
+
+        Configuration:
+        \tKext Signing: disabled
+        """
+    )))
+}
+
+@Test func authenticatedRootFeedsTheSecureBootCompatibilityProxy() {
+    let enabled = authenticatedRootRunner(csrutil: "Authenticated Root status: enabled\n")
+    let disabled = authenticatedRootRunner(csrutil: "Authenticated Root status: disabled\n")
+    #expect(checkAuthenticatedRootEnabled(runner: enabled))
+    #expect(checkSecureBootEnabled(runner: enabled))
+    #expect(!checkAuthenticatedRootEnabled(runner: disabled))
+    #expect(!checkSecureBootEnabled(runner: disabled))
+
+    #expect(checkAuthenticatedRootEnabled(runner: authenticatedRootRunner(
+        diskutil: "   Sealed: Yes\n")))
+    for value in ["No", "Broken"] {
+        #expect(!checkAuthenticatedRootEnabled(runner: authenticatedRootRunner(
+            diskutil: "   Sealed: \(value)\n")))
+    }
+    #expect(!checkAuthenticatedRootEnabled(runner: SecurityCommandRunner { _, _ in
+        SecurityCommandResult(terminationStatus: 1, stderr: "unreadable")
+    }))
+}
+
 @Test func binarySHA256HasherHashesDataAndFiles() throws {
     let hasher = BinarySHA256Hasher(chunkSize: 2)
     #expect(
@@ -191,24 +230,6 @@ import Testing
     #expect(String(data: explicitFalse, encoding: .utf8) == #"{"nonce":"n","sip_enabled":false,"timestamp":"t"}"#)
 }
 
-@Test func securityPostureAllowsRDMAEnabledWhenSIPIsEnabled() {
-    let posture = SecurityPosture(
-        sipEnabled: true,
-        rdmaDisabled: false,
-        secureBootEnabled: true,
-        authenticatedRootEnabled: true,
-        hardenedRuntimeEnabled: true,
-        antiDebugEnabled: true,
-        coreDumpsDisabled: true,
-        envScrubbed: true,
-        mdmEnrolled: false,
-        bundleSignatureValid: true,
-        binaryHash: "hash"
-    )
-
-    #expect(posture.isSafeToServe)
-}
-
 @Test func environmentScrubPlannerPlansWithoutMutatingEnvironment() {
     let planner = EnvironmentScrubPlanner()
     let plan = planner.plan(for: [
@@ -273,6 +294,28 @@ private func temporaryDirectory() throws -> URL {
         .appendingPathComponent("ProviderCoreSecurityTests-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
     return url
+}
+
+private func authenticatedRootRunner(
+    csrutil: String? = nil,
+    diskutil: String? = nil
+) -> SecurityCommandRunner {
+    SecurityCommandRunner { path, args in
+        switch (path, args) {
+        case ("/usr/bin/csrutil", ["authenticated-root", "status"]):
+            guard let csrutil else {
+                return SecurityCommandResult(terminationStatus: 1, stderr: "no authenticated-root fixture")
+            }
+            return SecurityCommandResult(terminationStatus: 0, stdout: csrutil)
+        case ("/usr/sbin/diskutil", ["info", "/"]):
+            guard let diskutil else {
+                return SecurityCommandResult(terminationStatus: 1, stderr: "no diskutil fixture")
+            }
+            return SecurityCommandResult(terminationStatus: 0, stdout: diskutil)
+        default:
+            return SecurityCommandResult(terminationStatus: 127, stderr: "unexpected probe: \(path) \(args)")
+        }
+    }
 }
 
 private struct PtraceCall: Equatable {

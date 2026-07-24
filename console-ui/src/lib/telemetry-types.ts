@@ -71,6 +71,8 @@ export const TELEMETRY_ALLOWED_FIELDS = new Set<string>([
   "hardware_chip",
   "memory_gb",
   "macos_version",
+  "boot_macos_major",
+  "boot_sip_status",
   "handler",
   "provider_id",
   "trust_level",

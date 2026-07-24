@@ -23,7 +23,8 @@ struct Doctor: AsyncParsableCommand {
         await runUpdateBannerIfEnabled()
 
         let snapshot = try loadRuntimeSnapshot(configOptions: configOptions)
-        var checks = buildDoctorChecks(snapshot: snapshot)
+        let bootSecurity = BootSecuritySnapshot.live()
+        var checks = buildDoctorChecks(snapshot: snapshot, bootSecurity: bootSecurity)
         checks.append(contentsOf: await buildCoordinatorDoctorChecks(
             snapshot: snapshot,
             coordinatorOverride: coordinator
@@ -51,6 +52,12 @@ struct Doctor: AsyncParsableCommand {
         print("DETAILED CHECKS")
         for check in checks {
             print("  \(check.status.marker) \(check.name): \(check.detail)")
+        }
+
+        if let guide = bootSecurityActionGuide(bootSecurity) {
+            print("")
+            print("BOOT SECURITY — ACTION REQUIRED")
+            print(guide)
         }
         if support {
             print("")
@@ -87,6 +94,13 @@ enum CheckStatus: Equatable {
         case .fail: return "[FAIL]"
         }
     }
+
+    init(_ verdict: BootSecurityVerdict) {
+        switch verdict {
+        case .pass: self = .pass
+        case .warn: self = .warn
+        }
+    }
 }
 
 struct DoctorCheck {
@@ -95,7 +109,15 @@ struct DoctorCheck {
     let detail: String
 }
 
-func buildDoctorChecks(snapshot: RuntimeSnapshot) -> [DoctorCheck] {
+func bootSecurityActionGuide(_ bootSecurity: BootSecuritySnapshot) -> String? {
+    let fixes = bootSecurity.issues.map { "\($0.name): \($0.fix)" }
+    return fixes.isEmpty ? nil : fixes.joined(separator: "\n")
+}
+
+func buildDoctorChecks(
+    snapshot: RuntimeSnapshot,
+    bootSecurity: BootSecuritySnapshot = .live()
+) -> [DoctorCheck] {
     var checks: [DoctorCheck] = []
 
     if let hardware = snapshot.hardware {
@@ -156,11 +178,16 @@ func buildDoctorChecks(snapshot: RuntimeSnapshot) -> [DoctorCheck] {
         detail: "\(snapshot.models.count) discovered"
     ))
 
-    let sipEnabled = checkSIPEnabled()
+    checks.append(.init(
+        name: "macos",
+        status: CheckStatus(bootSecurity.macOSVerdict),
+        detail: bootSecurity.macOSSummary
+    ))
+
     checks.append(.init(
         name: "sip",
-        status: sipEnabled ? .pass : .fail,
-        detail: sipEnabled ? "enabled" : "disabled"
+        status: CheckStatus(bootSecurity.sipVerdict),
+        detail: bootSecurity.sip.summary
     ))
 
     let rdmaDisabled = checkRDMADisabled()
@@ -168,13 +195,6 @@ func buildDoctorChecks(snapshot: RuntimeSnapshot) -> [DoctorCheck] {
         name: "rdma",
         status: rdmaDisabled ? .pass : .warn,
         detail: rdmaDisabled ? "disabled" : "enabled; allowed for RDMA-aware runtimes"
-    ))
-
-    let secureBoot = checkSecureBootEnabled()
-    checks.append(.init(
-        name: "secure boot",
-        status: secureBoot ? .pass : .warn,
-        detail: secureBoot ? "enabled" : "not confirmed"
     ))
 
     let authenticatedRoot = checkAuthenticatedRootEnabled()

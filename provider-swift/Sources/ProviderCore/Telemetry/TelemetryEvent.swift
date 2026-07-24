@@ -239,6 +239,7 @@ public enum TelemetryFieldFilter {
         "component", "operation", "duration_ms", "attempt", "endpoint",
         "status_code", "error_class", "error", "model", "backend",
         "exit_code", "signal", "hardware_chip", "memory_gb", "macos_version",
+        "boot_macos_major", "boot_sip_status",
         "handler", "provider_id", "trust_level", "queue_depth", "reason",
         "runtime_component", "reconnect_count", "last_error", "ws_state",
         "billing_method", "payment_failed", "target",

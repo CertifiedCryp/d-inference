@@ -36,6 +36,8 @@ struct Status: AsyncParsableCommand {
             print("Hardware: unavailable (\(snapshot.hardwareError?.localizedDescription ?? "unknown error"))")
         }
 
+        print(bootSecurityStatusLine(BootSecuritySnapshot.live()))
+
         if let scheduleConfig = config.schedule,
            let schedule = Schedule.from(config: scheduleConfig) {
             let active = schedule.isActiveNow()
@@ -67,6 +69,12 @@ struct Status: AsyncParsableCommand {
             return "on (watchdog installed but not loaded)"
         }
         return "on (watchdog not installed — run `darkbloom start` or `restart` to arm)"
+    }
+
+    func bootSecurityStatusLine(_ bootSecurity: BootSecuritySnapshot) -> String {
+        let status = bootSecurity.issues.isEmpty ? CheckStatus.pass : .warn
+        return "Local boot checks: \(status.marker) \(bootSecurity.macOSSummary); "
+            + "SIP \(bootSecurity.sip.summary); Secure Boot has no local public check"
     }
 
     /// Prints the running daemon's live state, including the coordinator's last

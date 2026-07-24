@@ -64,6 +64,9 @@ var telemetryFieldAllowlist = map[string]struct{}{
 	"hardware_chip": {},
 	"memory_gb":     {},
 	"macos_version": {},
+	// Boot-security posture (non-sensitive; provider-reported, MDM remains authoritative).
+	"boot_macos_major": {},
+	"boot_sip_status":  {},
 	// Coordinator
 	"handler":           {},
 	"provider_id":       {},
