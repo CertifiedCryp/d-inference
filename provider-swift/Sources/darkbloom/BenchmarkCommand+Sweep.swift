@@ -21,6 +21,10 @@ extension Benchmark {
             printError("--max-batch must be >= 1")
             throw ExitCode.failure
         }
+        guard decodeIterations >= 1 else {
+            printError("--decode-iterations must be >= 1")
+            throw ExitCode.failure
+        }
         let batchSizes = Array(1 ... maxBatch)
 
         let report = try await ThroughputSweep.run(
@@ -30,6 +34,7 @@ extension Benchmark {
             batchSizes: batchSizes,
             decodeTokens: decodeTokens,
             decodePromptTokens: decodePromptTokens,
+            decodeIterations: decodeIterations,
             hardware: hardware
         )
 
@@ -57,6 +62,33 @@ extension Benchmark {
             iterations: prefillIterations
         )
 
+        print(try report.jsonString())
+    }
+
+    func runArrivalInvarianceBenchmark(
+        modelID: String,
+        modelDirectory: URL
+    ) async throws {
+        guard arrivalPromptTokens >= 2 else {
+            printError("--arrival-prompt-tokens must be >= 2")
+            throw ExitCode.failure
+        }
+        guard arrivalDecodeTokens >= 2 else {
+            printError("--arrival-decode-tokens must be >= 2")
+            throw ExitCode.failure
+        }
+        guard arrivalIterations >= 1 else {
+            printError("--arrival-iterations must be >= 1")
+            throw ExitCode.failure
+        }
+
+        let report = try await ArrivalInvarianceBenchmark.run(
+            modelID: modelID,
+            modelDirectory: modelDirectory,
+            promptTokens: arrivalPromptTokens,
+            decodeTokens: arrivalDecodeTokens,
+            iterations: arrivalIterations
+        )
         print(try report.jsonString())
     }
 
