@@ -30,7 +30,20 @@ public struct BackendParityReport: Codable, Sendable {
 
     /// Bumped when the JSON shape changes so downstream parsers can gate.
     /// 2 adds the `EXPECTED_SHORTFALL` verdict.
-    public static let currentSchemaVersion = 2
+    /// 3 adds the dtype-provenance and adoption-evidence fields:
+    ///  - `BackendParityObservation.pagedPoolDType` — the RESOLVED pool dtype
+    ///    per arm, read off the constructed pool;
+    ///  - `NumericsControl.candidatePoolDType` / `.controlPoolDType` — both
+    ///    control arms' resolved dtypes, and with them the validity rule
+    ///    (`controlValidityBlocker`) that a same-dtype control is DISREGARDED
+    ///    at evaluation rather than quoted;
+    ///  - `PrefixReuse.adoptionMismatchReason` — why adoption was NOT exact
+    ///    (terminal outcomes are judged, not just token ids);
+    ///  - `PrefixReuse.adoptionInconclusiveReason` — the adoption comparison
+    ///    ran but was unjudgeable (both arms cut short identically);
+    ///    `adoptionTokenExact` stays nil and the prefix-reuse criterion is
+    ///    UNAVAILABLE, never PASS or FAIL.
+    public static let currentSchemaVersion = 3
 
     public enum Verdict: String, Codable, Sendable, CaseIterable {
         case pass = "PASS"
@@ -148,17 +161,29 @@ public struct BackendParityReport: Codable, Sendable {
         public let detail: String
         /// First flip against the unperturbed arm, when not exact.
         public let firstFlip: String?
+        /// RESOLVED pool dtype of the unperturbed candidate arm this control
+        /// compared against, read off the constructed pool — never the env
+        /// knob. Nil on artifacts that predate the field.
+        public let candidatePoolDType: String?
+        /// RESOLVED pool dtype of the control's own perturbed arm. A control
+        /// whose two arms carry the SAME dtype perturbed nothing, and
+        /// `BackendParityCriteria.controlValidityBlocker` refuses it.
+        public let controlPoolDType: String?
 
         public init(
             perturbation: String,
             tokenExact: Bool?,
             detail: String,
-            firstFlip: String? = nil
+            firstFlip: String? = nil,
+            candidatePoolDType: String? = nil,
+            controlPoolDType: String? = nil
         ) {
             self.perturbation = perturbation
             self.tokenExact = tokenExact
             self.detail = detail
             self.firstFlip = firstFlip
+            self.candidatePoolDType = candidatePoolDType
+            self.controlPoolDType = controlPoolDType
         }
 
         /// Leading clause for `token_exactness`, so the reader meets "the
@@ -499,7 +524,33 @@ public struct BackendParityObservation: Codable, Sendable, Equatable {
         /// would mean nondeterminism, which is a different finding. `nil`
         /// therefore means NOT MEASURED and must never be read as exact —
         /// the criterion says so out loud rather than passing quietly.
+        ///
+        /// "Exact" is a claim about the whole REQUEST OUTCOME, not just the
+        /// token IDs: the same tokens with different finish reasons (`stop`
+        /// on one arm, `length` or `error(…)` on the other) means adoption
+        /// changed how the request ENDED — that records `false`, with the
+        /// shape of the mismatch named in `adoptionMismatchReason`. But two
+        /// streams cut short IDENTICALLY by machinery (the same `error(…)`
+        /// on both arms) prove nothing in either direction: that records
+        /// nil with `adoptionInconclusiveReason` set, and the criterion is
+        /// UNAVAILABLE — a transient failure must not pass OR fail the gate.
         public let adoptionTokenExact: Bool?
+        /// WHY `adoptionTokenExact` is `false`, in one operator-readable
+        /// phrase ("token streams diverged", "terminal mismatch: cold
+        /// finished 'stop', adopted finished 'length'", "non-clean terminal
+        /// …"). nil whenever exactness is `true` or not measured. Carried on
+        /// the observation — not recomputed by the report — because the
+        /// harness is the only party that saw both raw streams.
+        public let adoptionMismatchReason: String?
+        /// WHY the adoption comparison RAN but could not be judged: both
+        /// requests were cut short by the SAME non-clean terminal, so the
+        /// two identical truncated streams are machinery artifacts, not
+        /// answers. Distinct from `adoptionTokenExact == nil` with this
+        /// field ALSO nil, which means the comparison never ran (no cache
+        /// hit). Renders the prefix-reuse criterion UNAVAILABLE with this
+        /// reason — never PASS (nothing was proven exact) and never FAIL
+        /// (identical outcomes are not "adoption changed the answer").
+        public let adoptionInconclusiveReason: String?
         /// Completion tokens the exactness comparison actually covered. This
         /// is the oracle's WINDOW and bounds what it could possibly have seen:
         /// the measured paged adoption divergence appears at completion token
@@ -539,6 +590,8 @@ public struct BackendParityObservation: Codable, Sendable, Equatable {
             cacheMisses: Int = 0,
             cacheTokensSaved: Int = 0,
             adoptionTokenExact: Bool? = nil,
+            adoptionMismatchReason: String? = nil,
+            adoptionInconclusiveReason: String? = nil,
             adoptionComparedTokens: Int = 0,
             probeResolvedBackend: String? = nil,
             probeFallbackReason: String? = nil,
@@ -560,6 +613,8 @@ public struct BackendParityObservation: Codable, Sendable, Equatable {
             self.cacheMisses = cacheMisses
             self.cacheTokensSaved = cacheTokensSaved
             self.adoptionTokenExact = adoptionTokenExact
+            self.adoptionMismatchReason = adoptionMismatchReason
+            self.adoptionInconclusiveReason = adoptionInconclusiveReason
             self.adoptionComparedTokens = adoptionComparedTokens
             self.probeResolvedBackend = probeResolvedBackend
             self.probeFallbackReason = probeFallbackReason
@@ -573,6 +628,12 @@ public struct BackendParityObservation: Codable, Sendable, Equatable {
     /// depends on this arm then reports UNAVAILABLE.
     public let resolvedBackend: String?
     public let fallbackReason: String?
+    /// Dtype of the pages the PAGED pool was ACTUALLY built with, read off
+    /// the constructed pool (`ProductionBuild.pagedPoolDType`), never the
+    /// env knob. Nil on contiguous arms and on artifacts that predate the
+    /// field. The numerics control compares this against its own resolved
+    /// dtype so two identical-dtype arms can never masquerade as a control.
+    public let pagedPoolDType: String?
     public let constructionFailure: String?
     public let rows: [Row]
     public let mtp: MTP?
@@ -584,6 +645,7 @@ public struct BackendParityObservation: Codable, Sendable, Equatable {
         selection: String,
         resolvedBackend: String? = nil,
         fallbackReason: String? = nil,
+        pagedPoolDType: String? = nil,
         constructionFailure: String? = nil,
         rows: [Row] = [],
         mtp: MTP? = nil,
@@ -594,6 +656,7 @@ public struct BackendParityObservation: Codable, Sendable, Equatable {
         self.selection = selection
         self.resolvedBackend = resolvedBackend
         self.fallbackReason = fallbackReason
+        self.pagedPoolDType = pagedPoolDType
         self.constructionFailure = constructionFailure
         self.rows = rows
         self.mtp = mtp
@@ -641,6 +704,19 @@ public enum BackendParityCriteria {
         ]
     }
 
+    /// Terminals a request may end with and still count as a valid
+    /// comparand: the model stopped (`stop`) or the budget ran out
+    /// (`length`). An ALLOWLIST, not a blocklist of known-bad prefixes:
+    /// `describe(CBv2FinishReason)` can grow a case, and `generateWithUsage`
+    /// adds two reasons of its own (`submit_error:`, `unterminated`) that no
+    /// `CBv2FinishReason` spells — a blocklist waves through every reason
+    /// nobody thought to enumerate, which is the shape of gate this harness
+    /// exists to refuse. One definition, shared by the per-row evidence
+    /// partition below, the harness's fp32 numerics control, and its
+    /// prefix-reuse adoption-exactness judge, so no two consumers can ever
+    /// disagree about what "ended cleanly" means.
+    static let cleanTerminals: Set<String> = ["stop", "length"]
+
     /// The precondition every cross-backend criterion shares: two arms that
     /// both built, and that built DIFFERENT backends. Returns the blocking
     /// reason, or nil when the comparison is meaningful.
@@ -670,6 +746,32 @@ public enum BackendParityCriteria {
                 + " — no cross-backend comparison was performed"
         }
         return nil
+    }
+
+    /// Why a numerics control must be DISREGARDED, or nil when it is sound.
+    ///
+    /// The control's whole claim is "the same backend under a benign dtype
+    /// perturbation". If both arms RESOLVED the same pool dtype — e.g. an
+    /// ambient `DARKBLOOM_CBV2_PAGED_KV_DTYPE=float32` leaked into the
+    /// candidate before the harness pinned it — then nothing was perturbed
+    /// and its agreement is a tautology, not evidence. Checked at EVALUATION
+    /// rather than only at measurement so a stored artifact from a harness
+    /// that predates the pinning is rejected too. Artifacts too old to carry
+    /// the dtype fields pass through: absence of the record is not proof of
+    /// a tautology, and their controls stay exactly as trustworthy as they
+    /// were when written.
+    static func controlValidityBlocker(
+        _ control: BackendParityReport.NumericsControl
+    ) -> String? {
+        guard let candidateDType = control.candidatePoolDType,
+            let controlDType = control.controlPoolDType
+        else { return nil }
+        guard candidateDType == controlDType else { return nil }
+        return "both control arms resolved \(candidateDType) pages "
+            + "(candidate \(candidateDType), control \(controlDType)) — the "
+            + "perturbation never happened, so its "
+            + (control.tokenExact == true ? "agreement" : "verdict")
+            + " is a tautology about one configuration, not a control"
     }
 
     /// Relative precision of the fp16 KV the paged pool stores (11-bit
@@ -822,17 +924,63 @@ public enum BackendParityCriteria {
             candidate.label: tokenSummary(candidate.rows),
         ]
 
-        if let mismatch = rowMismatch(baseline: baseline.rows, candidate: candidate.rows) {
+        // Per-row evidence. The zero-evidence guard above only catches ALL
+        // rows empty; a row with zero tokens and a FAILED terminal on both
+        // arms is still a non-observation — two matching `submit_error`
+        // shapes agree about nothing — so it is excluded from the agreement
+        // computation and disclosed. Clean zero-token rows stay in (an
+        // immediate EOS is an observation, and clean-vs-failed is a real
+        // asymmetry `rowMismatch` must report). Below the floor the
+        // criterion refuses outright.
+        var scoredBaseline = baseline.rows
+        var scoredCandidate = candidate.rows
+        var exclusionNote: String?
+        if let evidence = pairedRowEvidence(
+            baseline: baseline.rows, candidate: candidate.rows),
+            !evidence.nonObservations.isEmpty
+        {
+            measurements["excludedRows"] = evidence.exclusionNote
+            if let floor = evidence.floorBlocker {
+                return .init(
+                    id: id, title: title, verdict: .unavailable,
+                    detail: "MOST OF THIS RUN FAILED — this is NOT agreement between "
+                        + "the backends. \(floor). Rows that fail identically on both "
+                        + "arms are non-observations, not matches, and a verdict scored "
+                        + "on the surviving minority would owe more to which prompts "
+                        + "survived than to the backends",
+                    measurements: measurements)
+            }
+            scoredBaseline = evidence.baselineEvidence
+            scoredCandidate = evidence.candidateEvidence
+            exclusionNote = evidence.exclusionNote
+        }
+
+        if let mismatch = rowMismatch(baseline: scoredBaseline, candidate: scoredCandidate) {
             measurements["firstFlip"] = mismatch
+            // A same-dtype control is DISREGARDED, never quoted: quoting
+            // "CONTROL HELD" off two identical engines would launder a
+            // tautology into the one sentence readers act on.
+            let controlBlocker = control.flatMap(controlValidityBlocker)
             if let control {
-                measurements["control"] = control.tokenExact.map {
-                    $0 ? "TOKEN-EXACT" : "NOT token-exact"
-                } ?? "NOT RUN"
+                if let controlBlocker {
+                    measurements["control"] = "INVALID — \(controlBlocker)"
+                } else {
+                    measurements["control"] = control.tokenExact.map {
+                        $0 ? "TOKEN-EXACT" : "NOT token-exact"
+                    } ?? "NOT RUN"
+                }
             }
             // The control LEADS. A reader must meet "the incumbent also flips
             // here" before the divergence it explains, for the same reason
             // EXPECTED_SHORTFALL rides the summary line.
-            var detail = control.map { "\($0.headline) " } ?? ""
+            var detail: String
+            if let controlBlocker {
+                detail = "CONTROL INVALID (\(controlBlocker)), so nothing here "
+                    + "distinguishes a backend difference from ordinary numerical "
+                    + "drift. "
+            } else {
+                detail = control.map { "\($0.headline) " } ?? ""
+            }
             detail += "\(candidate.label) diverged from \(baseline.label) at the first "
                 + "flip: \(mismatch). NOT scored as a regression: free-running greedy "
                 + "decode is a PASS-ONLY signal here, because the incumbent fails it too "
@@ -842,7 +990,7 @@ public enum BackendParityCriteria {
                 + "first flip the two arms decode different contexts so later positions "
                 + "compare unrelated conversations"
             if let first = firstDivergingRow(
-                baseline: baseline.rows, candidate: candidate.rows),
+                baseline: scoredBaseline, candidate: scoredCandidate),
                 let probe = argmaxResolvable(row: first.row, index: first.index)
             {
                 measurements["argmaxMargin"] = String(format: "%.3e", probe.margin)
@@ -854,12 +1002,13 @@ public enum BackendParityCriteria {
                     + (probe.resolvable ? "resolvable" : "NOT resolvable")
                     + " at that precision"
             }
+            if let exclusionNote { detail += ". \(exclusionNote)" }
             return .init(
                 id: id, title: title, verdict: .unavailable, detail: detail,
                 measurements: measurements)
         }
 
-        let total = baseline.rows.reduce(0) { $0 + $1.tokens.count }
+        let total = scoredBaseline.reduce(0) { $0 + $1.tokens.count }
         // The SHORTEST row, not only the total. A run whose prompts each emit
         // one token before `stop` clears the zero-evidence guard above and
         // reports agreement over three tokens — true, and far thinner than
@@ -868,12 +1017,13 @@ public enum BackendParityCriteria {
         // which would refuse genuine passes on short-answer prompts. Measured
         // on gemma-4-e2b-it-4bit, where raw un-templated parity prompts do
         // exactly this.
-        let shortest = baseline.rows.map(\.tokens.count).min() ?? 0
+        let shortest = scoredBaseline.map(\.tokens.count).min() ?? 0
         return .init(
             id: id, title: title, verdict: .pass,
-            detail: "\(baseline.rows.count) prompts, \(total) generated token ids identical "
+            detail: "\(scoredBaseline.count) prompts, \(total) generated token ids identical "
                 + "between \(baseline.label) and \(candidate.label), finish reasons equal "
-                + "(shortest row \(shortest) token\(shortest == 1 ? "" : "s"))",
+                + "(shortest row \(shortest) token\(shortest == 1 ? "" : "s"))"
+                + (exclusionNote.map { ". \($0)" } ?? ""),
             measurements: measurements)
     }
 
@@ -1301,26 +1451,68 @@ public enum BackendParityCriteria {
         if !inexact.isEmpty {
             let exactArms = [(baseline.label, base), (candidate.label, cand)]
                 .filter { $0.1.adoptionTokenExact == true }
+            // Name the SHAPE of each arm's mismatch, because they are
+            // different findings: diverging token streams are the reuse
+            // path rewriting the output, while identical tokens under a
+            // terminal mismatch (`stop` vs `length`, an `error(…)` arm)
+            // are adoption changing how the request ENDED — and the
+            // precision-drift explanation below can only ever excuse the
+            // first kind.
             var detail = "adoption CHANGED THE ANSWER on "
-                + inexact.map(\.0).joined(separator: " and ")
-                + ": the adopting request returned different tokens than the cold "
-                + "request for the SAME prompt at temperature 0, so the reported "
-                + "savings are not savings — prefill was skipped that was needed. "
+                + inexact.map {
+                    "\($0.0) (\($0.1.adoptionMismatchReason ?? "token streams diverged"))"
+                }.joined(separator: " and ")
+                + ": the adopting request's outcome — token stream or terminal — "
+                + "differed from the cold request's for the SAME prompt at "
+                + "temperature 0, so the reported savings are not savings. "
                 + "Token counts are only meaningful conditional on exactness, which "
                 + "is why this outranks the comparison below"
+            let unjudged = [(baseline.label, base), (candidate.label, cand)]
+                .filter { $0.1.adoptionInconclusiveReason != nil }
             if let exact = exactArms.first {
                 detail += ". ASYMMETRIC, which isolates the backend: \(exact.0) adopted "
                     + "the same prefix on the same prompt in the same process and stayed "
                     + "exact, so precision sensitivity cannot explain this one"
+            } else if let other = unjudged.first {
+                detail += ". The other arm's comparison was INCONCLUSIVE — \(other.0): "
+                    + "\(other.1.adoptionInconclusiveReason ?? "") — so neither asymmetry "
+                    + "nor model-wide sensitivity is established by this run"
             } else {
-                detail += ". SYMMETRIC — every measured arm is inexact, so this is a "
-                    + "property of the MODEL (a cold prefill and an adopted replay "
-                    + "accumulate differently, and this checkpoint's argmax is sensitive "
-                    + "enough to show it), NOT evidence against either backend. Do not "
-                    + "cite it as one; see the precision caveat on token_exactness"
+                detail += ". SYMMETRIC — every measured arm is inexact. When the "
+                    + "mismatches are token divergence, that is a property of the MODEL "
+                    + "(a cold prefill and an adopted replay accumulate differently, and "
+                    + "this checkpoint's argmax is sensitive enough to show it), NOT "
+                    + "evidence against either backend — do not cite it as one; see the "
+                    + "precision caveat on token_exactness. A TERMINAL mismatch named "
+                    + "above is not excused by precision drift and stays a real finding"
             }
             return .init(
                 id: id, title: title, verdict: .fail, detail: detail,
+                measurements: measurements)
+        }
+
+        // An arm whose comparison RAN but was unjudgeable — cold and adopted
+        // both cut short by the SAME non-clean terminal — blocks the
+        // criterion. Exactness is the precondition for every count below
+        // ("exactness BEFORE arithmetic"), and this arm neither established
+        // it nor refuted it: identical truncated streams prove nothing, so
+        // certifying savings over them would launder a machinery failure
+        // into a parity verdict. Distinct from `adoptionTokenExact == nil`
+        // with no reason (the comparison never ran — no hit), which keeps
+        // its explicit NOT-MEASURED caveat on the pass path instead.
+        let inconclusive = [(baseline.label, base), (candidate.label, cand)]
+            .filter { $0.1.adoptionInconclusiveReason != nil }
+        if !inconclusive.isEmpty {
+            return .init(
+                id: id, title: title, verdict: .unavailable,
+                detail: "adoption exactness could not be judged on "
+                    + inconclusive.map {
+                        "\($0.0) (\($0.1.adoptionInconclusiveReason ?? ""))"
+                    }.joined(separator: " and ")
+                    + " — the cold and adopted requests were cut short identically, and "
+                    + "identical truncated streams prove nothing about adoption, so this "
+                    + "is neither a PASS (nothing was shown exact) nor a FAIL (nothing "
+                    + "changed the answer); re-run once the underlying failure clears",
                 measurements: measurements)
         }
 
@@ -1440,7 +1632,8 @@ public enum BackendParityCriteria {
         }
         if let weakest = exercised.min() {
             let window = [base, cand].map(\.adoptionComparedTokens).min() ?? 0
-            detail += ". Adoption was token-exact against each arm's OWN cold request over "
+            detail += ". Adoption was token- and terminal-exact against each arm's OWN "
+                + "cold request over "
                 + "\(window) completion tokens — the WINDOW bounds what could be seen, and a "
                 + "known paged adoption divergence appears at token 20, so read a short "
                 + "window as no evidence rather than weak evidence. The thinner arm also "
@@ -1489,6 +1682,94 @@ public enum BackendParityCriteria {
             + (reasons.isEmpty
                 ? "no finish reason recorded"
                 : "finish=\(reasons.joined(separator: "/"))")
+    }
+
+    /// The per-row evidence behind a paired comparison.
+    ///
+    /// `zeroEvidenceBlocker` refuses the all-rows-empty case, but a run in
+    /// which ONE prompt decoded while the rest failed identically on both
+    /// arms sails past it — and `rowMismatch` then reads each matching
+    /// `submit_error`/`unterminated` pair as a row that AGREED. A row with
+    /// zero tokens and a FAILED terminal on both arms is not a match; it is
+    /// a non-observation, and counting it toward parity lets a
+    /// partially-failed release-gate run report agreement it never measured.
+    ///
+    /// The failed-terminal half of that predicate is load-bearing. A row
+    /// where both arms cleanly finished `stop` with zero tokens (the model
+    /// hit EOS immediately, both sides) is a real — if thin — matching
+    /// observation and stays IN as agreement. And a row where one arm
+    /// cleanly stopped while the other returned `submit_error` is a real
+    /// observed ASYMMETRY that must be reported as the divergence it is,
+    /// never quietly removed: excluding it would let a run with enough other
+    /// productive rows PASS while claiming "finish reasons equal".
+    struct PairedRowEvidence {
+        /// Row pairs carrying an observable outcome: at least one arm
+        /// generated a token, or at least one arm ended on a CLEAN terminal.
+        /// (One-sided emptiness and clean-vs-failed rows stay IN: an arm
+        /// that decoded nothing — or failed — while the other did not is a
+        /// real asymmetry, and `rowMismatch` reports it.)
+        let baselineEvidence: [BackendParityObservation.Row]
+        let candidateEvidence: [BackendParityObservation.Row]
+        /// One rendered line per row where NEITHER arm generated a token
+        /// and BOTH terminals were failed measurements, naming the failure
+        /// shape(s) the rows carried.
+        let nonObservations: [String]
+        let totalRows: Int
+
+        /// Non-nil when fewer than half the rows are observations: whatever
+        /// the surviving rows say, most of the run failed, and a criterion
+        /// scored on the remainder would owe its verdict to which prompts
+        /// happened to survive.
+        var floorBlocker: String? {
+            let observed = baselineEvidence.count
+            guard observed * 2 < totalRows else { return nil }
+            return "only \(observed) of \(totalRows) row(s) carried an observable "
+                + "outcome — the criterion is below its minimum-evidence floor (half "
+                + "the rows) and is not scored. Failed rows: "
+                + nonObservations.joined(separator: "; ")
+        }
+
+        /// Non-nil disclosure when scoring proceeds but rows were excluded.
+        var exclusionNote: String? {
+            guard !nonObservations.isEmpty else { return nil }
+            return "\(nonObservations.count) of \(totalRows) row(s) EXCLUDED as "
+                + "non-observations (zero tokens and failed terminals on both arms): "
+                + nonObservations.joined(separator: "; ")
+        }
+    }
+
+    /// Partition paired rows into observations and non-observations, or nil
+    /// when the rows cannot be paired at all (count or prompt-order
+    /// mismatch) — `rowMismatch` owns reporting those.
+    static func pairedRowEvidence(
+        baseline: [BackendParityObservation.Row],
+        candidate: [BackendParityObservation.Row]
+    ) -> PairedRowEvidence? {
+        guard baseline.count == candidate.count else { return nil }
+        var baseEvidence: [BackendParityObservation.Row] = []
+        var candEvidence: [BackendParityObservation.Row] = []
+        var nonObservations: [String] = []
+        for (base, cand) in zip(baseline, candidate) {
+            guard base.prompt == cand.prompt else { return nil }
+            if base.tokens.isEmpty, cand.tokens.isEmpty,
+                !cleanTerminals.contains(base.finishReason),
+                !cleanTerminals.contains(cand.finishReason)
+            {
+                let shapes =
+                    base.finishReason == cand.finishReason
+                    ? (base.finishReason.isEmpty ? "no finish reason" : base.finishReason)
+                    : "\(base.finishReason) vs \(cand.finishReason)"
+                nonObservations.append("prompt '\(base.prompt)': \(shapes)")
+            } else {
+                baseEvidence.append(base)
+                candEvidence.append(cand)
+            }
+        }
+        return PairedRowEvidence(
+            baselineEvidence: baseEvidence,
+            candidateEvidence: candEvidence,
+            nonObservations: nonObservations,
+            totalRows: baseline.count)
     }
 
     /// The blocking reason when a PAIR of token streams cannot be compared at
@@ -1675,7 +1956,10 @@ public enum BackendParityCriteria {
             summary += "/\(reuse.adoptionComparedTokens)tok"
         case .some(false): summary += ", adoptionExact=FALSE"
             summary += "/\(reuse.adoptionComparedTokens)tok"
-        case nil: summary += ", adoptionExact=not_measured"
+        case nil:
+            summary +=
+                reuse.adoptionInconclusiveReason != nil
+                ? ", adoptionExact=INCONCLUSIVE" : ", adoptionExact=not_measured"
         }
         if reuse.promptTokens > 0, reuse.adoptionTokenExact != nil {
             let pct = Double(reuse.secondPrefillTokensSaved) / Double(reuse.promptTokens) * 100
