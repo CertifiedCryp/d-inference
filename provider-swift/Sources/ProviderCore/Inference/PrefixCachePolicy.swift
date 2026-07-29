@@ -108,8 +108,16 @@ enum PrefixCachePolicy {
     // MARK: - Exact prefix-reuse capability
 
     /// Construct the engine-owned typed capability for the backend selected
-    /// before cache construction. `.auto` is the shipped contiguous,
-    /// unquantized native-float backend. Explicit paged selection remains eligible only for layouts
+    /// before cache construction. Callers pass a RESOLVED selection derived
+    /// from the backend actually built (`EngineV2SlotFactory` maps
+    /// `preparedBackend.kind` to `.paged`/`.contiguous`), so `.auto` never
+    /// reaches here — it is grouped with `.contiguous` only as a safe
+    /// default. Treat that grouping as defensive, and as ACTIVELY WRONG
+    /// about config-level `.auto`, which resolves PAGED as of v0.8.0 (see
+    /// `EngineV2Factory.prepareProductionBackend`): a caller passing a raw,
+    /// unresolved selection would declare a contiguous capability for a
+    /// paged slot. Resolve first, always.
+    /// Explicit paged selection remains eligible only for layouts
     /// whose ordinary single-cursor replay is exact; interleaved hybrids fail
     /// cold until a separately-proven paged dual-cursor row exists.
     static func prefixReuseCapability(
@@ -129,13 +137,33 @@ enum PrefixCachePolicy {
             backend: backend)
     }
 
-    /// Conservative finite-window replay length. Kept as a policy convenience
-    /// for SSD donation/stage benefit gates; the engine plan remains
-    /// authoritative per matched boundary.
-    static func adoptionBoundTokens(layerKinds: [CBv2LayerKind]) -> Int {
-        CBv2PrefixReuseCapability.derive(
+    /// Conservative finite-window replay length for the SSD donation/stage
+    /// benefit gates; the engine plan remains authoritative per matched
+    /// boundary.
+    ///
+    /// Resolves the backend through `prefixReuseCapability` rather than
+    /// hardcoding `.contiguousUnquantized`, so this and the capability can no
+    /// longer describe two different backends for the same slot.
+    ///
+    /// WS-4.2 once made this residency-dependent — a boundary whose window
+    /// was restored from sidecars had nothing to replay, so the bound
+    /// collapsed to zero. No row in this repo can install a restored window
+    /// (paged would need `PagedSequenceKV.restoreWindow(_:at:)`, contiguous
+    /// a `CBv2WindowedSequenceKV` ring adoption; neither exists), so the
+    /// collapsed bound was unreachable and the plumbing carrying it has been
+    /// removed. Restoring it means reintroducing a residency input HERE, not
+    /// merely landing a consumer: advertising a matched prefix as free while
+    /// the engine still performs its full `windowCount × maxWindow` replay is
+    /// the failure this conservatism exists to prevent.
+    static func adoptionBoundTokens(
+        layerKinds: [CBv2LayerKind],
+        backendSelection: EngineV2KVBackendSelection = .auto,
+        pagedKilled: Bool = false
+    ) -> Int {
+        prefixReuseCapability(
             layerKinds: layerKinds,
-            backend: .contiguousUnquantized
+            backendSelection: backendSelection,
+            pagedKilled: pagedKilled
         ).conservativeReplayBoundTokens
     }
 
@@ -143,15 +171,20 @@ enum PrefixCachePolicy {
     /// and positive from 1,536 onward; GPT's shorter 1,536-token replay span
     /// remains beneficial at the generic 1,024 floor. The environment may
     /// raise either floor but cannot lower the proved long-hybrid minimum.
+    ///
+    /// The override keys off the RESOLVED bound, not the capability's raw
+    /// one. That evidence was measured against a 25,600-token replay, where
+    /// saving 1,024 tokens was within the noise; with the window restored
+    /// there is no replay to be noisy about, so the generic floor applies.
     static func minEffectiveTokens(
         capability: CBv2PrefixReuseCapability,
+        adoptionBoundTokens: Int? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Int {
         let configured = SSDPrefixCachePolicy.minEffectiveTokens(environment: environment)
+        let bound = adoptionBoundTokens ?? capability.conservativeReplayBoundTokens
         let longHybridFloor =
-            capability.strategy == .frozenFullReplay
-                && capability.conservativeReplayBoundTokens >= 25_600
-            ? 1_536 : 0
+            capability.strategy == .frozenFullReplay && bound >= 25_600 ? 1_536 : 0
         return max(configured, longHybridFloor)
     }
 

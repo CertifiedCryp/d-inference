@@ -183,6 +183,21 @@ type dispatchState struct {
 	// error-body message (the jinja_* stop surfaces the curated
 	// model_capability text, not the provider's raw template backtrace).
 	terminalClientErrorMessage string
+	// servedKVBackend latches the KV-cache backend attribution of the SLOT the
+	// most recent attempt was dispatched to (v0.8.0 paged rollout, Gate G5) —
+	// the resolved kind AND whether that kind was a silent degrade. It is NOT
+	// per-attempt scratch: the failure tails run after a retry has cleared
+	// d.provider/d.pr, and a 5xx from a paged slot that just fell over is
+	// exactly the sample the rollout dashboard must not lose. Zero value until
+	// the request reaches a slot, which tags unknown on both dimensions.
+	servedKVBackend kvBackendAttribution
+	// The (provider, model) the latch above was taken for. Not decoration: it
+	// is what lets kvBackendAttribution reuse the latch instead of re-entering
+	// the registry, while still honouring the rule that a LIVE d.pr wins — a
+	// speculative backup that beats the primary must be attributed to the
+	// backup's slot, and that shows up here as a key mismatch.
+	servedKVProviderID string
+	servedKVModel      string
 
 	// ---- per-attempt scratch (reset each attempt) ----
 	attempt          int
@@ -958,7 +973,7 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 				// both (the attempt-0 path emits neither, unchanged).
 				retryAfter := s.estimateTTFTRetryAfter(d.model, bestTTFT, d.deadline)
 				s.recordRejection(d.rejectionInfoWithDecision("dispatch", "ttft_too_slow", http.StatusTooManyRequests, retryAfter*1000, decision))
-				s.recordRequestOutcome(d.model, classifyOutcomeByCode(http.StatusTooManyRequests))
+				s.recordRequestOutcome(d.model, d.kvBackendAttribution(), classifyOutcomeByCode(http.StatusTooManyRequests))
 			}
 			s.writeTTFTTooSlow(w, d.model, d.publicModel, bestTTFT, d.deadline)
 			return outcomeResponseWritten
@@ -1277,6 +1292,10 @@ func (d *dispatchState) dispatchPrimary() dispatchOutcome {
 			return outcomeRetry
 		}
 	}
+	// The request is now on a slot. Latch that slot's KV backend so the
+	// exhaustion ladder can still attribute the outcome after a failover has
+	// cleared d.provider/d.pr (v0.8.0 paged rollout, Gate G5).
+	d.noteServingSlot()
 	return outcomeProceed
 }
 
@@ -1917,6 +1936,10 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 				d.pr = backupPR
 				d.requestID = d.pr.RequestID
 				d.heldChunks = backupHeld
+				// The backup is now the serving slot; re-latch so a
+				// post-commit failure books under ITS backend, not the
+				// cancelled primary's.
+				d.noteServingSlot()
 				d.commitFirstContent(d.pr, chunk)
 				d.committed = true
 			} else {
@@ -1941,6 +1964,7 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 					d.pr = backupPR
 					d.requestID = d.pr.RequestID
 					d.heldChunks = backupHeld
+					d.noteServingSlot()
 					d.committed = true
 				}
 			}
@@ -1964,6 +1988,10 @@ func (d *dispatchState) runRace(backupProvider *registry.Provider, backupPR *reg
 			d.pr = backupPR
 			d.requestID = d.pr.RequestID
 			d.heldChunks = backupHeld
+			// The backup is the serving slot from here on: an accepted-wait
+			// failure clears d.pr, and the terminal fallback must read the
+			// backup's backend, not the cancelled primary's.
+			d.noteServingSlot()
 			d.accepted = true
 			return outcomeAccepted
 
@@ -2144,6 +2172,11 @@ func (d *dispatchState) raceBackupChunkClosedWaitPrimary(provider *registry.Prov
 func (d *dispatchState) racePrimaryFailedWaitBackup(backupProvider *registry.Provider, backupPR *registry.PendingRequest, backupHeld []string) dispatchOutcome {
 	s := d.s
 	r := d.r
+	// The primary already failed and d.pr is cleared: the BACKUP is the only
+	// racer left, so every failure or timeout below is the backup's. Re-latch
+	// now so the terminal outcome names the backup's backend rather than
+	// falling back to the dead primary's latch.
+	d.noteServingSlotFor(backupPR)
 	backupDeadline := time.NewTimer(d.deadline - d.speculativeAt)
 	for {
 		select {
@@ -2645,6 +2678,10 @@ exhausted:
 			reason = "unservable_token_budget"
 			s.ddIncr("routing.unservable_reclassified", []string{"model:" + d.model})
 		}
+		// Resolved once: the telemetry event and the OR-uptime counter must agree
+		// on which slot's backend this failure belongs to, and on whether that
+		// backend was chosen or degraded into (v0.8.0 paged rollout).
+		kvBackend := d.kvBackendAttribution()
 		s.emitRequest(r.Context(), protocol.SeverityError, d.requestID,
 			fmt.Sprintf("inference failed after %d attempt(s)", d.attempt+1),
 			map[string]any{
@@ -2652,6 +2689,7 @@ exhausted:
 				"attempt":     d.attempt + 1,
 				"status_code": statusCode,
 				"last_error":  d.lastErr,
+				"kv_backend":  kvBackend.Backend,
 			})
 		if s.metrics != nil {
 			s.metrics.IncCounter("inference_dispatches_total", MetricLabel{"result", "failure"})
@@ -2661,9 +2699,9 @@ exhausted:
 		// pre-dispatch rejections emit from recordRejection instead). A failure
 		// after a keepalive committed HTTP 200 is a mid-stream error to the client.
 		if keepaliveCommitted {
-			s.recordRequestOutcome(d.model, orClassMidStream)
+			s.recordRequestOutcome(d.model, kvBackend, orClassMidStream)
 		} else {
-			s.recordRequestOutcome(d.model, classifyOutcomeByCode(statusCode))
+			s.recordRequestOutcome(d.model, kvBackend, classifyOutcomeByCode(statusCode))
 		}
 		if statusCode == http.StatusTooManyRequests || statusCode == http.StatusServiceUnavailable {
 			retryAfter := s.estimateRetryAfter(d.model)
@@ -2762,7 +2800,7 @@ exhausted:
 	// once per dispatched request (disjoint from the exhausted branch above and
 	// from pre-dispatch rejections).
 	if d.stream {
-		s.recordRequestOutcome(d.model, orClassSuccess)
+		s.recordRequestOutcome(d.model, d.kvBackendAttribution(), orClassSuccess)
 	}
 
 	d.writeCommittedResponse()
@@ -2986,9 +3024,9 @@ func (d *dispatchState) writeCommittedResponse() {
 		s.handleNonStreamingResponseWithFirstChunk(sw, r, pr, firstChunks)
 		switch {
 		case sw.status == http.StatusOK:
-			s.recordRequestOutcome(d.model, orClassSuccess)
+			s.recordRequestOutcome(d.model, d.kvBackendAttribution(), orClassSuccess)
 		case sw.status > 0:
-			s.recordRequestOutcome(d.model, classifyOutcomeByCode(sw.status))
+			s.recordRequestOutcome(d.model, d.kvBackendAttribution(), classifyOutcomeByCode(sw.status))
 		}
 	}
 }

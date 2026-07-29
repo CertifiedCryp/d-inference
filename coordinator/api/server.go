@@ -143,10 +143,13 @@ func keyLimitResetFromContext(ctx context.Context) string {
 // release has been registered in the store (e.g. in-memory dev setups).
 // Production reads the latest version from the releases table.
 //
-// 0.6.0 is the APNs code-identity / VLM-routing / graceful-update release.
+// 0.8.0 is the PagedAttention release: the paged KV backend reaches parity
+// with contiguous on prefix reuse, packed prefill and vision spans, and
+// `.auto` now resolves to PAGED fleet-wide (see the provider's
+// EngineV2Factory.prepareProductionBackend for the argument).
 // Keep this fallback in sync with ProviderCore.version so dev/in-memory
 // coordinators advertise the same floor as the Swift binary they expect.
-var LatestProviderVersion = "0.7.15"
+var LatestProviderVersion = "0.8.0"
 
 // minProviderVersionForDesiredModels is the first provider version whose Swift
 // runtime understands the desired_models message. The coordinator must NOT send

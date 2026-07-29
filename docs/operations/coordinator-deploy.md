@@ -108,6 +108,18 @@ Interpret provider eligibility in this order:
    `runtime_identity_unavailable`, `unsupported_layout`,
    `unsupported_backend`, and `paged_hybrid_unsupported` are deterministic
    exclusions. A binary-version upgrade alone does not make them ready.
+   Note on `paged_hybrid_unsupported`: providers ≥ 0.8.0 can no longer
+   produce it — the engine deleted the `paged_hybrid_requires_dual_cursor`
+   case from `CBv2PrefixReuseUnsupportedReason`
+   (`libs/mlx-swift-lm/.../ContinuousBatchingV2/PrefixReusePlan.swift:28-33`;
+   every remaining `derive` reason maps elsewhere), so the provider's
+   raw-string comparison in
+   `provider-swift/Sources/ProviderCore/Inference/PrefixCacheEligibilityStatus.swift:41`
+   can never match again — but **v0.7.x providers
+   still send it** — it stays in the coordinator's accepted vocabulary and
+   its count trends to zero as the fleet upgrades. Do not read a shrinking
+   count as a fix, and do not remove the value while any pre-0.8.0 provider
+   remains.
 3. `scan_failed`, `disk_unavailable`, and `cache_init_failed` require provider
    disk/key/cache initialization investigation.
 4. Donation outcomes explain durable-ready absence: policy/shape outcomes
@@ -629,7 +641,7 @@ semantics is the code (`coordinator/registry/`, `coordinator/api/`); the highlig
 | `EIGENINFERENCE_QUALITY_CONCURRENCY_OVERCOMMIT`, `_BY_MODEL` | Per-box admission density (default 1.2) |
 | `EIGENINFERENCE_QUALITY_CAP_PER_MODEL_TPS` | Quality cap reads each model's own solo decode rate (default `true`; `false` restores the provider-level benchmark) |
 | `EIGENINFERENCE_QUALITY_CAP_SOLO_MIN_SAMPLES` | Solo samples required before a per-(model, chip) median is trusted (default 5) |
-| `EIGENINFERENCE_MODEL_SOLO_TPS_SEED` | Cold-start solo rates, `build-id=tok/s` CSV (e.g. `gemma-4-26b-qat-4bit=14,gpt-oss-20b=30`); the in-memory TPS registry is restart-wiped |
+| `EIGENINFERENCE_MODEL_SOLO_TPS_SEED` | Cold-start solo rates, `build-id[@Family\|Tier]=tok/s` CSV (e.g. `gemma-4-26b-qat-4bit=14,gemma-4-26b-qat-4bit@M4\|Max=70`); the in-memory TPS registry is restart-wiped. **Ships in `release-env-defaults` and is listed in `required-env-keys.txt`**, so `refresh-env.sh` installs it and then refuses an env where it is missing or blank — `deploy/environments/prod.env` is a sanitized reference and editing it changes nothing. A provider takes its own chip class's entry when one exists, else the unqualified entry, which is clamped to the slowest class named for that model — so a seed measured on one class can never over-admit a slower or unrecognized one. Seeding also re-enables cross-class solo-median transfer for a model: without a seed the coordinator refuses to transfer a median from chip classes that cannot bound it |
 | `EIGENINFERENCE_WARM_POOL_*` | Warm-pool controller (active; `OBSERVE_ONLY=false`) |
 | `EIGENINFERENCE_DEDICATED_MODELS` | Static dedicated-box partition (`gemma-4`) |
 | `EIGENINFERENCE_PROMPT_SIDECAR_*` | Sidecar lifecycle, independent health/planning deadlines, failure threshold, diagnostics, preload, and resource bounds. Keep it enabled at the physical artifact root; provider releases must not alter its operator-selected values. |

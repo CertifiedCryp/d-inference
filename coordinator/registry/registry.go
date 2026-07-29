@@ -564,6 +564,15 @@ type Provider struct {
 	// Live backend capacity from heartbeats (nil for providers without capacity reporting)
 	BackendCapacity *protocol.BackendCapacity
 
+	// kvBackends is the last KV-cache backend observation each SLOT (keyed by
+	// model) named on a heartbeat — the resolved kind AND, when the slot
+	// degraded, why — for the v0.8.0 paged rollout's per-backend segmentation.
+	// Sticky within a provider session and deliberately NOT cleared by a nil
+	// BackendCapacity, so a slot that crashes or is evicted mid-request can
+	// still be attributed. A missing key is UNKNOWN and must never read as a
+	// backend kind. Guarded by p.mu; see kv_backend.go for the full contract.
+	kvBackends map[string]slotKVBackend
+
 	// Reputation tracking
 	Reputation Reputation
 
@@ -3025,6 +3034,12 @@ func (r *Registry) Heartbeat(id string, msg *protocol.HeartbeatMessage) {
 	// Update backend capacity from heartbeat. A nil report clears prior live
 	// capacity so stale slot state cannot keep influencing routing.
 	p.BackendCapacity = msg.BackendCapacity
+	// Per-slot KV backend (v0.8.0 paged rollout). Recorded from the raw report,
+	// BEFORE the nil-clearing semantics above take effect for it: the record is
+	// sticky across a slot vanishing from the heartbeat, because attribution of
+	// an in-flight request must survive its slot crashing. Measurement only —
+	// nothing below reads it. See kv_backend.go.
+	p.recordKVBackendsLocked(msg.BackendCapacity)
 	if p.BackendCapacity != nil {
 		chipFamily := p.Hardware.ChipFamily
 		// Solo samples are keyed by chip CLASS (family+tier, chipClassKey) so a

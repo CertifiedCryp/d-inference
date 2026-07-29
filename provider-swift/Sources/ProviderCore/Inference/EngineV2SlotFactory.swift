@@ -76,8 +76,6 @@ enum EngineV2SlotFactory {
     ///   - kvBudget: process-wide shared KV reservation ledger (nil ⇒ no
     ///     shared gating — unit tests only; both production callers pass
     ///     their ledger).
-    ///   - kvQuantConfigured: operator set `kv_quant` — v2 uses unquantized
-    ///     native-float KV, so a WARN telemetry event fires once per load.
     ///   - weightHash: the slot's verified weight hash binding for SSD
     ///     artifacts. Nil or blank disables reusable SSD caching.
     ///   - environment: prefix-cache policy environment
@@ -101,7 +99,6 @@ enum EngineV2SlotFactory {
         kvBytesCapacity: Int,
         maxConcurrentRequests: Int,
         kvBudget: GlobalKVCacheBudget?,
-        kvQuantConfigured: Bool,
         kvBackendConfig: String = "auto",
         kvBackendConfigByModel: [String: String] = [:],
         weightHash: String? = nil,
@@ -122,7 +119,6 @@ enum EngineV2SlotFactory {
             kvBytesCapacity: kvBytesCapacity,
             maxConcurrentRequests: maxConcurrentRequests,
             kvBudget: kvBudget,
-            kvQuantConfigured: kvQuantConfigured,
             kvBackendConfig: kvBackendConfig,
             kvBackendConfigByModel: kvBackendConfigByModel,
             weightHash: weightHash,
@@ -151,7 +147,6 @@ enum EngineV2SlotFactory {
         kvBytesCapacity: Int,
         maxConcurrentRequests: Int,
         kvBudget: GlobalKVCacheBudget?,
-        kvQuantConfigured: Bool,
         kvBackendConfig: String = "auto",
         kvBackendConfigByModel: [String: String] = [:],
         weightHash: String? = nil,
@@ -168,10 +163,20 @@ enum EngineV2SlotFactory {
         // KV-backend gate, slot-veto layer (`EngineV2KVBackendPolicy`):
         // parse the operator selection (per-model override wins; typo →
         // WARN + auto), then force contiguous for slots the paged cache
-        // cannot serve — VLM (span masks unsupported: media would 4xx at
-        // submit) and kv_quant intent (fp16 pages only). `auto` resolves
-        // contiguous; the fleet kill switch, physical-capacity planning,
-        // and eligibility fallback live in `makeProductionBuild`.
+        // cannot serve. That is a VLM slot whose paged cache does not
+        // vouch for multimodal span masks — media would 4xx at submit.
+        // The claim comes from the cache itself
+        // (`PagedLayerCache.honorsSpanMaskContextsByConstruction`, the same
+        // constant the engine's own submit-time gate resolves to), never
+        // from a belief held here: the decision has to be made before any
+        // pool exists, so it cannot ask a live instance, but it must still
+        // ASK rather than assume. A veto is policy, so it is silent even
+        // for an explicit paged request. kv_quant is gone from the product
+        // entirely — it is no longer a veto, no longer a parameter, and no
+        // longer warned about. `auto` resolves PAGED as of v0.8.0; that
+        // resolution, the fleet kill switch, physical-capacity planning,
+        // and the degrade-or-REFUSE decision for an explicit paged request
+        // all live in `EngineV2Factory.prepareProductionBackend`.
         let parsedKVBackend = EngineV2KVBackendPolicy.parseSelection(
             global: kvBackendConfig, byModel: kvBackendConfigByModel, modelID: modelId)
         if let unrecognized = parsedKVBackend.unrecognized {
@@ -182,7 +187,7 @@ enum EngineV2SlotFactory {
         let vetoed = EngineV2KVBackendPolicy.applySlotVetoes(
             selection: parsedKVBackend.selection,
             isVLM: isVLM,
-            kvQuantConfigured: kvQuantConfigured)
+            pagedHonorsSpanMasks: PagedLayerCache.honorsSpanMaskContextsByConstruction)
         let kvBackendSelection = vetoed.selection
         if let veto = vetoed.veto {
             logInfo(
@@ -296,6 +301,10 @@ enum EngineV2SlotFactory {
         } else if PrefixCachePolicy.isEnabled(environment: environment) {
             if let preparedBackend {
                 let ssdLayerKinds = preparedBackend.layerKinds
+                // Hoisted: `ProductionBackendPreparation` is non-Sendable, so
+                // the @Sendable construction-failure closure below must
+                // capture the resolved kind, not the preparation.
+                let preparedKVBackendKind = preparedBackend.kind
                 let resolvedSelection: EngineV2KVBackendSelection =
                     preparedBackend.kind == .paged ? .paged : .contiguous
                 let prefixReuseCapability = PrefixCachePolicy.prefixReuseCapability(
@@ -324,6 +333,7 @@ enum EngineV2SlotFactory {
                                     failure: failure, capability: prefixReuseCapability)
                                 Self.emitPrefixCacheConstructionFailure(
                                     modelId: modelId,
+                                    kvBackendKind: preparedKVBackendKind,
                                     capability: prefixReuseCapability,
                                     failure: failure,
                                     emitTelemetry: emitTelemetry)
@@ -339,6 +349,7 @@ enum EngineV2SlotFactory {
                         state: .error, reason: .cacheInitFailed)
                     Self.emitPrefixCacheConstructionFailure(
                         modelId: modelId,
+                        kvBackendKind: preparedKVBackendKind,
                         capability: prefixReuseCapability,
                         failure: .promptContractUnavailable,
                         emitTelemetry: emitTelemetry)
@@ -355,6 +366,10 @@ enum EngineV2SlotFactory {
                     state: .disabled, reason: .unsupportedLayout)
                 Self.emitPrefixCacheConstructionFailure(
                     modelId: modelId,
+                    // No prepared backend in this branch, so the KV kind was
+                    // never resolved — the same reason `cacheBackend` below
+                    // reports `.unknown`. Omitted, never guessed.
+                    kvBackendKind: nil,
                     capability: unavailableCapability,
                     failure: .layoutUnavailable,
                     emitTelemetry: emitTelemetry)
@@ -448,12 +463,6 @@ enum EngineV2SlotFactory {
                 + prefixCacheStateDescription(
                     ssdCache: ssdPrefixCache))
 
-        // WARN once (per load) that kv_quant is ignored on the v2 path
-        // (unquantized native-float caches are what the engine builds).
-        if kvQuantConfigured {
-            EngineV2Factory.emitKVQuantUnsupportedTelemetry(
-                modelId: modelId, emitTelemetry: emitTelemetry)
-        }
         let reason = mtpStatus.reason?.rawValue ?? "none"
         let revision = mtpStatus.revision ?? "none"
         logInfo(
@@ -471,30 +480,38 @@ enum EngineV2SlotFactory {
 
     private static func emitPrefixCacheConstructionFailure(
         modelId: String,
+        kvBackendKind: EngineV2KVBackendKind?,
         capability: CBv2PrefixReuseCapability,
         failure: SSDPrefixCacheConstructionFailure,
         emitTelemetry: (@Sendable (TelemetryEvent) -> Void)?
     ) {
-        var event = TelemetryEvent(
-            source: .provider,
-            severity: .warn,
-            kind: .engineHealth,
-            message: "engine_v2: SSD prefix cache construction failed"
-        )
-        event.fields = TelemetryFieldFilter.filter([
-            "component": .string("engine"),
-            "operation": .string("prefix_cache_construction"),
-            "backend": .string(capability.backend.rawValue),
-            "model": .string(modelId),
-            "prefix_reuse_strategy": .string(
-                capability.strategy?.rawValue ?? "none"),
-            "prefix_construction_failure": .string(failure.rawValue),
-            "prefix_cold_fallback": .bool(true),
-        ])
-        if let emitTelemetry {
-            emitTelemetry(event)
-        } else {
-            TelemetryClient.shared.emit(event)
-        }
+        // `prefix_reuse_backend` keeps its own key alongside the shared
+        // `backend` / `kv_backend` pair: it is the finer prefix-reuse ROW
+        // identity, and contiguous_quantized vs contiguous_unquantized is a
+        // distinction "contiguous" cannot express. Folding any of the three
+        // together silently mis-buckets every `group by backend` dashboard.
+        //
+        // `kv_backend` is nil-ABLE here and that is the whole reason
+        // EngineHealthEvent.make takes an optional. ABSENT ⇒ UNKNOWN, the same
+        // contract as BackendSlotCapacity.KVBackend (`*string` + omitempty) on
+        // the heartbeat wire: a slot whose backend was never resolved omits
+        // the key. Do NOT substitute a third vocabulary value such as
+        // "unknown" — omission must stay distinguishable from an observation,
+        // and any value here would be read as one.
+        emitEngineHealth(
+            EngineHealthEvent.make(
+                severity: .warn,
+                message: "engine_v2: SSD prefix cache construction failed",
+                operation: "prefix_cache_construction",
+                model: modelId,
+                kvBackend: kvBackendKind?.rawValue,
+                extra: [
+                    "prefix_reuse_backend": .string(capability.backend.rawValue),
+                    "prefix_reuse_strategy": .string(
+                        capability.strategy?.rawValue ?? "none"),
+                    "prefix_construction_failure": .string(failure.rawValue),
+                    "prefix_cold_fallback": .bool(true),
+                ]),
+            sink: emitTelemetry)
     }
 }

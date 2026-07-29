@@ -1,7 +1,9 @@
 package testbed
 
 import (
+	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -67,6 +69,102 @@ const (
 	TrustHardware   TrustLevel = "hardware"
 )
 
+// KVBackendAuto / KVBackendPaged / KVBackendContiguous are the values the
+// provider accepts for `engine_v2_kv_backend` under `[backend]`.
+const (
+	KVBackendAuto       = "auto"
+	KVBackendPaged      = "paged"
+	KVBackendContiguous = "contiguous"
+)
+
+// ResolveKVBackend returns the KV backend the testbed should ask the provider
+// for: the explicit value when set, else DARKBLOOM_TESTBED_KV_BACKEND, else ""
+// (leave the provider at its own default). The env fallback lets CI re-run the
+// existing suites against a different backend without editing a single test.
+func ResolveKVBackend(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return os.Getenv("DARKBLOOM_TESTBED_KV_BACKEND")
+}
+
+// ResolveMaxConcurrent returns the per-slot concurrency cap: the explicit
+// value when non-zero, else DARKBLOOM_TESTBED_MAX_CONCURRENT, else 0 (leave
+// the provider to pick).
+//
+// 0 IS NOT "8". The provider has TWO defaults and which one you get depends on
+// whether it was handed a config file at all:
+//
+//   - No `--config`: `BackendSettings`' memberwise init, `engineV2MaxConcurrent
+//     = 8` since the v0.8.0 flip.
+//   - With `--config`: the Decodable path, `decodeIfPresent(...) ?? 4`.
+//
+// The testbed writes a TOML the moment EITHER knob is set, so selecting a KV
+// backend and leaving this at 0 does not inherit 8 — it lands on 4. Paged at
+// B=4 measures 0.98x of contiguous against 1.17x at B=8, so that combination is
+// the one configuration with all of paged's cost and none of its benefit. A
+// lane that wants paged MUST name the cap too.
+//
+// A malformed env value is a hard error rather than a silent fall-through. It
+// used to be ignored "over a typo in an optional knob", and the knob stopped
+// being optional when it became the difference between measuring paged and
+// measuring nothing: a typo would quietly seat the suite at 4 and still pass.
+func ResolveMaxConcurrent(explicit int) (int, error) {
+	if explicit != 0 {
+		return explicit, nil
+	}
+	raw := os.Getenv("DARKBLOOM_TESTBED_MAX_CONCURRENT")
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"DARKBLOOM_TESTBED_MAX_CONCURRENT=%q is not an integer: %w", raw, err)
+	}
+	return n, nil
+}
+
+// DescribeKVPosture renders the KV posture this config resolves to, naming the
+// PROVENANCE of each value and not just the value. A run that reads back
+// "provider default" in its log is a run nobody chose the backend for.
+//
+// This describes what the testbed ASKS the provider for. It equals what the
+// provider BUILDS only because an explicit "paged" refuses rather than degrades
+// (EngineV2KVBackendPolicy.degradesPagedFailure is false for .paged), so a
+// paged request that could not be honoured fails the run instead of reaching
+// this log with a lie in it. Under "auto" — or under the negative-polarity kill
+// switch DARKBLOOM_CBV2_PAGED_KV=0, which always degrades — the two can differ,
+// and only the provider's own slot log says which one served.
+func DescribeKVPosture(cfg ProviderConfig) string {
+	backend := "provider default"
+	switch {
+	case cfg.KVBackend != "":
+		backend = cfg.KVBackend + " (suite)"
+	case os.Getenv("DARKBLOOM_TESTBED_KV_BACKEND") != "":
+		backend = os.Getenv("DARKBLOOM_TESTBED_KV_BACKEND") +
+			" (env DARKBLOOM_TESTBED_KV_BACKEND)"
+	}
+
+	concurrent := "provider default"
+	switch {
+	case cfg.MaxConcurrent != 0:
+		concurrent = fmt.Sprintf("%d (suite)", cfg.MaxConcurrent)
+	case os.Getenv("DARKBLOOM_TESTBED_MAX_CONCURRENT") != "":
+		concurrent = os.Getenv("DARKBLOOM_TESTBED_MAX_CONCURRENT") +
+			" (env DARKBLOOM_TESTBED_MAX_CONCURRENT)"
+	}
+
+	kill := "unset"
+	if raw := os.Getenv("DARKBLOOM_CBV2_PAGED_KV"); raw != "" {
+		kill = raw
+	}
+
+	return fmt.Sprintf(
+		"kv_backend=%s max_concurrent=%s DARKBLOOM_CBV2_PAGED_KV=%s",
+		backend, concurrent, kill)
+}
+
 type ProviderConfig struct {
 	TrustLevel                 TrustLevel
 	ModelID                    string
@@ -74,6 +172,33 @@ type ProviderConfig struct {
 	AttestationInterval        time.Duration
 	AuthTokenPath              string
 	EnableEphemeralPrefixCache bool
+	// KVBackend selects the CBv2 KV-cache backend for every engine slot the
+	// provider builds: "" (leave the provider at its own default), "auto",
+	// "paged", or "contiguous". Non-empty makes the testbed write a provider
+	// TOML into StateDir and launch with `--config`; empty changes nothing
+	// about the launch.
+	//
+	// GOTCHA — do NOT reach for DARKBLOOM_CBV2_PAGED_KV to turn paged on.
+	// That env var is negative-polarity ONLY: it is the fleet kill switch and
+	// can force paged OFF, never ON. `engine_v2_kv_backend` under `[backend]`
+	// is the only way to select paged, which is the entire reason the testbed
+	// writes a config file at all.
+	//
+	// SETTING THIS ALONE IS A TRAP. Selecting a backend makes the testbed
+	// write a TOML, which moves the provider onto its config-DECODER
+	// defaults — and that path still reads `engine_v2_max_concurrent` as 4,
+	// not the 8 the v0.8.0 flip put in the memberwise init. So "paged" on its
+	// own is paged@4: 0.98x of contiguous, against 1.17x at B=8. Name
+	// MaxConcurrent whenever you name KVBackend.
+	KVBackend string
+	// MaxConcurrent is the box-wide concurrent-request cap per engine slot
+	// (`engine_v2_max_concurrent` under `[backend]`). The provider clamps the
+	// value to [1, 8]. Travels through the same generated TOML as KVBackend.
+	//
+	// 0 leaves the provider to pick, which is 8 only when NOTHING else caused
+	// a TOML to be written — see ResolveMaxConcurrent for the two-defaults
+	// split and why 0 is not a safe way to ask for 8.
+	MaxConcurrent int
 }
 
 func DefaultProviderConfig() ProviderConfig {
@@ -146,6 +271,19 @@ type SuiteConfig struct {
 	SeedBalance                int64
 	UseMemoryStore             bool
 	EnableEphemeralPrefixCache bool
+	// KVBackend / MaxConcurrent are forwarded verbatim to every provider this
+	// suite launches. See ProviderConfig for the zero-value semantics and the
+	// DARKBLOOM_CBV2_PAGED_KV gotcha.
+	KVBackend     string
+	MaxConcurrent int
+	// ExpectKVBackend asserts the KV backend every engine slot was actually
+	// BUILT with ("paged" or "contiguous"); the suite pre-warms each slot and
+	// fails Start when the heartbeat-reported kv_backend differs or never
+	// arrives. "" falls back to DARKBLOOM_TESTBED_EXPECT_KV_BACKEND, and an
+	// unset env leaves the assertion off. Orthogonal to KVBackend: that knob
+	// REQUESTS a backend, this one asserts the CONSTRUCTED one — a lane
+	// exercising the `.auto` default sets only the expectation.
+	ExpectKVBackend string
 }
 
 func DefaultSuiteConfig() SuiteConfig {

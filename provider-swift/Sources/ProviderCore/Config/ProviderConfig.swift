@@ -80,20 +80,17 @@ public struct BackendSettings: Sendable, Equatable, Codable {
     /// coordinator-driven preloads so advertised model count cannot become a
     /// memory-unbounded slot cap.
     public var maxModelSlots: UInt64
-    /// KV-cache quantization request. v0.7.5 serves fp16-only KV (the
-    /// KV-quant schemes died with the legacy engine); a `kv_quant = true`
-    /// is REJECTED-with-WARN at startup and per model load — never
-    /// silently ignored — because a CBv2-native KV-quant fast-follow is
-    /// planned and operators who set this should learn it does not apply
-    /// yet, not wonder why memory numbers moved.
-    public var kvQuant: Bool
     /// Box-wide concurrent-request cap per v2 engine slot
-    /// (`engine_v2_max_concurrent` under `[backend]`). Default 4 — the
-    /// CBv2 product target. Clamped to [1, 8] at use: the engine's KV
-    /// byte-ledger admission binds long before count does, and caps past 8
-    /// recreate the batch-collapse regime the one-engine release exists to
-    /// kill. The coordinator sees the effective value in heartbeat
-    /// `max_concurrency`.
+    /// (`engine_v2_max_concurrent` under `[backend]`). Default
+    /// ``defaultEngineV2MaxConcurrent`` — 8 as of v0.8.0, raised from 4
+    /// alongside the `.auto` paged flip, though the raise does not depend
+    /// on it: B=8 is the better operating point on either backend, with
+    /// contiguous gaining ~1.07x from B=4 to B=8 and paged ~1.27x.
+    /// Clamped to
+    /// [1, 8] at use: the engine's KV byte-ledger admission binds long
+    /// before count does, and caps past 8 recreate the batch-collapse
+    /// regime the one-engine release exists to kill. The coordinator sees
+    /// the effective value in heartbeat `max_concurrency`.
     public var engineV2MaxConcurrent: UInt64
     /// Optional per-model override map
     /// (`engine_v2_max_concurrent_by_model` under `[backend]`, TOML table
@@ -101,11 +98,22 @@ public struct BackendSettings: Sendable, Equatable, Codable {
     /// `engineV2MaxConcurrent`.
     public var engineV2MaxConcurrentByModel: [String: UInt64]
     /// CBv2 KV-backend selection (`engine_v2_kv_backend` under
-    /// `[backend]`): "auto" (default — contiguous for every current and
-    /// future model), experimental "paged", or "contiguous". VLM slots and
-    /// `kv_quant = true` always force contiguous; kernel-ineligible models
-    /// fall back to contiguous with an INFO telemetry event. Fleet kill
-    /// switch: `DARKBLOOM_CBV2_PAGED_KV=0`. See `EngineV2KVBackendPolicy`.
+    /// `[backend]`): "auto" (default — resolves PAGED as of v0.8.0; see
+    /// `EngineV2Factory.prepareProductionBackend`), "paged", or
+    /// "contiguous". VLM slots
+    /// are NOT forced to contiguous: the veto in
+    /// `EngineV2KVBackendPolicy.applySlotVetoes` (`guard isVLM,
+    /// !pagedHonorsSpanMasks`) fires only when the paged
+    /// cache does not affirm span masks, and
+    /// `PagedLayerCache.honorsSpanMaskContextsByConstruction` — what
+    /// `EngineV2SlotFactory` passes — is `true`, so the veto
+    /// is inert and a VLM slot gets paged under "auto" like any other.
+    /// A model that cannot serve
+    /// paged falls back to contiguous with an INFO event; under an
+    /// explicit "paged" it REFUSES the load instead, so a paged fleet
+    /// can never silently serve contiguous. Fleet kill switch
+    /// `DARKBLOOM_CBV2_PAGED_KV=0` always degrades, never refuses.
+    /// See `EngineV2KVBackendPolicy`.
     public var engineV2KVBackend: String
     /// Optional per-model override map (`engine_v2_kv_backend_by_model`
     /// under `[backend]`, TOML table of model id → "auto" | "paged" |
@@ -156,11 +164,32 @@ public struct BackendSettings: Sendable, Equatable, Codable {
     public var mtpDrafterPath: String?
     /// RETIRED `[backend]` keys found in the decoded provider.toml
     /// (`engine_v2`, `continuous_batching`, `adaptive_prefill`,
-    /// `legacy_compiled_decode`). The keys parse cleanly — an old config
-    /// must never brick a provider — but their values are IGNORED;
-    /// startup emits one WARN per entry so operators notice the knob no
-    /// longer exists. Not encoded back out.
+    /// `legacy_compiled_decode`, `kv_quant`). The keys parse cleanly — an
+    /// old config must never brick a provider — but their values are
+    /// IGNORED; startup emits one WARN per entry so operators notice the
+    /// knob no longer exists. Not encoded back out.
     public internal(set) var retiredKeysPresent: [String] = []
+
+    /// The v0.8.0 box-wide concurrency cap, and the single source for BOTH
+    /// the memberwise default and the ``init(from:)`` fallback.
+    ///
+    /// They are one constant because they drifted apart exactly once and it
+    /// was expensive: the memberwise default moved 4 -> 8 while the decode
+    /// fallback stayed at 4, so every provider that loaded a `provider.toml`
+    /// — which is every provider in the fleet — silently kept B=4 while
+    /// the release believed it had moved to 8. The drift is the bug here,
+    /// independent of which KV backend `.auto` happens to select.
+    public static let defaultEngineV2MaxConcurrent: UInt64 = 8
+
+    /// The cap pre-v0.8.0 releases GENERATED into `provider.toml`.
+    ///
+    /// `TOMLEncoder` emits every non-optional `CodingKeys` member, so any
+    /// config ever written by `ConfigManager.save` carries an explicit
+    /// `engine_v2_max_concurrent = 4` — byte-identical to an operator who
+    /// typed it. Disambiguated once, by absence of
+    /// ``ProviderConfig/configVersion``; see
+    /// ``ProviderConfig/legacyMaxConcurrentMigrationID``.
+    public static let legacyGeneratedMaxConcurrent: UInt64 = 4
 
     public init(
         port: UInt16 = 8100,
@@ -168,8 +197,7 @@ public struct BackendSettings: Sendable, Equatable, Codable {
         enabledModels: [String] = [],
         idleTimeoutMins: UInt64 = 60,
         maxModelSlots: UInt64 = 3,
-        kvQuant: Bool = false,
-        engineV2MaxConcurrent: UInt64 = 4,
+        engineV2MaxConcurrent: UInt64 = BackendSettings.defaultEngineV2MaxConcurrent,
         engineV2MaxConcurrentByModel: [String: UInt64] = [:],
         engineV2KVBackend: String = "auto",
         engineV2KVBackendByModel: [String: String] = [:],
@@ -186,7 +214,6 @@ public struct BackendSettings: Sendable, Equatable, Codable {
         self.enabledModels = enabledModels
         self.idleTimeoutMins = idleTimeoutMins
         self.maxModelSlots = maxModelSlots
-        self.kvQuant = kvQuant
         self.engineV2MaxConcurrent = engineV2MaxConcurrent
         self.engineV2MaxConcurrentByModel = engineV2MaxConcurrentByModel
         self.engineV2KVBackend = engineV2KVBackend
@@ -206,7 +233,6 @@ public struct BackendSettings: Sendable, Equatable, Codable {
         case enabledModels = "enabled_models"
         case idleTimeoutMins = "idle_timeout_mins"
         case maxModelSlots = "max_model_slots"
-        case kvQuant = "kv_quant"
         case engineV2MaxConcurrent = "engine_v2_max_concurrent"
         case engineV2MaxConcurrentByModel = "engine_v2_max_concurrent_by_model"
         case engineV2KVBackend = "engine_v2_kv_backend"
@@ -220,13 +246,16 @@ public struct BackendSettings: Sendable, Equatable, Codable {
         case mtpDrafterPath = "mtp_drafter_path"
     }
 
-    /// RETIRED `[backend]` keys (v0.7.5 one-engine): parsed for presence
-    /// only, values ignored. See `retiredKeysPresent`.
+    /// RETIRED `[backend]` keys: parsed for presence only, values ignored.
+    /// See `retiredKeysPresent`. v0.7.5 (one engine) retired the four
+    /// selection knobs; v0.8.0 retired `kv_quant` along with the KV
+    /// quantization feature itself.
     private enum RetiredCodingKeys: String, CodingKey, CaseIterable {
         case continuousBatching = "continuous_batching"
         case adaptivePrefill = "adaptive_prefill"
         case engineV2 = "engine_v2"
         case legacyCompiledDecode = "legacy_compiled_decode"
+        case kvQuant = "kv_quant"
     }
 
     public init(from decoder: Decoder) throws {
@@ -236,9 +265,9 @@ public struct BackendSettings: Sendable, Equatable, Codable {
         self.enabledModels = try container.decodeIfPresent([String].self, forKey: .enabledModels) ?? []
         self.idleTimeoutMins = try container.decodeIfPresent(UInt64.self, forKey: .idleTimeoutMins) ?? 60
         self.maxModelSlots = try container.decodeIfPresent(UInt64.self, forKey: .maxModelSlots) ?? 3
-        self.kvQuant = try container.decodeIfPresent(Bool.self, forKey: .kvQuant) ?? false
         self.engineV2MaxConcurrent =
-            try container.decodeIfPresent(UInt64.self, forKey: .engineV2MaxConcurrent) ?? 4
+            try container.decodeIfPresent(UInt64.self, forKey: .engineV2MaxConcurrent)
+            ?? Self.defaultEngineV2MaxConcurrent
         self.engineV2MaxConcurrentByModel =
             try container.decodeIfPresent(
                 [String: UInt64].self, forKey: .engineV2MaxConcurrentByModel) ?? [:]
@@ -298,25 +327,82 @@ public struct ProviderConfig: Sendable, Equatable, Codable {
     public var backend: BackendSettings
     public var coordinator: CoordinatorSettings
     public var schedule: ScheduleConfig?
+    /// Schema version of the `provider.toml` this config came from
+    /// (`config_version`, top level, written by the startup stamp in
+    /// `migrateConfigIfNeeded`).
+    ///
+    /// Its whole job is to date the file. A pre-v0.8.0 config and a
+    /// hand-written one are byte-identical wherever it matters, so
+    /// "absent" is the only evidence that an `engine_v2_max_concurrent = 4`
+    /// was GENERATED rather than chosen. That evidence is spent once, at
+    /// the migration below; from the stamp on, 4 means 4 forever.
+    ///
+    /// Decoding always reports ``currentConfigVersion`` — the field
+    /// describes the schema this process speaks, and the pre-stamp state
+    /// is reported through ``appliedMigrations`` instead.
+    public var configVersion: Int
+    /// Ids of the one-time migrations this decode applied, for the startup
+    /// WARN (see `RetiredKnobWarnings`). Derived, never encoded — the same
+    /// contract as ``BackendSettings/retiredKeysPresent``.
+    public internal(set) var appliedMigrations: [String] = []
+
+    /// Current `provider.toml` schema version. 1 = v0.8.0, the release that
+    /// raised the concurrency default 4 -> 8.
+    public static let currentConfigVersion = 1
+
+    /// Stable id of the one-time pre-v0.8.0 concurrency migration.
+    public static let legacyMaxConcurrentMigrationID = "engine_v2_max_concurrent:4->8"
 
     public init(
         provider: ProviderSettings,
         backend: BackendSettings = BackendSettings(),
         coordinator: CoordinatorSettings = CoordinatorSettings(),
-        schedule: ScheduleConfig? = nil
+        schedule: ScheduleConfig? = nil,
+        configVersion: Int = ProviderConfig.currentConfigVersion
     ) {
         self.provider = provider
         self.backend = backend
         self.coordinator = coordinator
         self.schedule = schedule
+        self.configVersion = configVersion
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case provider
+        case backend
+        case coordinator
+        case schedule
+        case configVersion = "config_version"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.provider = try container.decodeIfPresent(ProviderSettings.self, forKey: .provider) ?? ProviderSettings(name: "darkbloom")
-        self.backend = try container.decodeIfPresent(BackendSettings.self, forKey: .backend) ?? BackendSettings()
+        var backend = try container.decodeIfPresent(BackendSettings.self, forKey: .backend) ?? BackendSettings()
         self.coordinator = try container.decodeIfPresent(CoordinatorSettings.self, forKey: .coordinator) ?? CoordinatorSettings()
         self.schedule = try container.decodeIfPresent(ScheduleConfig.self, forKey: .schedule)
+
+        // One-time pre-v0.8.0 concurrency migration.
+        //
+        // Deliberately narrow: it fires only on an UNSTAMPED file holding
+        // the EXACT value old releases generated. An operator who picked 1,
+        // 2, 3, 5, 6 or 7 is never rewritten, because no release ever
+        // generated those. The single unavoidable casualty is a deliberate
+        // 4 in a pre-v0.8.0 file, which is indistinguishable from the
+        // generated one by construction — it is raised once, announced by
+        // `RetiredKnobWarnings`, and sticks the moment it is re-set.
+        //
+        // The predicate is shared with the on-disk rewrite
+        // (`LegacyConcurrencyMigration`) so this in-memory raise and the
+        // durable text surgery cannot disagree about what counts as legacy.
+        let onDiskVersion = try container.decodeIfPresent(Int.self, forKey: .configVersion)
+        if LegacyConcurrencyMigration.shouldRaise(
+            onDiskVersion: onDiskVersion, cap: backend.engineV2MaxConcurrent) {
+            backend.engineV2MaxConcurrent = BackendSettings.defaultEngineV2MaxConcurrent
+            self.appliedMigrations = [Self.legacyMaxConcurrentMigrationID]
+        }
+        self.backend = backend
+        self.configVersion = Self.currentConfigVersion
     }
 
     /// Generate a default config based on detected hardware.

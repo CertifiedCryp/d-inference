@@ -2,10 +2,12 @@
 //
 // KV-backend GATE tests over the REAL `EngineV2Factory.makeProductionBuild`
 // with tiny real-family models (JSON-decoded configs, random-init weights,
-// no downloads): production-safe `auto` (always contiguous), the fleet
-// kill switch at the deepest layer, explicit
-// selections, and the eligibility fallback (ineligible head dim → paged
-// selection degrades to contiguous, never a refusal).
+// no downloads): production-safe `auto` (PAGED as of v0.8.0), the fleet
+// kill switch at the deepest layer, explicit selections, and the
+// degrade-or-REFUSE split — an explicit paged request that cannot be
+// served throws `EngineV2ProductionError.pagedUnavailable` with the reason
+// attached, while the kill switch still degrades because an operator
+// override is not a failure.
 //
 // These tests CONSTRUCT engines (paged construction materializes its slab
 // pool — a small Metal eval), but never run a forward pass.
@@ -28,7 +30,9 @@ private func decodeConfig<T: Decodable>(_ json: [String: Any]) throws -> T {
 
 /// 2-layer GPT-OSS: alternating sliding/full derivation, sinks on every
 /// layer, headDim 64 / GQA 2 — the paged kernel's validated shape family.
-private func tinyGPTOSS(headDim: Int = 64) throws -> GPTOSSModel {
+/// `kvHeads` widens the KV geometry for the pool-throw test, which needs a
+/// page big enough that a floor-sized plan holds only one.
+private func tinyGPTOSS(headDim: Int = 64, kvHeads: Int = 2) throws -> GPTOSSModel {
     let config: GPTOSSConfiguration = try decodeConfig([
         "model_type": "gpt_oss",
         "num_hidden_layers": 2,
@@ -39,8 +43,8 @@ private func tinyGPTOSS(headDim: Int = 64) throws -> GPTOSSModel {
         "hidden_size": 64,
         "intermediate_size": 64,
         "head_dim": headDim,
-        "num_attention_heads": 4,
-        "num_key_value_heads": 2,
+        "num_attention_heads": max(4, kvHeads),
+        "num_key_value_heads": kvHeads,
         "sliding_window": 32,
     ])
     return GPTOSSModel(config)
@@ -93,7 +97,26 @@ private final class GateCacheCapture: @unchecked Sendable {
     var capability: CBv2PrefixReuseCapability? { lock.withLock { _capability } }
 }
 
+private final class GateTelemetrySink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _events: [TelemetryEvent] = []
+    var events: [TelemetryEvent] { lock.withLock { _events } }
+    func record(_ event: TelemetryEvent) { lock.withLock { _events.append(event) } }
+}
+
 private let gateTestCapacity = 8 << 20  // 8 MiB pool — tiny but constructible
+
+/// Hermetic default for every construction in this suite: point the
+/// crash-loop guard store at a file that can never decode. Without it a
+/// developer box whose REAL provider tripped the guard on the checked-out
+/// version would fail every `.auto`-resolves-paged assertion here — the
+/// same reason tests inject `environment:` instead of inheriting the
+/// shell's kill switch. A caller's explicit value wins.
+private let hermeticGuardEnvironment = [KVBackendGuardStore.pathEnvKey: "/dev/null"]
+
+private func gateEnvironment(_ overrides: [String: String] = [:]) -> [String: String] {
+    hermeticGuardEnvironment.merging(overrides) { _, explicit in explicit }
+}
 
 private func makeBuild(
     model: any LanguageModel,
@@ -106,12 +129,42 @@ private func makeBuild(
         model: model,
         tokenizer: StubBridgeTokenizer(),
         kvBytesCapacity: gateTestCapacity,
-        prefixCache: nil,
+        // Deliberately 2, not the production 8: these gates assert BACKEND
+        // SELECTION, and a small pool keeps construction cheap.
         maxConcurrentRequests: 2,
+        prefixCache: nil,
         kvBackend: kvBackend,
         maxContextLength: 2048,
-        environment: environment,
+        environment: gateEnvironment(environment),
         pagedPreflightOverride: pagedPreflightOverride)
+}
+
+/// Run `body` and require it REFUSED an explicit paged request, returning
+/// the reason the refusal carries. `body` COMPLETING is itself the
+/// failure: it means the policy silently degraded to contiguous, which is
+/// the exact defect OPEN-9 closes — a run that reports paged and measures
+/// contiguous. Also pins the telemetry classification, because
+/// `engine_init_failed` would bury a paged regression among unrelated bad
+/// model loads.
+private func pagedRefusalReason(
+    _ body: () async throws -> Void
+) async -> String? {
+    do {
+        try await body()
+        Issue.record("explicit paged must refuse, not degrade to contiguous")
+        return nil
+    } catch let error as EngineV2ProductionError {
+        guard case .pagedUnavailable(let reason) = error else {
+            Issue.record("expected .pagedUnavailable, got \(error)")
+            return nil
+        }
+        #expect(EngineV2RefusalReason.classify(error) == .pagedBackendUnavailable)
+        #expect("\(error)".contains("explicitly requested but unavailable"))
+        return reason
+    } catch {
+        Issue.record("expected EngineV2ProductionError, got \(error)")
+        return nil
+    }
 }
 
 // MARK: - Tests
@@ -122,20 +175,26 @@ struct EngineV2KVBackendGateTests {
         _ = LiveInferenceFixtures.ensureMetallibColocated()
     }
 
-    @Test("auto is contiguous for GPT-OSS and cannot drift with family defaults")
-    func autoServesContiguousForGPTOSS() async throws {
+    @Test("auto is PAGED for GPT-OSS and cannot drift with family defaults")
+    func autoServesPagedForGPTOSS() async throws {
         let build = try makeBuild(model: try tinyGPTOSS(), kvBackend: .auto)
-        #expect(build.kvBackendKind == .contiguous)
+        // `.auto` is PAGED as of v0.8.0 — see the rationale at
+        // EngineV2Factory+Production.swift's `.auto` case. This assertion
+        // guards BOTH directions: it caught the first flip, it caught the
+        // revert, and it will catch a silent third change.
+        #expect(build.kvBackendKind == .paged)
         #expect(build.kvBackendFallbackReason == nil)
+        // Paged reports the PHYSICAL pool it committed, not the logical
+        // admission grant a contiguous slot advertises.
         let snapshot = build.engine.capacity()
-        #expect(snapshot.kvBytesBackendCapacity == gateTestCapacity)
+        #expect(snapshot.kvBytesBackendCapacity > 0)
         await build.engine.shutdown()
     }
 
-    @Test("auto resolves contiguous for Gemma-4 (bf16 KV stays opt-in)")
-    func autoServesContiguousForGemma() async throws {
+    @Test("auto resolves PAGED for Gemma-4 (bf16 KV stays opt-in)")
+    func autoServesPagedForGemma() async throws {
         let build = try makeBuild(model: try tinyGemma4Text(), kvBackend: .auto)
-        #expect(build.kvBackendKind == .contiguous)
+        #expect(build.kvBackendKind == .paged)
         #expect(build.kvBackendFallbackReason == nil)
         await build.engine.shutdown()
     }
@@ -169,6 +228,13 @@ struct EngineV2KVBackendGateTests {
         await build.engine.shutdown()
     }
 
+    // DEGRADE, deliberately — the one paged-to-contiguous case that
+    // survives OPEN-9, and the only test pinning the distinction. The kill
+    // switch is an operator override ("do NOT do what you asked"), not a
+    // failure ("we CANNOT do what you asked"); refusing here would 503
+    // every slot on a fleet configured `engine_v2_kv_backend = "paged"`
+    // the moment an operator pulled it. The three refusal tests below are
+    // the other half of that split.
     @Test("fleet kill switch forces explicit paged to contiguous at the deepest layer")
     func killSwitchForcesContiguous() async throws {
         let build = try makeBuild(
@@ -180,62 +246,279 @@ struct EngineV2KVBackendGateTests {
         await build.engine.shutdown()
     }
 
-    @Test("kernel-ineligible shape falls back to contiguous, never refuses")
-    func ineligibleFallsBack() async throws {
+    @Test("kernel-ineligible shape REFUSES an explicit paged request")
+    func ineligibleShapeRefusesExplicitPaged() async throws {
         // headDim 80 is outside the paged kernel's {64,128,256,512}.
-        let build = try makeBuild(model: try tinyGPTOSS(headDim: 80), kvBackend: .paged)
-        #expect(build.kvBackendKind == .contiguous)
-        #expect(build.kvBackendFallbackReason?.hasPrefix("kernel_preflight:") == true)
-        await build.engine.shutdown()
+        let reason = await pagedRefusalReason {
+            let build = try makeBuild(
+                model: try tinyGPTOSS(headDim: 80), kvBackend: .paged)
+            // Reached only on a policy regression; still tear the engine
+            // down so the failure is one clean assertion, not a leak too.
+            await build.engine.shutdown()
+        }
+        #expect(reason?.hasPrefix("kernel_preflight:") == true)
     }
 
-    @Test("failed kernel preflight falls back to contiguous before slab construction")
-    func failedPreflightFallsBack() async throws {
+    @Test("failed kernel preflight REFUSES before slab construction")
+    func failedPreflightRefuses() async throws {
+        struct PreflightFailure: Error {}
+        let reason = await pagedRefusalReason {
+            let build = try makeBuild(
+                model: try tinyGPTOSS(),
+                kvBackend: .paged,
+                pagedPreflightOverride: { _ in throw PreflightFailure() })
+            await build.engine.shutdown()
+        }
+        #expect(reason?.hasPrefix("kernel_preflight:") == true)
+        // The underlying cause survives into the refusal, so an operator
+        // reading the 503 sees WHY paged could not be served.
+        #expect(reason?.contains("PreflightFailure") == true)
+    }
+
+    @Test("physical-capacity shortfall REFUSES an explicit paged request")
+    func capacityShortfallRefusesExplicitPaged() async throws {
+        let reason = await pagedRefusalReason {
+            _ = try EngineV2Factory.prepareProductionBackend(
+                model: try tinyGemma4Text(),
+                kvBytesCapacity: 1_024,
+                maxConcurrentRequests: 2,
+                kvBackend: .paged,
+                maxContextLength: 2048,
+                environment: [:],
+                pagedPreflightOverride: { _ in })
+        }
+        #expect(reason?.hasPrefix("physical_capacity:") == true)
+    }
+
+    @Test("`.auto` still degrades when paged cannot be served")
+    func autoDegradesOnPagedFailure() async throws {
+        // Layer 5's degrade half, as a predicate. Since v0.8.0 `.auto`
+        // RESOLVES PAGED, so the real construction path reaches this branch
+        // on every paged-ineligible box in the fleet — it is the COMMON
+        // path, not a hypothetical. The predicate stays pinned here; the
+        // three construction tests below drive the same answer through the
+        // real factory, one per failure stage (preflight, capacity
+        // planning, pool construction).
+        #expect(EngineV2KVBackendPolicy.degradesPagedFailure(selection: .auto))
+        #expect(EngineV2KVBackendPolicy.degradesPagedFailure(selection: .contiguous))
+        #expect(!EngineV2KVBackendPolicy.degradesPagedFailure(selection: .paged))
+    }
+
+    // MARK: `.auto` degrade — real construction, one test per failure stage.
+    // Mirrors of the three explicit-paged REFUSAL tests above: the same
+    // failure, split by WHO asked. Each build must SUCCEED on contiguous
+    // and say why, because on the fleet `.auto` is every slot — a degrade
+    // that turned into a throw here would be a fleet-wide 503.
+
+    @Test("`.auto` + failing kernel preflight degrades: the build SUCCEEDS on contiguous")
+    func autoDegradesOnFailedPreflight() async throws {
         struct PreflightFailure: Error {}
         let build = try makeBuild(
             model: try tinyGPTOSS(),
-            kvBackend: .paged,
+            kvBackend: .auto,
             pagedPreflightOverride: { _ in throw PreflightFailure() })
         #expect(build.kvBackendKind == .contiguous)
         #expect(build.kvBackendFallbackReason?.hasPrefix("kernel_preflight:") == true)
+        // The underlying cause survives into the reason, same as the
+        // refusal carries it — an operator reading the heartbeat sees WHY.
+        #expect(build.kvBackendFallbackReason?.contains("PreflightFailure") == true)
+        #expect(build.pagedPoolDType == nil)
         await build.engine.shutdown()
     }
 
-    @Test("explicit paged fallback constructs frozen-full cache for resolved contiguous backend")
+    @Test("`.auto` + sub-floor capacity degrades: the build SUCCEEDS on contiguous")
+    func autoDegradesOnCapacityShortfall() async throws {
+        _ = LiveInferenceFixtures.ensureMetallibColocated()
+        // The same 1_024-byte grant capacityShortfallRefusesExplicitPaged
+        // uses — under the serviceability floor, so the physical-capacity
+        // policy answers contiguous before any pool exists.
+        let build = try EngineV2Factory.makeProductionBuild(
+            model: try tinyGemma4Text(),
+            tokenizer: StubBridgeTokenizer(),
+            kvBytesCapacity: 1_024,
+            maxConcurrentRequests: 2,
+            kvBackend: .auto,
+            maxContextLength: 2048,
+            environment: gateEnvironment(),
+            pagedPreflightOverride: { _ in })
+        #expect(build.kvBackendKind == .contiguous)
+        #expect(build.kvBackendFallbackReason?.hasPrefix("physical_capacity:") == true)
+        #expect(build.pagedPoolDType == nil)
+        await build.engine.shutdown()
+    }
+
+    @Test("`.auto` + a pool that throws at construction degrades: the build SUCCEEDS on contiguous")
+    func autoDegradesOnThrowingPool() async throws {
+        _ = LiveInferenceFixtures.ensureMetallibColocated()
+        // A REAL `PagedKVPool.init` throw through the production path —
+        // the third failure stage, past both preflight and the capacity
+        // plan. The capacity policy is dtype-BLIND (it plans at the fp16
+        // rate), so a grant that plans a 1 MiB pool (the sub-GiB test
+        // floor) is handed to an fp32 pool whose pages are twice the size:
+        // at head_dim 512 / 16 KV heads one fp32 page is
+        // 2·16·16·512·4 = 1 MiB (`PagedKVGroup.pageBytes`), the single
+        // slab group holds exactly one page, and a group needs two (one
+        // poison, one tenant) — `CBv2KVError.capacityExhausted`, from the
+        // pool itself, after `decide` said paged.
+        let build = try EngineV2Factory.makeProductionBuild(
+            model: try tinyGPTOSS(headDim: 512, kvHeads: 16),
+            tokenizer: StubBridgeTokenizer(),
+            kvBytesCapacity: 1_572_864,  // plans min(grant, …) → 1 MiB
+            maxConcurrentRequests: 2,
+            kvBackend: .auto,
+            maxContextLength: 2048,
+            environment: gateEnvironment(
+                [EngineV2Factory.pagedPoolDTypeEnvKey: "float32"]),
+            pagedPreflightOverride: { _ in })
+        #expect(build.kvBackendKind == .contiguous)
+        #expect(
+            build.kvBackendFallbackReason?.hasPrefix("pool_construction_capacity:") == true)
+        // No pages were built, so no page dtype is reported — the fp32
+        // request that degraded must not masquerade as an fp32 pool.
+        #expect(build.pagedPoolDType == nil)
+        await build.engine.shutdown()
+    }
+
+    // MARK: crash-loop guard resolution (the guard's factory half; the
+    // watchdog half lives in WatchdogCrashLoopGuardTests).
+
+    private func withGuardFile(
+        _ record: KVBackendGuard?,
+        _ body: ([String: String]) async throws -> Void
+    ) async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kv-backend-guard-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let env = [KVBackendGuardStore.pathEnvKey: url.path]
+        if let record {
+            #expect(KVBackendGuardStore.write(record, environment: env))
+        }
+        try await body(env)
+    }
+
+    @Test("`.auto` + active crash-loop guard resolves CONTIGUOUS with the guard reason")
+    func autoHonorsCrashLoopGuard() async throws {
+        try await withGuardFile(
+            KVBackendGuard(
+                trippedAt: 1, providerVersion: ProviderCore.version, crashCount: 3)
+        ) { env in
+            let build = try makeBuild(
+                model: try tinyGPTOSS(), kvBackend: .auto, environment: env)
+            #expect(build.kvBackendKind == .contiguous)
+            #expect(build.kvBackendFallbackReason == "crash_loop_guard")
+            #expect(build.pagedPoolDType == nil)
+            await build.engine.shutdown()
+        }
+    }
+
+    @Test("explicit paged IGNORES the crash-loop guard — operator intent beats automation")
+    func explicitPagedIgnoresCrashLoopGuard() async throws {
+        try await withGuardFile(
+            KVBackendGuard(
+                trippedAt: 1, providerVersion: ProviderCore.version, crashCount: 3)
+        ) { env in
+            let build = try makeBuild(
+                model: try tinyGPTOSS(), kvBackend: .paged, environment: env)
+            #expect(build.kvBackendKind == .paged)
+            #expect(build.kvBackendFallbackReason == nil)
+            await build.engine.shutdown()
+        }
+    }
+
+    @Test("a version-mismatched guard record fails OPEN to paged")
+    func staleGuardFailsOpen() async throws {
+        try await withGuardFile(
+            KVBackendGuard(trippedAt: 1, providerVersion: "0.0.1-tripped-by-someone-else", crashCount: 3)
+        ) { env in
+            let build = try makeBuild(
+                model: try tinyGPTOSS(), kvBackend: .auto, environment: env)
+            #expect(build.kvBackendKind == .paged)
+            #expect(build.kvBackendFallbackReason == nil)
+            await build.engine.shutdown()
+        }
+    }
+
+    @Test("a corrupt guard file fails OPEN to paged, not a crash")
+    func corruptGuardFailsOpen() async throws {
+        try await withGuardFile(nil) { env in
+            let url = URL(fileURLWithPath: env[KVBackendGuardStore.pathEnvKey]!)
+            try Data("{definitely not json".utf8).write(to: url)
+            let build = try makeBuild(
+                model: try tinyGPTOSS(), kvBackend: .auto, environment: env)
+            #expect(build.kvBackendKind == .paged)
+            #expect(build.kvBackendFallbackReason == nil)
+            await build.engine.shutdown()
+        }
+    }
+
+    @Test("the kill switch outranks the guard for the reported reason")
+    func killSwitchReasonOutranksGuard() async throws {
+        // Both force contiguous; the label must be the OPERATOR's, because
+        // "kill_switch" is deliberate rollback (good news) while
+        // "crash_loop_guard" is an incident marker, and dashboards separate
+        // the two populations on exactly this string.
+        try await withGuardFile(
+            KVBackendGuard(
+                trippedAt: 1, providerVersion: ProviderCore.version, crashCount: 3)
+        ) { env in
+            var environment = env
+            environment[EngineV2KVBackendPolicy.killSwitchEnvKey] = "0"
+            let build = try makeBuild(
+                model: try tinyGPTOSS(), kvBackend: .auto, environment: environment)
+            #expect(build.kvBackendKind == .contiguous)
+            #expect(build.kvBackendFallbackReason == "kill_switch")
+            await build.engine.shutdown()
+        }
+    }
+
+    @Test("manual clear restores paged on the very next construction")
+    func manualClearRestoresPaged() async throws {
+        try await withGuardFile(
+            KVBackendGuard(
+                trippedAt: 1, providerVersion: ProviderCore.version, crashCount: 3)
+        ) { env in
+            let guarded = try makeBuild(
+                model: try tinyGPTOSS(), kvBackend: .auto, environment: env)
+            #expect(guarded.kvBackendKind == .contiguous)
+            await guarded.engine.shutdown()
+
+            // What `darkbloom doctor --clear-backend-guard` executes.
+            #expect(KVBackendGuardStore.clear(environment: env))
+
+            let cleared = try makeBuild(
+                model: try tinyGPTOSS(), kvBackend: .auto, environment: env)
+            #expect(cleared.kvBackendKind == .paged)
+            #expect(cleared.kvBackendFallbackReason == nil)
+            await cleared.engine.shutdown()
+        }
+    }
+
+    @Test("kill-switch degrade constructs frozen-full cache for resolved contiguous backend")
     func pagedFallbackConstructsFrozenCache() async throws {
-        struct PreflightFailure: Error {}
         let model = try tinyGemma4Text()
+        // The kill switch is now the only route to a DEGRADED preparation
+        // from an explicit paged selection — preflight and capacity
+        // failures refuse instead (see the three refusal tests above). The
+        // property under test is unchanged: whatever produces a resolved
+        // contiguous backend must also produce a frozen-full SSD cache
+        // capability, so the cache can never be built for a backend that
+        // is not the one serving.
         let prepared = try EngineV2Factory.prepareProductionBackend(
             model: model,
             kvBytesCapacity: gateTestCapacity,
             maxConcurrentRequests: 2,
             kvBackend: .paged,
             maxContextLength: 2048,
-            environment: [:],
-            pagedPreflightOverride: { _ in throw PreflightFailure() })
+            environment: [EngineV2KVBackendPolicy.killSwitchEnvKey: "0"],
+            pagedPreflightOverride: { _ in })
         #expect(prepared.kind == .contiguous)
-        #expect(prepared.fallbackReason?.hasPrefix("kernel_preflight:") == true)
+        #expect(prepared.fallbackReason == "kill_switch")
 
         let capability = PrefixCachePolicy.prefixReuseCapability(
             layerKinds: prepared.layerKinds,
             backendSelection: .contiguous)
         #expect(capability.strategy == .frozenFullReplay)
         #expect(capability.isSupported)
-
-        let capacityFallback = try EngineV2Factory.prepareProductionBackend(
-            model: model,
-            kvBytesCapacity: 1_024,
-            maxConcurrentRequests: 2,
-            kvBackend: .paged,
-            maxContextLength: 2048,
-            environment: [:],
-            pagedPreflightOverride: { _ in })
-        #expect(capacityFallback.kind == .contiguous)
-        #expect(capacityFallback.fallbackReason?.hasPrefix("physical_capacity:") == true)
-        #expect(PrefixCachePolicy.prefixReuseCapability(
-            layerKinds: capacityFallback.layerKinds,
-            backendSelection: .contiguous
-        ).strategy == .frozenFullReplay)
 
         let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
             .appendingPathComponent("paged-fallback-cache-\(UUID().uuidString)", isDirectory: true)
@@ -290,9 +573,38 @@ struct EngineV2KVBackendGateTests {
         await build.engine.shutdown()
     }
 
-    @Test("slot factory resolves paged fallback before constructing frozen cache")
+    @Test("paged pool is sized from the ONE scheduler config the engine runs on")
+    func pagedPoolLocksStepWithSchedulerConfig() async throws {
+        let model = try tinyGemma4Text()
+        let prepared = try EngineV2Factory.prepareProductionBackend(
+            model: model,
+            kvBytesCapacity: gateTestCapacity,
+            maxConcurrentRequests: 2,
+            kvBackend: .paged,
+            maxContextLength: 2048,
+            environment: [:])
+        #expect(prepared.kind == .paged)
+        let (backend, _) = try prepared.consume(model: model, maxConcurrentRequests: 2)
+        let paged = try #require(backend as? PagedKVBackend)
+        // LOCKSTEP. `PagedSequenceKV` PRECONDITIONS that a windowed update
+        // never exceeds the pool's `maxPrefillChunk` — a process kill, not
+        // a throw — so the pool must be sized from the chunk the ENGINE
+        // actually schedules. There is now one `CBv2SchedulerConfig` per
+        // build, carried on the preparation and reused verbatim by
+        // `assembleProductionBuild`; this pins the pool against it so a
+        // re-introduced parallel constant fails here instead of aborting
+        // the daemon under a long windowed prefill.
+        #expect(
+            paged.pool.config.maxPrefillChunk
+                == prepared.schedulerConfig.prefillChunkSize)
+        #expect(prepared.schedulerConfig.maxConcurrentRequests == 2)
+        // Prefix caching is the ONLY field assembly may still decide, and
+        // it is off until a cache instance is supplied.
+        #expect(!prepared.schedulerConfig.enablePrefixCache)
+    }
+
+    @Test("slot factory resolves the degraded backend before constructing frozen cache")
     func slotFactoryOrdersResolvedBackendBeforeCache() async throws {
-        struct PreflightFailure: Error {}
         let model = try tinyGemma4Text()
         let tokenizer = StubBridgeTokenizer()
         let container = ModelContainer(
@@ -331,7 +643,6 @@ struct EngineV2KVBackendGateTests {
             kvBytesCapacity: gateTestCapacity,
             maxConcurrentRequests: 2,
             kvBudget: nil,
-            kvQuantConfigured: false,
             kvBackendConfig: "paged",
             weightHash: String(repeating: "a", count: 64),
             specDecPreparation: SpecDecPreparation(
@@ -340,7 +651,10 @@ struct EngineV2KVBackendGateTests {
             preparedModel: preparedModel,
             assemblyOverrides: .init(
                 promptContractID: "tiny-gemma-contract",
-                pagedPreflight: { _ in throw PreflightFailure() },
+                // Kill-switch degrade, not a preflight failure: an
+                // explicit `paged` config whose preflight fails now
+                // refuses out of this same call (see
+                // `slotFactoryRefusesExplicitPagedRequest`).
                 makePrefixCache: { layerKinds, capability in
                     let cache = SSDPrefixCache(
                         config: .init(
@@ -368,7 +682,7 @@ struct EngineV2KVBackendGateTests {
                     capture.set(cache: cache, capability: capability)
                     return cache
                 }),
-            environment: [:])
+            environment: [EngineV2KVBackendPolicy.killSwitchEnvKey: "0"])
         let cache = try #require(capture.cache)
         let backendKind = await bundle.bridge.kvBackendKind
         #expect(backendKind == .contiguous)
@@ -381,6 +695,77 @@ struct EngineV2KVBackendGateTests {
         #expect(status.state == .pending)
         #expect(status.reason == .scanPending)
         await bundle.bridge.shutdown()
+    }
+
+    @Test("slot factory REFUSES an explicit paged request it cannot serve")
+    func slotFactoryRefusesExplicitPagedRequest() async throws {
+        struct PreflightFailure: Error {}
+        let model = try tinyGemma4Text()
+        let tokenizer = StubBridgeTokenizer()
+        let container = ModelContainer(
+            context: ModelContext(
+                configuration: ModelConfiguration(id: "tiny/gemma"),
+                model: model,
+                processor: GateProcessor(),
+                tokenizer: tokenizer))
+        let preparedModel = EngineV2PreparedModel(
+            snapshot: EngineV2ModelSnapshot(
+                model: model,
+                eosTokenIds: [1],
+                extraEOSTokens: []),
+            servingModel: model,
+            assistant: nil,
+            mtpStatus: .disabled(.configDisabled, configured: false),
+            mtpArtifact: nil)
+        let telemetry = GateTelemetrySink()
+
+        // The production 503 path end to end: operator config says paged,
+        // the kernel cannot be preflighted, so the LOAD fails instead of
+        // quietly serving a contiguous slot under a paged label.
+        let reason = await pagedRefusalReason {
+            _ = try await EngineV2SlotFactory.makeProductionBundle(
+                modelId: "tiny-gemma",
+                modelType: "gemma4_text",
+                isVLM: false,
+                modelDirectory: nil,
+                container: container,
+                tokenizer: TokenizerHandle(tokenizer),
+                sizing: SlotSizingSnapshot(
+                    weightsBytes: 1,
+                    fp16KVBytesPerToken: 1_024,
+                    maxContextLength: 2_048,
+                    defaultMaxTokens: 32),
+                kvBytesCapacity: gateTestCapacity,
+                maxConcurrentRequests: 2,
+                kvBudget: nil,
+                kvBackendConfig: "paged",
+                weightHash: String(repeating: "a", count: 64),
+                specDecPreparation: SpecDecPreparation(
+                    artifact: nil,
+                    status: .disabled(.configDisabled, configured: false)),
+                preparedModel: preparedModel,
+                assemblyOverrides: .init(
+                    promptContractID: "tiny-gemma-contract",
+                    pagedPreflight: { _ in throw PreflightFailure() }),
+                environment: [:],
+                emitTelemetry: { telemetry.record($0) })
+        }
+        #expect(reason?.hasPrefix("kernel_preflight:") == true)
+
+        // ERROR `engine_v2_refusal`, classified so a paged-rollout
+        // regression stays separable from every other bad load in
+        // aggregate — `engine_init_failed` would bury it.
+        let refusals = telemetry.events.filter {
+            $0.fields?["operation"]?.description == "engine_v2_refusal"
+        }
+        #expect(refusals.count == 1)
+        #expect(refusals.first?.severity == .error)
+        #expect(
+            refusals.first?.fields?["reason"]?.description
+                == "paged_backend_unavailable")
+        #expect(
+            refusals.first?.fields?["error"]?.description
+                .contains("kernel_preflight:") == true)
     }
 
     @Test("slot factory publishes GPT-OSS native contiguous rate without SSD staging")
@@ -425,7 +810,6 @@ struct EngineV2KVBackendGateTests {
             kvBytesCapacity: gateTestCapacity,
             maxConcurrentRequests: 2,
             kvBudget: nil,
-            kvQuantConfigured: false,
             kvBackendConfig: "contiguous",
             weightHash: String(repeating: "b", count: 64),
             specDecPreparation: SpecDecPreparation(
@@ -443,5 +827,91 @@ struct EngineV2KVBackendGateTests {
         #expect(status.state == .disabled)
         #expect(status.reason == .configDisabled)
         await bundle.bridge.shutdown()
+    }
+
+    // MARK: VLM slot routing (WS-2.2)
+
+    /// THROUGH the slot factory, which is the point.
+    ///
+    /// Every other test of paged vision — the backend suites in
+    /// mlx-swift-lm, `BackendParityHarness` — constructs the engine
+    /// directly and therefore never runs `applySlotVetoes`. That is exactly
+    /// how the span-mask work could land, pass everywhere, and still be
+    /// unreachable in production: the veto forced every VLM slot to
+    /// contiguous and nothing that ran asked it. This test goes through
+    /// `makeProductionBundle` and asserts the backend the bridge ACTUALLY
+    /// resolved, so the next capability cannot land with the same invisible
+    /// gap.
+    ///
+    /// `preparedModel` is supplied so the VLM text extraction (which needs a
+    /// checkpoint directory) is skipped: the subject here is the ROUTING for
+    /// `isVLM: true`, not the extraction.
+    @Test("slot factory routes a VLM slot to paged now that the cache vouches")
+    func slotFactoryRoutesVLMToPagedWhenTheCacheVouches() async throws {
+        #expect(
+            PagedLayerCache.honorsSpanMaskContextsByConstruction,
+            "premise: the paged cache affirms span masks — if this ever goes false the expectation below must flip to .contiguous with a \"vlm\" veto")
+        let model = try tinyGemma4Text()
+        let tokenizer = StubBridgeTokenizer()
+        let container = ModelContainer(
+            context: ModelContext(
+                configuration: ModelConfiguration(id: "tiny/gemma"),
+                model: model,
+                processor: GateProcessor(),
+                tokenizer: tokenizer))
+        let preparedModel = EngineV2PreparedModel(
+            snapshot: EngineV2ModelSnapshot(
+                model: model, eosTokenIds: [1], extraEOSTokens: []),
+            servingModel: model,
+            assistant: nil,
+            mtpStatus: .disabled(.configDisabled, configured: false),
+            mtpArtifact: nil)
+
+        let bundle = try await EngineV2SlotFactory.makeProductionBundle(
+            modelId: "tiny-gemma-vlm",
+            modelType: "gemma4",
+            isVLM: true,
+            modelDirectory: nil,
+            container: container,
+            tokenizer: TokenizerHandle(tokenizer),
+            sizing: SlotSizingSnapshot(
+                weightsBytes: 1,
+                fp16KVBytesPerToken: 1_024,
+                maxContextLength: 2_048,
+                defaultMaxTokens: 32),
+            kvBytesCapacity: gateTestCapacity,
+            maxConcurrentRequests: 2,
+            kvBudget: nil,
+            kvBackendConfig: "paged",
+            weightHash: String(repeating: "c", count: 64),
+            specDecPreparation: SpecDecPreparation(
+                artifact: nil,
+                status: .disabled(.configDisabled, configured: false)),
+            preparedModel: preparedModel,
+            environment: [PrefixCachePolicy.environmentFlag: "0"])
+        let backendKind = await bundle.bridge.kvBackendKind
+        #expect(
+            backendKind == .paged,
+            "an explicit paged VLM slot must now resolve PAGED — the veto is gated on the cache's span claim, and the paged cache affirms it")
+        await bundle.bridge.shutdown()
+    }
+
+    /// The other side of the same gate, and the reason it is a gate rather
+    /// than a deletion: a VLM slot whose cache does NOT vouch still goes
+    /// contiguous, silently, with the `"vlm"` tag for the slot log. Asserted
+    /// on the policy directly because no shipping cache answers false — the
+    /// veto has to keep working for the backend that has not implemented
+    /// spans YET, which is the whole point of gating on the claim.
+    @Test("a VLM slot whose cache does not vouch is still forced to contiguous")
+    func vlmSlotWithoutSpanClaimStaysContiguous() {
+        let refused = EngineV2KVBackendPolicy.applySlotVetoes(
+            selection: .paged, isVLM: true, pagedHonorsSpanMasks: false)
+        #expect(refused.selection == .contiguous)
+        #expect(refused.veto == "vlm")
+
+        let allowed = EngineV2KVBackendPolicy.applySlotVetoes(
+            selection: .paged, isVLM: true, pagedHonorsSpanMasks: true)
+        #expect(allowed.selection == .paged)
+        #expect(allowed.veto == nil, "an unvetoed slot has nothing to log")
     }
 }
