@@ -143,25 +143,36 @@ end = "08:00"
   tell a value the previous release GENERATED from one you chose. Leave it
   alone; deleting it re-runs the one-time upgrade migrations below.
 - `backend.engine_v2_max_concurrent` — box-wide concurrent-request cap per
-  engine slot (default 8 as of v0.8.0, clamped to `[1, 8]`). Raised from 4
-  in v0.8.0 because B=8 is the better operating point on either KV backend
-  (contiguous gains ~1.07x from B=4 to B=8). A `provider.toml` written
-  before v0.8.0 carries an
-  explicit `= 4` that the old release generated; because that is
-  indistinguishable from a deliberate 4, first start after upgrading raises
-  it to 8 once, logs a warning saying so, and stamps `config_version`. If
-  you want 4, set it again afterwards — from then on it is honoured.
+  engine slot (default **4** as of v0.8.1, clamped to `[1, 8]`). v0.8.0 raised
+  it to 8 because PagedAttention made the batch curve keep climbing (paged
+  gains 1.27x from B=4 to B=8, contiguous only 1.069x); v0.8.1 reverts the
+  paged default, so the raise goes back with it. 4 is the knee of the measured
+  contiguous curve — aggregate throughput is flat from B=4 to B=8 and collapses
+  below it, while per-request decode is aggregate/B and so improves as the
+  batch shrinks, which is what a time-to-first-token deadline is scored on.
+  A `provider.toml` written by v0.8.0 carries an explicit `= 8` that release
+  generated; because that is **indistinguishable from a deliberate 8**, first
+  start after upgrading changes it to 4 once, logs a warning saying so, and
+  bumps `config_version` to 2. If you want 8, set it again afterwards — from
+  then on it is honoured. The `[1, 8]` upper bound is unchanged, so 8 stays
+  available both box-wide and per-model, which is what a box running
+  `engine_v2_kv_backend = "paged"` wants.
 - `backend.engine_v2_kv_backend` — KV-cache backend for the inference engine:
-  `"auto"` (default — resolves **PAGED** as of v0.8.0; grep
-  `case .auto: resolvedKind` in
+  `"auto"` (default — resolves **CONTIGUOUS** as of v0.8.1, reverting the
+  v0.8.0 paged default; grep `case .auto: resolvedKind` in
   `provider-swift/Sources/ProviderCore/Inference/EngineV2Factory+Production.swift`
-  for the argument). On the two models the network serves, paged is the arm
-  whose prefix-cache adoption is exact; contiguous is the arm that diverges
-  from its own cold decode. **gemma-4 greedy outputs change under paged** —
-  measurably closer to an fp32 reference, but different text for the same
-  prompt. Set `"contiguous"` per slot, or
-  `DARKBLOOM_CBV2_PAGED_KV=0` fleet-wide, to go back. A box that cannot
-  build paged degrades to contiguous on its own and keeps serving.
+  for the argument). Paged sizes its KV pool from a physical-capacity policy
+  rather than the slot's logical grant, which cost the fleet roughly 10x its
+  KV and produced widespread admission failures; contiguous gets the whole
+  grant. Set `"paged"` to opt a box back in — note that an explicit `"paged"`
+  on a box that cannot build it **refuses the load (503)** rather than
+  degrading, which is the point of naming it. There is no env var that turns
+  paged on: `DARKBLOOM_CBV2_PAGED_KV=0` is a kill switch and only forces
+  contiguous. **gemma-4 greedy outputs differ between the two backends** —
+  paged is measurably closer to an fp32 reference, but the text is not
+  identical. A resolved-contiguous slot also runs with the SSD prefix cache
+  OFF: adoption is not bit-exact on contiguous for the served models, so the
+  cache is not constructed there.
   Vision (VLM) models are NOT forced to contiguous. The
   VLM veto in `EngineV2KVBackendPolicy.applySlotVetoes`
   (`guard isVLM, !pagedHonorsSpanMasks`, `provider-swift/Sources/ProviderCore/Inference/EngineV2KVBackendPolicy.swift:162`)
