@@ -1833,9 +1833,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /v1/billing/stripe/status", s.requireAuth(s.handleStripeStatus))
 	s.mux.HandleFunc("POST /v1/billing/withdraw/stripe", s.requireAuth(s.handleStripeWithdraw))
 	s.mux.HandleFunc("GET /v1/billing/stripe/withdrawals", s.requireAuth(s.handleStripeWithdrawals))
-	// requirePrivyAuth (not requireAuth): unlink is an account-management
-	// operation — a leaked inference API key must not be able to detach the
-	// user's payout account.
+	// requirePrivyAuth (not requireAuth): both of these are account-management
+	// operations — a leaked inference API key must not be able to detach the
+	// user's payout account, nor mint a dashboard session that can point their
+	// earnings at a different bank account.
+	//
+	// The dashboard route additionally carries rateLimitFinancial: every call
+	// is a live Stripe POST that mints a credential, so an authenticated
+	// session must not be able to loop it and burn the platform's Stripe
+	// request capacity. Chained INSIDE requirePrivyAuth because the limiter
+	// keys on the account ID the auth middleware puts in the request context.
+	s.mux.HandleFunc("POST /v1/billing/stripe/dashboard", s.requirePrivyAuth(s.rateLimitFinancial(s.handleStripeDashboardLink)))
 	s.mux.HandleFunc("DELETE /v1/billing/stripe/account", s.requirePrivyAuth(s.handleStripeUnlink))
 	s.mux.HandleFunc("POST /v1/billing/stripe/connect/webhook", s.handleStripeConnectWebhook) // no auth — Stripe signs it
 
