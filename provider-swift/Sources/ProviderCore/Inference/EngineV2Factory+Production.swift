@@ -39,14 +39,14 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXVLM
 
 /// Failure modes of production v2-engine construction. Each maps to the
 /// factory's REFUSAL path (ERROR `engine_v2_refusal` telemetry + throw).
 enum EngineV2ProductionError: Error, CustomStringConvertible {
     /// The loaded module is not a CBv2-adapted family (an unexpected
-    /// architecture). Allowlisted Gemma 4 VLM wrappers do NOT land here —
-    /// the slot factory extracts their CBv2-adapted text model first
-    /// (`EngineV2VLMTextExtraction`) and hands THAT to this factory.
+    /// architecture). Gemma 4 VLM wrappers are resolved to their directly
+    /// owned text tower before engine construction.
     case unsupportedModel(String)
     /// No KV byte budget is left under the unified-memory cap — an engine
     /// admitted with a zero ceiling would reject every request, so the
@@ -66,10 +66,11 @@ enum EngineV2ProductionError: Error, CustomStringConvertible {
     /// (`EngineV2Factory.pagedPoolDType(environment:)`) and surfaced as a
     /// REFUSAL only for an EXPLICIT `.paged` selection — the measurement
     /// posture the knob exists for, where silently serving fp16 under an
-    /// fp32 label would fake a control arm. Under `.auto` (the fleet
-    /// default since v0.8.0) the factory catches it and DEGRADES to
-    /// contiguous with `fallbackReason = "invalid_dtype: …"` instead: one
-    /// typo'd env var must not 503 every slot on the fleet.
+    /// fp32 label would fake a control arm. If `.auto` resolves paged, the
+    /// factory catches this and DEGRADES to contiguous with
+    /// `fallbackReason = "invalid_dtype: …"` instead. That path is dormant
+    /// while `.auto` resolves contiguous as of v0.8.1, but remains the safety
+    /// contract for any future paged default.
     case invalidPagedPoolDType(String)
 
     var description: String {
@@ -89,6 +90,20 @@ enum EngineV2ProductionError: Error, CustomStringConvertible {
 }
 
 extension EngineV2Factory {
+    /// Resolve the exact module instance served by CBv2. Gemma 4 VLM owns
+    /// its `Gemma4TextModel`; direct VLM forwards and CBv2 therefore share
+    /// one language tower, one parameter tree, and one residency footprint.
+    static func directServingModel(
+        model: any LanguageModel, isVLM: Bool
+    ) throws -> any LanguageModel {
+        guard isVLM else { return model }
+        guard let gemma4 = model as? MLXVLM.Gemma4 else {
+            throw EngineV2ProductionError.unsupportedModel(
+                String(describing: type(of: model)))
+        }
+        return gemma4.textModel
+    }
+
 
     /// Clamp a KV admission ceiling to physical unified memory. A ceiling
     /// above physical RAM can only come from a mis-derivation upstream; the
@@ -283,8 +298,8 @@ extension EngineV2Factory {
     /// Build the real `EngineV2` over a loaded model.
     ///
     /// - Parameters:
-    ///   - model: the loaded language module (the SAME instance the legacy
-    ///     engine serves — weights are shared, never duplicated).
+    ///   - model: the loaded serving language module; for Gemma 4 VLM this
+    ///     is the exact text tower owned by the wrapper.
     ///   - tokenizer: the model's tokenizer, for incremental detokenization.
     ///   - kvBytesCapacity: admission ceiling for live sequence KV, in bytes
     ///     (derive from `UnifiedMemoryCap.kvBudgetBytes`).
@@ -532,11 +547,11 @@ extension EngineV2Factory {
         let layerKinds: [CBv2LayerKind]
         let newCaches:
             ((Int, CBv2LayerKind) -> any CBv2AttendingLayerCache)
-                -> [any CBv2AttendingLayerCache]
+                throws -> [any CBv2AttendingLayerCache]
         switch model {
         case let gemma as Gemma4TextModel:
             layerKinds = gemma.cbv2LayerKinds
-            newCaches = { make in gemma.newCacheV2(makeLayerCache: make) }
+            newCaches = { make in try gemma.newCacheV2(makeLayerCache: make) }
         case let gptoss as GPTOSSModel:
             layerKinds = gptoss.cbv2LayerKinds
             newCaches = { make in gptoss.newCacheV2(makeLayerCache: make) }
@@ -749,10 +764,10 @@ extension EngineV2Factory {
         let schedulerConfig = CBv2SchedulerConfig(
             maxConcurrentRequests: max(1, maxConcurrentRequests))
 
-        func contiguousPreparation() -> ProductionBackendPreparation {
+        func contiguousPreparation() throws -> ProductionBackendPreparation {
             let backend = CBv2ContiguousKVBackend(
                 config: CBv2ContiguousBackendConfig(bytesCapacity: cappedCapacity))
-            let caches = newCaches { index, kind in
+            let caches = try newCaches { index, kind in
                 CBv2LayerCache(layerIndex: index, kind: kind)
             }
             return ProductionBackendPreparation(
@@ -833,7 +848,7 @@ extension EngineV2Factory {
                         // exists, so no admitted page is ever unbacked.
                         slabCommitment: plan.commitment)
                     let pagedCaches = paged.makeLayerCaches()
-                    let caches = newCaches { index, _ in pagedCaches[index] }
+                    let caches = try newCaches { index, _ in pagedCaches[index] }
                     return ProductionBackendPreparation(
                         model: model,
                         maxConcurrentRequests: maxConcurrentRequests,
@@ -866,7 +881,7 @@ extension EngineV2Factory {
                 }
             }
         }
-        return contiguousPreparation()
+        return try contiguousPreparation()
     }
 
     /// Emergency rollback kill-switch for the monotonic deadline leases. Set

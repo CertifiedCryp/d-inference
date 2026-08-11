@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased (v0.8.2 candidate — provider)
+
+### Provider (Swift)
+
+#### Performance
+
+- **Gemma 4 26B-A4B v0.8.2 optimization stack** — Layer-18 lazy prefill submission; coupled weighted-expert-unsort + safe-R1 expert-QMM gate (both default-on via `[gemma_optimizations]`); the VLM wrapper's directly shared text tower; packed multimodal prefill inside q=128 query blocks; source-matched metallib enforced across CI/release/packaged smoke. Final performance and retention deltas are pending a same-tree A/B measurement on the reviewed release tree. Earlier gitignored measurements predated the final kernel edits and are not release evidence. Dropped before the final cut: expert gate/up packing, dense gate/up packing, standalone weighted-unsort, standalone R1. `0cc5fc9c9`
+
+---
+
 ## Unreleased (Apr 26 - May 25, 2026)
 
 26 commits since `aa74499`.

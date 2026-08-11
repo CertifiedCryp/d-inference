@@ -100,7 +100,6 @@ struct GemmaMTPProductionLiveTests {
         let prepared = try await EngineV2SlotFactory.prepareProductionModel(
             modelId: MTPProductionLiveFixtures.targetID,
             isVLM: true,
-            modelDirectory: targetDirectory,
             container: container,
             specDecPreparation: preparation,
             assistantLoader: AlwaysFailMTPAssistantLoader())
@@ -155,7 +154,7 @@ struct GemmaMTPProductionLiveTests {
     }
 
     @Test(
-        "VLM extraction and tool-templated decode retain greedy parity",
+        "shared VLM text tower and tool-templated decode retain greedy parity",
         .enabled(
             if: MTPProductionLiveFixtures.enabled,
             MTPProductionLiveFixtures.disabledReason))

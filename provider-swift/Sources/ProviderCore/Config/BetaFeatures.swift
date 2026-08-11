@@ -1,6 +1,6 @@
 import Foundation
 
-/// A user-facing opt-in *beta* feature.
+/// A user-facing configurable *beta* feature.
 ///
 /// Beta features are intentionally **config-backed**, not environment-variable
 /// backed: the launchd daemon started by `darkbloom start` only inherits a tiny
@@ -22,6 +22,13 @@ public struct BetaFeature: Sendable, Identifiable {
     public let details: String
     /// Whether `darkbloom restart` is required for a change to take effect.
     public let requiresRestart: Bool
+    /// Where the backing field lives in `provider.toml`
+    /// (`[section]` + `key =`), so the CLI can tell "already at the requested
+    /// value AND pinned in the file" apart from "same value via decode
+    /// default". An absent key must be WRITTEN on an explicit toggle: the
+    /// operator asked for the value durably, not for today's decode default
+    /// (a future default flip would otherwise silently move their provider).
+    public let configAddress: (section: String, key: String)?
 
     private let read: @Sendable (ProviderConfig) -> Bool
     private let write: @Sendable (Bool, inout ProviderConfig) -> Void
@@ -32,6 +39,7 @@ public struct BetaFeature: Sendable, Identifiable {
         summary: String,
         details: String,
         requiresRestart: Bool,
+        configAddress: (section: String, key: String)? = nil,
         read: @escaping @Sendable (ProviderConfig) -> Bool,
         write: @escaping @Sendable (Bool, inout ProviderConfig) -> Void
     ) {
@@ -40,6 +48,7 @@ public struct BetaFeature: Sendable, Identifiable {
         self.summary = summary
         self.details = details
         self.requiresRestart = requiresRestart
+        self.configAddress = configAddress
         self.read = read
         self.write = write
     }
@@ -55,13 +64,51 @@ public struct BetaFeature: Sendable, Identifiable {
     }
 }
 
-/// The registry of opt-in beta features.
+/// The registry of configurable beta features.
 ///
 /// Adding a beta toggle = adding one ``BetaFeature`` entry here (and its backing
-/// `ProviderConfig` field). The `darkbloom beta` command and `darkbloom status`
-/// are driven entirely off this list, so they need no per-feature code.
+/// `ProviderConfig` field). Features declare their own defaults; the
+/// `darkbloom beta` command and `darkbloom status` are driven entirely off this
+/// list, so they need no per-feature code.
 public enum BetaFeatures {
     public static let all: [BetaFeature] = [
+        BetaFeature(
+            id: "gemma-prefill-layer18",
+            title: "Gemma layer-18 prefill submission",
+            summary: "Default ON. Submit prefill work every 18 layers; disable for legacy submission behavior.",
+            details: """
+            Default ON for existing and new configs. Writes prefill_layer18 \
+            under [gemma_optimizations]; provider config is authoritative over \
+            the low-level process environment. Restart after changing it. \
+            Disable and restart to restore the legacy one-final-submission \
+            prefill behavior.
+            """,
+            requiresRestart: true,
+            configAddress: (section: "gemma_optimizations", key: "prefill_layer18"),
+            read: { $0.gemmaOptimizations.prefillLayer18 },
+            write: { enabled, config in
+                config.gemmaOptimizations.prefillLayer18 = enabled
+            }
+        ),
+        BetaFeature(
+            id: "gemma-weighted-r1",
+            title: "Gemma weighted unsort + safe R1",
+            summary: "Default ON. Coupled weighted-unsort and safe-R1 expert paths with one rollback.",
+            details: """
+            Default ON for existing and new configs. Writes weighted_r1 under \
+            [gemma_optimizations]. This single production control keeps direct \
+            weighted expert reduction coupled to the safe exact-shape R1 QMM \
+            path; neither half can be selected independently. Provider config \
+            is authoritative over the low-level process environment. Disable \
+            and restart to restore both legacy paths together.
+            """,
+            requiresRestart: true,
+            configAddress: (section: "gemma_optimizations", key: "weighted_r1"),
+            read: { $0.gemmaOptimizations.weightedR1 },
+            write: { enabled, config in
+                config.gemmaOptimizations.weightedR1 = enabled
+            }
+        ),
         BetaFeature(
             id: "mtp",
             title: "Multi-token prediction (speculative decoding)",
@@ -75,6 +122,7 @@ public enum BetaFeatures {
             mtp_drafter_path under [backend] to a local drafter directory.
             """,
             requiresRestart: true,
+            configAddress: (section: "backend", key: "mtp"),
             read: { $0.backend.mtp },
             write: { enabled, config in config.backend.mtp = enabled }
         ),

@@ -9,6 +9,13 @@ from .arrival import validate_arrival
 from .checks import assert_finite, require_positive
 
 
+RAW_SCHEMA_VERSIONS = {
+    "throughput sweep": 5,
+    "scheduler prefill": 2,
+    "arrival invariance": 4,
+}
+
+
 def validate_prefill(args: argparse.Namespace, sweep: dict) -> None:
     expected_prefill_counts = Counter(
         {length: args.iterations for length in args.prefill_lengths}
@@ -102,6 +109,12 @@ def validate_raw_outputs(
         ("scheduler prefill", scheduler),
         ("arrival invariance", arrival),
     ):
+        expected_schema = RAW_SCHEMA_VERSIONS[name]
+        if payload.get("schemaVersion") != expected_schema:
+            raise RuntimeError(
+                f"{name} schemaVersion is {payload.get('schemaVersion')!r}, "
+                f"expected {expected_schema}"
+            )
         if payload.get("modelID", "").replace("\\/", "/") != args.model:
             raise RuntimeError(f"{name} returned the wrong model ID")
         assert_finite(payload, name)

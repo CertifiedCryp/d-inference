@@ -83,9 +83,6 @@ public enum EngineV2RefusalReason: String, Sendable {
     /// (`EngineV2ProductionError.unsupportedModel`) — should be unreachable
     /// behind the scan-time supported-set gate; kept as loud insurance.
     case unsupportedModel = "unsupported_model"
-    /// The Gemma 4 VLM text-model extraction failed (config decode, weight
-    /// re-key, verify, or the forward-parity gate).
-    case vlmExtractionFailed = "vlm_extraction_failed"
     /// A load-time KV re-slice would push some co-resident slot below the
     /// minimum serviceable grant (`EngineV2KVSizing` floor).
     case resliceFloor = "reslice_floor"
@@ -121,8 +118,6 @@ public enum EngineV2RefusalReason: String, Sendable {
             return .pagedBackendUnavailable
         case EngineV2ProductionError.invalidPagedPoolDType:
             return .pagedKVDTypeInvalid
-        case is EngineV2VLMTextExtractionError:
-            return .vlmExtractionFailed
         default:
             return .engineInitFailed
         }

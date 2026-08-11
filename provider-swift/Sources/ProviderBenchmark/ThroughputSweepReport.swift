@@ -1,4 +1,5 @@
 import Foundation
+import ProviderCore
 
 /// Machine-readable result of `darkbloom benchmark --sweep`.
 ///
@@ -15,7 +16,8 @@ public struct ThroughputSweepReport: Codable, Sendable {
     /// `decode[].resolvedKVBackend`.
     /// 4 adds the required `decodeCoverage` block: which cells were ASKED
     /// for versus which ones actually produced a measurement.
-    public static let currentSchemaVersion = 4
+    /// 5 adds required effective config-projected Gemma settings.
+    public static let currentSchemaVersion = 5
 
     public struct Hardware: Codable, Sendable {
         public let chipName: String
@@ -229,6 +231,8 @@ public struct ThroughputSweepReport: Codable, Sendable {
     public let decode: [DecodeSample]
     public let derived: Derived
     public let notes: [String]
+    /// Config-projected Gemma settings this subprocess actually benchmarked.
+    public let gemmaOptimizations: BenchmarkGemmaOptimizations
     /// Selection versus resolved backend. Always present since schema 3: a
     /// decode curve whose backend is unknown is not comparable to anything.
     public let kvBackend: KVBackend
@@ -251,6 +255,7 @@ public struct ThroughputSweepReport: Codable, Sendable {
         decode: [DecodeSample],
         derived: Derived,
         notes: [String],
+        gemmaOptimizations: BenchmarkGemmaOptimizations,
         kvBackend: KVBackend = KVBackend(selection: "auto", resolved: []),
         decodeConstructionFailure: DecodeConstructionFailure? = nil,
         decodeCoverage: DecodeCoverage = DecodeCoverage(
@@ -264,6 +269,7 @@ public struct ThroughputSweepReport: Codable, Sendable {
         self.decode = decode
         self.derived = derived
         self.notes = notes
+        self.gemmaOptimizations = gemmaOptimizations
         self.kvBackend = kvBackend
         self.decodeConstructionFailure = decodeConstructionFailure
         self.decodeCoverage = decodeCoverage

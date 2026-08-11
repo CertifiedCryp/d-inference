@@ -94,8 +94,7 @@ private func gemma4Kinds(from config: [String: Any]) -> [CBv2LayerKind] {
         globalHeadDim: config["global_head_dim"] as! Int,
         numAttentionHeads: config["num_attention_heads"] as! Int,
         numKeyValueHeads: config["num_key_value_heads"] as! Int,
-        numGlobalKeyValueHeads: config["num_global_key_value_heads"] as? Int,
-        attentionKeqV: config["attention_k_eq_v"] as! Bool)
+        numGlobalKeyValueHeads: config["num_global_key_value_heads"] as? Int)
 }
 
 // MARK: - Tests
@@ -191,8 +190,11 @@ struct SlotSizingDriftTests {
             // Engine truth from the REAL file.
             let engineRate: Int
             if checkpoint.textConfigWrapped {
-                let textConfig = try EngineV2VLMTextExtraction.decodeTextConfiguration(
-                    configData: configData)
+                let root = try JSONSerialization.jsonObject(with: configData) as! [String: Any]
+                let textConfigData = try JSONSerialization.data(
+                    withJSONObject: root["text_config"] as! [String: Any])
+                let textConfig = try JSONDecoder().decode(
+                    Gemma4TextConfiguration.self, from: textConfigData)
                 engineRate = SlotSizingSnapshot.fp16KVBytesPerToken(
                     layerKinds: textConfig.cbv2LayerKinds)
             } else {

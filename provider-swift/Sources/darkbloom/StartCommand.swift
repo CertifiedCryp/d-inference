@@ -62,7 +62,6 @@ struct Start: AsyncParsableCommand {
 
     mutating func run() async throws {
         Darkbloom.ensureLogging()
-
         if !foreground {
             printTermsNotice()
         }
@@ -75,20 +74,20 @@ struct Start: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        // GPU is required. Reject CPU fallback up-front so we never
-        // come up reporting healthy and then silently churn at 0.5 tok/s.
-        do {
-            _ = try GPUEnforcement.requireMetal()
-        } catch {
-            printError("\(error)")
-            throw ExitCode.failure
-        }
-
         let snapshot = try loadRuntimeSnapshot(configOptions: configOptions)
         let effectiveCoordinator = coordinatorURL ?? snapshot.config.coordinator.url
         var effectiveConfig = snapshot.config
         if let idleTimeout {
             effectiveConfig.backend.idleTimeoutMins = idleTimeout
+        }
+
+        // These controls are process-start latches in MLX/MLXLM. Project the
+        // authoritative TOML before requireMetal() performs the first MLX touch.
+        do {
+            try Self.prepareServeRuntime(settings: snapshot.config.gemmaOptimizations)
+        } catch {
+            printError("Cannot start: \(error)")
+            throw ExitCode.failure
         }
 
         guard let hardware = snapshot.hardware else {
@@ -120,9 +119,32 @@ struct Start: AsyncParsableCommand {
             try await launchDaemon(
                 snapshot: snapshot,
                 config: effectiveConfig,
-                coordinatorURL: effectiveCoordinator
+                coordinatorURL: effectiveCoordinator,
+                configPath: configOptions.config == nil ? nil : snapshot.configPath
             )
         }
+    }
+
+    /// Backward-compatible forwarding shim for the process-start environment
+    /// projection. The real seam (and its ordering contract: config projection
+    /// strictly BEFORE the first MLX touch; a rejected projection throws
+    /// before `requireMetal()`) lives in `ServeRuntimePreparer.prepareRuntime`
+    /// so `benchmark` mirrors the serve path without referencing `Start`.
+    /// Tests target `ServeRuntimePreparer` directly.
+    internal static func prepareServeRuntime(
+        settings: GemmaOptimizationSettings,
+        apply: (GemmaOptimizationSettings) throws -> Void = {
+            try GemmaOptimizationEnvironment.apply($0)
+        },
+        requireMetal: () throws -> Void = {
+            _ = try GPUEnforcement.requireMetal()
+        }
+    ) throws {
+        try ServeRuntimePreparer.prepareRuntime(
+            settings: settings,
+            apply: apply,
+            requireMetal: requireMetal
+        )
     }
 
 }

@@ -8,6 +8,8 @@ fixture that only satisfied the checks under test would let the others rot.
 
 from __future__ import annotations
 
+import copy
+
 from statistics import median
 
 from ..config import EXPECTED_ARRIVAL_PATTERNS
@@ -21,6 +23,15 @@ HARDWARE = {
 }
 MODEL_ID = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
 MODEL_PATH = "/models/hub/models--mlx-community--gemma/snapshots/abc123"
+GEMMA_OPTIMIZATIONS = {
+    "prefillLayer18": True,
+    "weightedR1": True,
+    "environment": {
+        "DARKBLOOM_GEMMA4_PREFILL_CHUNK_EVAL": "18",
+        "MLX_GEMMA4_FUSED_WEIGHTED_UNSORT": "1",
+        "MLX_GATHER_QMM_EXPERT_SLICES": "1",
+    },
+}
 
 
 def sweep_payload(
@@ -71,10 +82,11 @@ def sweep_payload(
                 }
             )
     return {
-        "schemaVersion": 4,
+        "schemaVersion": 5,
         "modelID": MODEL_ID,
         "modelPath": MODEL_PATH,
         "hardware": dict(HARDWARE),
+        "gemmaOptimizations": copy.deepcopy(GEMMA_OPTIMIZATIONS),
         "prefill": prefill,
         "decode": decode,
         "derived": {
@@ -105,9 +117,10 @@ def scheduler_payload(
     the binary emits it.
     """
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "modelID": MODEL_ID,
         "modelPath": MODEL_PATH,
+        "gemmaOptimizations": copy.deepcopy(GEMMA_OPTIMIZATIONS),
         "kvBackend": {"selection": selection, "resolved": [resolved]},
         "samples": [
             {
@@ -186,7 +199,8 @@ def arrival_payload(
     return {
         "modelID": MODEL_ID,
         "modelPath": MODEL_PATH,
-        "schemaVersion": 3,
+        "schemaVersion": 4,
+        "gemmaOptimizations": copy.deepcopy(GEMMA_OPTIMIZATIONS),
         "kvBackend": {"selection": selection, "resolved": [resolved]},
         "promptTokensPerRequest": prompt_tokens,
         "decodeTokensPerRequest": decode_tokens,

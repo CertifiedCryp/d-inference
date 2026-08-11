@@ -20,6 +20,7 @@ from .baseline import (
 from .checks import assert_finite
 from .config import SCHEMA_VERSION, parse_args
 from .environment import performance_environment
+from .gemma_optimizations import resolve_gemma_optimizations
 from .process import (
     BenchmarkCommandFailure,
     atomic_write,
@@ -47,6 +48,30 @@ def resolve_output_dir(args: argparse.Namespace, repo_root: Path) -> Path:
         output_dir = repo_root / output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
+
+
+def resolve_config_path(raw_path: str | None, repo_root: Path) -> str | None:
+    """Normalize an explicit config against repo root and fail if unreadable."""
+    if raw_path is None:
+        return None
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = repo_root / path
+    try:
+        path = path.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError(f"provider config is not readable: {path}") from error
+    if not path.is_file() or not os.access(path, os.R_OK):
+        raise RuntimeError(f"provider config is not a readable regular file: {path}")
+    return str(path)
+
+
+def benchmark_argv(binary: Path, args: argparse.Namespace) -> list[str]:
+    """Shared prefix so every phase loads the same provider config."""
+    command = [str(binary), "benchmark"]
+    if args.config:
+        command.extend(["--config", args.config])
+    return command + ["--model", args.model]
 
 
 def persist_failed_report(failure: BenchmarkCommandFailure, output_dir: Path) -> int:
@@ -157,6 +182,7 @@ def arrival_argv(benchmark: list[str], args: argparse.Namespace) -> list[str]:
 def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[2]
+    args.config = resolve_config_path(args.config, repo_root)
     provider_dir = repo_root / "provider-swift"
     binary = provider_dir / ".build/release/darkbloom"
     metallib = provider_dir / ".build/release/mlx.metallib"
@@ -193,7 +219,7 @@ def main() -> int:
         raise RuntimeError("release binary or mlx.metallib is missing")
 
     output_dir = resolve_output_dir(args, repo_root)
-    benchmark = [str(binary), "benchmark", "--model", args.model]
+    benchmark = benchmark_argv(binary, args)
     # Parse before aborting: a refused sweep prints its report and THEN
     # fails, and that report is the whole diagnostic.
     try:
@@ -209,6 +235,7 @@ def main() -> int:
         "arrivalInvariance": arrival,
     }
     validate_raw_outputs(args, sweep, scheduler, arrival)
+    gemma_optimizations = resolve_gemma_optimizations(raw_outputs)
     # The backend every phase was actually built with. Extracted before the
     # summary so a run that cannot name its backends never reaches a report,
     # let alone a comparison.
@@ -220,6 +247,18 @@ def main() -> int:
     # The same capture is recorded in the report and pinned against the
     # baseline below, so the two can never describe different runs.
     environment = performance_environment(os.environ)
+    metadata = {
+        "rootCommit": capture(["git", "rev-parse", "HEAD"], repo_root),
+        "gitStatus": capture(["git", "status", "--short"], repo_root).splitlines(),
+        "submodules": capture(["git", "submodule", "status"], repo_root).splitlines(),
+        "mlxMetalSourceStatus": mlx_metal_status,
+        "mlxMetalSourceFingerprint": mlx_metal_fingerprint,
+        "binarySha256": sha256(binary),
+        "metallibSha256": sha256(metallib),
+        "environment": environment,
+        "thermalBefore": thermal_before,
+        "thermalAfter": capture_optional(["pmset", "-g", "therm"], repo_root),
+    }
     report = {
         # See config.SCHEMA_VERSION for what each version changed.
         "schemaVersion": SCHEMA_VERSION,
@@ -243,19 +282,11 @@ def main() -> int:
             "decodeIterations": args.iterations,
             "arrivalPromptTokens": args.arrival_prompt_tokens,
             "arrivalDecodeTokens": args.arrival_decode_tokens,
+            "providerConfig": args.config or "default",
+            "comparisonAxis": args.comparison_axis,
+            "gemmaOptimizations": gemma_optimizations,
         },
-        "metadata": {
-            "rootCommit": capture(["git", "rev-parse", "HEAD"], repo_root),
-            "gitStatus": capture(["git", "status", "--short"], repo_root).splitlines(),
-            "submodules": capture(["git", "submodule", "status"], repo_root).splitlines(),
-            "mlxMetalSourceStatus": mlx_metal_status,
-            "mlxMetalSourceFingerprint": mlx_metal_fingerprint,
-            "binarySha256": sha256(binary),
-            "metallibSha256": sha256(metallib),
-            "environment": environment,
-            "thermalBefore": thermal_before,
-            "thermalAfter": capture_optional(["pmset", "-g", "therm"], repo_root),
-        },
+        "metadata": metadata,
         "summary": summary,
         "raw": raw_outputs,
         "durationSeconds": time.monotonic() - started,
@@ -271,10 +302,19 @@ def main() -> int:
         # delta is computed: an unpinned snapshot, a different Mac, or a
         # flipped kill switch turns unrelated differences into what reads as
         # an engine regression.
-        validate_baseline_pins(args, baseline, model_snapshot, hardware, environment)
-        # The pin this release turns on. A paged-versus-contiguous difference
-        # would otherwise show up as a double-digit aggregate delta with no
-        # trace of its cause anywhere in the report.
+        validate_baseline_pins(
+            args,
+            baseline,
+            model_snapshot,
+            hardware,
+            environment,
+            gemma_optimizations,
+            comparison_axis=args.comparison_axis,
+            metadata=metadata,
+        )
+        # Keep the release's contiguous posture fixed across comparisons. A
+        # paged-versus-contiguous difference would otherwise read as a code or
+        # Gemma-optimization delta with no trace of its cause in the summary.
         validate_kv_backend_pin(baseline, kv_backend)
         report["comparison"] = compare(summary, baseline)
 

@@ -10,7 +10,8 @@ public struct SchedulerPrefillBenchmarkReport: Codable, Sendable {
     ///    `kvBackend` block and the per-sample `resolvedKVBackend`. An
     ///    UNVERSIONED payload predates the backend pin and cannot say which
     ///    backend it measured, so a gate must refuse it rather than assume.
-    public static let currentSchemaVersion = 1
+    /// 2 adds required effective config-projected Gemma settings.
+    public static let currentSchemaVersion = 2
 
     public struct Sample: Codable, Sendable {
         public let strategy: String
@@ -32,6 +33,8 @@ public struct SchedulerPrefillBenchmarkReport: Codable, Sendable {
     public let promptLengths: [Int]
     public let strategies: [String]
     public let iterations: Int
+    /// Config-projected Gemma settings this subprocess actually benchmarked.
+    public let gemmaOptimizations: BenchmarkGemmaOptimizations
     /// Selection versus the backends the measured engines were built with.
     public let kvBackend: BenchmarkKVBackend
     public let samples: [Sample]
@@ -67,15 +70,16 @@ public enum SchedulerPrefillBenchmark {
         modelDirectory: URL,
         promptLengths: [Int],
         iterations: Int,
-        kvBackend: EngineV2KVBackendSelection = .auto
+        kvBackend: EngineV2KVBackendSelection = .auto,
+        gemmaOptimizations: GemmaOptimizationSettings
     ) async throws -> SchedulerPrefillBenchmarkReport {
         let lengths = promptLengths.filter { $0 > 1 }.sorted()
         let iterations = max(1, iterations)
         log("loading model \(modelID)")
         log("  path: \(modelDirectory.path)")
 
-        // VLM checkpoints load via the VLM factory and measure through the
-        // weight-sharing extracted text model (production serving path).
+        // VLM checkpoints load via the VLM factory and measure the exact
+        // text tower owned by the wrapper (the production serving path).
         let isVLM = ThroughputSweep.readHasVisionConfig(modelDirectory: modelDirectory)
         let container: ModelContainer
         if isVLM {
@@ -109,7 +113,6 @@ public enum SchedulerPrefillBenchmark {
             iteration: 0,
             weightBytes: facts.weightBytes,
             isVLM: isVLM,
-            modelDirectory: modelDirectory,
             kvBackend: kvBackend
         )
 
@@ -124,7 +127,6 @@ public enum SchedulerPrefillBenchmark {
                     iteration: iteration,
                     weightBytes: facts.weightBytes,
                     isVLM: isVLM,
-                    modelDirectory: modelDirectory,
                     kvBackend: kvBackend
                 )
                 if !resolved.contains(sample.resolvedKVBackend) {
@@ -143,6 +145,8 @@ public enum SchedulerPrefillBenchmark {
             promptLengths: lengths,
             strategies: [strategyLabel],
             iterations: iterations,
+            gemmaOptimizations: BenchmarkGemmaOptimizations(
+                settings: gemmaOptimizations),
             kvBackend: BenchmarkKVBackend(
                 selection: kvBackend.rawValue, resolved: resolved),
             samples: samples
@@ -156,7 +160,6 @@ public enum SchedulerPrefillBenchmark {
         iteration: Int,
         weightBytes: Int,
         isVLM: Bool,
-        modelDirectory: URL?,
         kvBackend: EngineV2KVBackendSelection
     ) async throws -> SchedulerPrefillBenchmarkReport.Sample {
         // Same KV-ceiling derivation as a single-model serving slot; far
@@ -178,7 +181,7 @@ public enum SchedulerPrefillBenchmark {
         // to have been honoured.
         let parts = try await container.perform { ctx -> EngineParts in
             let servingModel = try EngineV2Factory.benchmarkServingModel(
-                model: ctx.model, isVLM: isVLM, modelDirectory: modelDirectory)
+                model: ctx.model, isVLM: isVLM)
             let build = try EngineV2Factory.makeProductionBuild(
                 model: servingModel,
                 tokenizer: ctx.tokenizer,

@@ -15,10 +15,10 @@ serving the public fleet, or use the same node for your own free inference via
 | **Network** | Outbound HTTPS (port 443) | Low-latency path to `api.darkbloom.dev` |
 
 The installer enforces macOS + Apple Silicon up front
-(`scripts/install.sh:41-48`). The start path rejects CPU-only execution via
-`GPUEnforcement.requireMetal()` (`provider-swift/Sources/darkbloom/StartCommand.swift:80-85`)
-and rejects machines with less than 8 GB RAM
-(`provider-swift/Sources/darkbloom/StartCommand.swift:444-447`).
+(`scripts/install.sh:41-48`). The start path rejects CPU-only execution through
+`Start.prepareServeRuntime` (`provider-swift/Sources/darkbloom/StartCommand.swift:128-147`)
+and rejects machines with less than 8 GB RAM in `Start.runPreflightChecks`
+(`provider-swift/Sources/darkbloom/StartCommand+Preflight.swift:14-27`).
 
 ## Install
 
@@ -109,7 +109,7 @@ It is created automatically on first start. The TOML schema is defined in
 `provider-swift/Sources/ProviderCore/Config/ProviderConfig.swift`.
 
 ```toml
-config_version = 1
+config_version = 2
 
 [provider]
 name = "darkbloom-mac16-1"
@@ -123,6 +123,10 @@ enabled_models = []
 idle_timeout_mins = 60
 max_model_slots = 3
 
+[gemma_optimizations]
+prefill_layer18 = true
+weighted_r1 = true
+
 [coordinator]
 url = "wss://api.darkbloom.dev/ws/provider"
 heartbeat_interval_secs = 5
@@ -134,6 +138,26 @@ start = "22:00"
 end = "08:00"
 ```
 
+- `gemma_optimizations.prefill_layer18` — default ON, including when an older
+  config omits the section or key. Set to `false` and restart to restore legacy
+  one-final-submission Gemma prefill. The default and missing-key decode are in
+  `provider-swift/Sources/ProviderCore/Config/GemmaOptimizationSettings.swift:16-34`;
+  the missing-section fallback is in
+  `provider-swift/Sources/ProviderCore/Config/ProviderConfig.swift:397-400`.
+- `gemma_optimizations.weighted_r1` — default ON, including when omitted. This
+  is one atomic production control for weighted unsort and safe R1; the two
+  paths cannot be configured independently
+  (`provider-swift/Sources/ProviderCore/Config/GemmaOptimizationSettings.swift:10-18`,
+  coupled projection at
+  `provider-swift/Sources/ProviderCore/Config/GemmaOptimizationEnvironment.swift:14-22`).
+- Provider TOML is authoritative for both controls. Changes take effect at
+  process restart; after setting either key to `false`, run `darkbloom restart`
+  to activate the rollback. The start path projects config before Metal access
+  (`provider-swift/Sources/darkbloom/StartCommand.swift:84-91` and
+  `provider-swift/Sources/darkbloom/ServeRuntimePreparer.swift:24-35`), while
+  `darkbloom beta` durably locks, reloads, and saves the selected value before
+  printing the restart boundary
+  (`provider-swift/Sources/darkbloom/BetaCommand.swift:201-235`).
 - `backend.enabled_models` — if non-empty, only these models are advertised.
 - `backend.idle_timeout_mins` — minutes of inactivity before an idle model is
   unloaded (default 60; 0 disables eviction).
@@ -175,14 +199,15 @@ end = "08:00"
   cache is not constructed there.
   Vision (VLM) models are NOT forced to contiguous. The
   VLM veto in `EngineV2KVBackendPolicy.applySlotVetoes`
-  (`guard isVLM, !pagedHonorsSpanMasks`, `provider-swift/Sources/ProviderCore/Inference/EngineV2KVBackendPolicy.swift:162`)
+  (`guard isVLM, !pagedHonorsSpanMasks`, `provider-swift/Sources/ProviderCore/Inference/EngineV2KVBackendPolicy.swift:202-210`)
   fires only when the paged cache does not affirm multimodal span masks, and
   `PagedLayerCache.honorsSpanMaskContextsByConstruction` is `true`
-  (`libs/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/PagedLayerCache.swift:982`),
+  (`libs/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/PagedLayerCache.swift:994`),
   which is what the slot factory passes
-  (`provider-swift/Sources/ProviderCore/Inference/EngineV2SlotFactory.swift:190`),
-  so the veto is inert: a VLM slot gets paged under `"auto"` like any
-  other model.
+  (`provider-swift/Sources/ProviderCore/Inference/EngineV2SlotFactory.swift:301-304`),
+  so the veto is inert: an explicitly paged VLM slot can use paged like any
+  other model. Under `"auto"`, every slot resolves contiguous as described
+  above.
   The concurrency cap above matters: paged only
   overtakes contiguous above ~5 concurrent rows, so pairing
   `engine_v2_kv_backend = "paged"` with a low `engine_v2_max_concurrent`
@@ -192,14 +217,14 @@ end = "08:00"
   under an explicit `"paged"` the model REFUSES to load instead, with the
   underlying reason attached:
   `EngineV2KVBackendPolicy.degradesPagedFailure`
-  (`selection != .paged`, `provider-swift/Sources/ProviderCore/Inference/EngineV2KVBackendPolicy.swift:183`)
+  (`selection != .paged`, `provider-swift/Sources/ProviderCore/Inference/EngineV2KVBackendPolicy.swift:229-233`)
   returns `false` for — and only for — an explicit `.paged` selection, so a
   paged fleet can never silently serve contiguous. That refusal surfaces as
   a 503 and the coordinator reroutes: the engine-construction catch wraps it
   as `InferenceError.modelLoadFailed`
   (`provider-swift/Sources/ProviderCore/ProviderLoop+ModelLoading.swift:543-549`),
   `loadErrorStatusCode` maps that case to 503
-  (`same file:975-983`), and the coordinator counts a 503 as
+  (`same file:979-1007`), and the coordinator counts a 503 as
   `capacityRejection` — no reputation strike — then cools the load-rejecting
   pair so retries skip it (`coordinator/api/provider.go:2332`, cool-down at
   `:2343-2351`).

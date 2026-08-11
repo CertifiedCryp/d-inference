@@ -110,7 +110,10 @@ func loadRuntimeSnapshot(configOptions: ConfigOptions) throws -> RuntimeSnapshot
     return try loadRuntimeSnapshot(configPath: configOptions.config)
 }
 
-func loadRuntimeSnapshot(configPath rawPath: String?) throws -> RuntimeSnapshot {
+func loadRuntimeSnapshot(
+    configPath rawPath: String?,
+    migrateOnDisk: Bool = true
+) throws -> RuntimeSnapshot {
     let configPath = try resolveConfigPath(rawPath)
     let configFileExists = FileManager.default.fileExists(atPath: configPath.path)
 
@@ -133,8 +136,11 @@ func loadRuntimeSnapshot(configPath rawPath: String?) throws -> RuntimeSnapshot 
         config = ConfigManager.loadDefault()
     }
 
-    // Auto-migrate stale config values (idempotent, best-effort).
-    config = migrateConfigIfNeeded(configPath: configPath, config: config)
+    // Serving/operator commands migrate stale config values. Benchmarking is
+    // read-only: measurement must never rewrite the input half of an A/B pair.
+    if migrateOnDisk {
+        config = migrateConfigIfNeeded(configPath: configPath, config: config)
+    }
 
     let models = hardware.map { ModelScanner.scanModels(hardwareInfo: $0) } ?? []
 

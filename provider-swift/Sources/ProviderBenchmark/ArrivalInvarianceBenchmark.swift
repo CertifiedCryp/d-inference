@@ -57,7 +57,8 @@ public struct ArrivalInvarianceBenchmarkReport: Codable, Sendable {
     ///   launched with and the backend its engine actually built. Without it
     ///   the phase's numbers cannot be attributed to an arm, and `.auto`
     ///   resolves CONTIGUOUS.
-    public static let currentSchemaVersion = 3
+    /// 4 adds required effective config-projected Gemma settings.
+    public static let currentSchemaVersion = 4
 
     public let schemaVersion: Int
     public let modelID: String
@@ -65,6 +66,8 @@ public struct ArrivalInvarianceBenchmarkReport: Codable, Sendable {
     public let promptTokensPerRequest: Int
     public let decodeTokensPerRequest: Int
     public let iterations: Int
+    /// Config-projected Gemma settings this subprocess actually benchmarked.
+    public let gemmaOptimizations: BenchmarkGemmaOptimizations
     /// Bound enforced on every measured row's `arrivalErrorMs`. Samples that
     /// exceed it are re-run, and the benchmark fails rather than reporting
     /// numbers produced by a topology it did not actually deliver.
@@ -161,7 +164,8 @@ public enum ArrivalInvarianceBenchmark {
         iterations: Int = 3,
         arrivalToleranceMs: Double? = nil,
         maxAttemptsPerSample: Int = 3,
-        kvBackend: EngineV2KVBackendSelection = .auto
+        kvBackend: EngineV2KVBackendSelection = .auto,
+        gemmaOptimizations: GemmaOptimizationSettings
     ) async throws -> ArrivalInvarianceBenchmarkReport {
         let promptTokens = max(2, promptTokens)
         let decodeTokens = max(2, decodeTokens)
@@ -203,7 +207,6 @@ public enum ArrivalInvarianceBenchmark {
 
         let engineParts = try await makeEngine(
             container: container,
-            modelDirectory: modelDirectory,
             isVLM: isVLM,
             weightBytes: facts.weightBytes,
             maxConcurrentRequests: patterns.map(\.delaysMs.count).max() ?? 1,
@@ -321,6 +324,8 @@ public enum ArrivalInvarianceBenchmark {
             promptTokensPerRequest: promptTokens,
             decodeTokensPerRequest: decodeTokens,
             iterations: iterations,
+            gemmaOptimizations: BenchmarkGemmaOptimizations(
+                settings: gemmaOptimizations),
             arrivalToleranceMs: toleranceMs,
             arrivalMaxAttemptsPerSample: maxAttempts,
             kvBackend: BenchmarkKVBackend(
@@ -504,7 +509,6 @@ public enum ArrivalInvarianceBenchmark {
 
     private static func makeEngine(
         container: ModelContainer,
-        modelDirectory: URL,
         isVLM: Bool,
         weightBytes: Int,
         maxConcurrentRequests: Int,
@@ -525,8 +529,7 @@ public enum ArrivalInvarianceBenchmark {
         return try await container.perform { context -> EngineParts in
             let servingModel = try EngineV2Factory.benchmarkServingModel(
                 model: context.model,
-                isVLM: isVLM,
-                modelDirectory: modelDirectory
+                isVLM: isVLM
             )
             let build = try EngineV2Factory.makeProductionBuild(
                 model: servingModel,

@@ -109,15 +109,9 @@ public enum BackendParityHarness {
         // The SERVING model is resolved EXACTLY ONCE and reused by every
         // engine build and by the drafter.
         //
-        // This is not an optimization. For a VLM checkpoint
-        // `benchmarkServingModel` runs `EngineV2VLMTextExtraction`, which
-        // returns a NEW model object on each call. Calling it per engine bound
-        // the drafter to one instance and every engine to another, and
-        // `CBv2MTPRoundDriver.build` could then not prove target identity — it
-        // returned nil and the run reported MTP inert on BOTH backends for a
-        // reason that was entirely the harness's. Resolving once also keeps
-        // the two arms on literally the same weights, so a token difference
-        // can only be the backend.
+        // Resolving once keeps the drafter and both backend arms bound to the
+        // exact same VLM-owned text tower, so target identity is preserved and
+        // a token difference can only come from the backend.
         struct Facts: @unchecked Sendable {
             let weightBytes: Int
             let eosTokenIds: Set<Int>
@@ -134,7 +128,7 @@ public enum BackendParityHarness {
             let seed = ctx.tokenizer.encode(
                 text: ThroughputSweep.seedText, addSpecialTokens: false)
             let servingModel = try EngineV2Factory.benchmarkServingModel(
-                model: ctx.model, isVLM: isVLM, modelDirectory: modelDirectory)
+                model: ctx.model, isVLM: isVLM)
 
             // Both halves of the packed-prefill gate are consulted by the
             // engine loop; only the model half is publicly readable, so read
@@ -1174,7 +1168,7 @@ public enum BackendParityHarness {
                 + "EngineV2SlotFactory). Every verdict here is a BACKEND result, not a "
                 + "statement about how production routes a slot to that backend."
                 + (isVLM ? " This checkpoint IS a VLM and is served here through the "
-                    + "text-extraction seam." : ""))
+                    + "wrapper's directly owned shared text tower." : ""))
         notes.append(
             "token comparisons are over RAW SAMPLED TOKEN IDS with temperature 0; text "
                 + "equality is a strictly weaker oracle and is not used.")

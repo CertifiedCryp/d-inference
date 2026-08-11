@@ -163,6 +163,10 @@ def markdown_report(report: dict) -> str:
         f"| Decode batch sizes | {', '.join(map(str, configuration['batchSizes']))} |",
         f"| Decode samples per batch | {configuration['decodeIterations']} |",
         f"| Arrival prompt / output | {configuration['arrivalPromptTokens']} / {configuration['arrivalDecodeTokens']} tokens |",
+        f"| Provider config | `{configuration['providerConfig']}` |",
+        f"| Comparison axis | `{configuration['comparisonAxis']}` |",
+        f"| Gemma layer-18 prefill | {'on' if configuration['gemmaOptimizations']['prefillLayer18'] else 'off'} |",
+        f"| Gemma weighted-unsort + safe-R1 | {'on' if configuration['gemmaOptimizations']['weightedR1'] else 'off'} |",
     ]
 
     lines += kv_backend_lines(kv_backend)

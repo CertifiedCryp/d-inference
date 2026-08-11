@@ -28,7 +28,8 @@ extension Benchmark {
     func runThroughputSweep(
         modelID: String,
         modelDirectory: URL,
-        hardware: HardwareInfo
+        hardware: HardwareInfo,
+        gemmaOptimizations: GemmaOptimizationSettings
     ) async throws {
         let lengths = Self.parsePositiveInts(prefillLengths)
         guard !lengths.isEmpty else {
@@ -66,6 +67,7 @@ extension Benchmark {
             decodePromptTokens: decodePromptTokens,
             decodeIterations: decodeIterations,
             kvBackend: backend,
+            gemmaOptimizations: gemmaOptimizations,
             hardware: hardware
         )
 
@@ -134,7 +136,8 @@ extension Benchmark {
 
     func runSchedulerPrefillBenchmark(
         modelID: String,
-        modelDirectory: URL
+        modelDirectory: URL,
+        gemmaOptimizations: GemmaOptimizationSettings
     ) async throws {
         let lengths = Self.parsePositiveInts(prefillLengths)
         guard !lengths.isEmpty else {
@@ -151,7 +154,8 @@ extension Benchmark {
             modelDirectory: modelDirectory,
             promptLengths: lengths,
             iterations: prefillIterations,
-            kvBackend: try resolvedKVBackendSelection()
+            kvBackend: try resolvedKVBackendSelection(),
+            gemmaOptimizations: gemmaOptimizations
         )
 
         print(try report.jsonString())
@@ -159,7 +163,8 @@ extension Benchmark {
 
     func runArrivalInvarianceBenchmark(
         modelID: String,
-        modelDirectory: URL
+        modelDirectory: URL,
+        gemmaOptimizations: GemmaOptimizationSettings
     ) async throws {
         guard arrivalPromptTokens >= 2 else {
             printError("--arrival-prompt-tokens must be >= 2")
@@ -180,7 +185,8 @@ extension Benchmark {
             promptTokens: arrivalPromptTokens,
             decodeTokens: arrivalDecodeTokens,
             iterations: arrivalIterations,
-            kvBackend: try resolvedKVBackendSelection()
+            kvBackend: try resolvedKVBackendSelection(),
+            gemmaOptimizations: gemmaOptimizations
         )
         print(try report.jsonString())
     }

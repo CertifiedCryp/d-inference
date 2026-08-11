@@ -20,27 +20,24 @@ from pathlib import Path
 #       not just the decode curve's. The scheduler-prefill and arrival
 #       commands now take the selection too, so `kvBackend.resolved` is the
 #       whole run's population rather than the sweep's.
-SCHEMA_VERSION = 4
+#   5 — required effective config-projected Gemma settings, validated across
+#       all three subprocesses and pinned for baseline comparisons.
+SCHEMA_VERSION = 5
 
 
 DEFAULT_MODEL = "mlx-community/gemma-4-26B-A4B-it-qat-4bit"
 # The canonical posture this release is measured under. Both defaults are
 # load-bearing:
 #
-#   paged      — `auto` resolves PAGED as of v0.8.0, but it degrades
-#                SILENTLY (kill switch, kernel preflight, pool capacity)
-#                while an explicit `paged` REFUSES. Naming the backend is
-#                the only way this wrapper can promise it measured what it
-#                reports, so it is requested by name even though `auto`
-#                would usually land on the same engine.
-#   1,2,4,8    — paged-vs-contiguous aggregate decode crosses over at ~B=5
-#                (measured on gemma-4 / M4 Max: 0.92x at B=1, 0.98x at B=4,
-#                1.17x at B=8). A curve that stops at 4 structurally cannot
-#                observe the win and reads as a regression. B=8 is also the
-#                raised production concurrency ceiling. The list is sparse on
+#   contiguous — `auto` resolves contiguous as of v0.8.1, but naming the
+#                backend keeps every phase's release posture explicit and
+#                prevents a future default flip from changing the benchmark.
+#   1,2,4,8    — the current production concurrency default is B=4 under the
+#                contiguous `auto` posture, while B=8 remains a supported
+#                stress point. The list is sparse on
 #                purpose: a dense 1..8 ladder doubles wall time for cells no
 #                gate reads.
-DEFAULT_KV_BACKEND = "paged"
+DEFAULT_KV_BACKEND = "contiguous"
 DEFAULT_BATCH_SIZES = [1, 2, 4, 8]
 KV_BACKENDS = ("auto", "contiguous", "paged")
 EXPECTED_ARRIVAL_PATTERNS = {
@@ -69,6 +66,21 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="provider TOML passed to every darkbloom benchmark subprocess",
+    )
+    parser.add_argument(
+        "--comparison-axis",
+        choices=("code", "gemma-optimizations"),
+        default="code",
+        help=(
+            "dimension allowed to differ from --baseline: code requires equal "
+            "Gemma settings; gemma-optimizations requires equal binaries and "
+            "different effective Gemma settings"
+        ),
+    )
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument(
         "--prefill-lengths", type=parse_positive_ints, default=[128, 512, 2048]
@@ -87,7 +99,7 @@ def parse_args() -> argparse.Namespace:
         choices=KV_BACKENDS,
         default=DEFAULT_KV_BACKEND,
         help=(
-            "KV backend the decode sweep is built with "
+            "KV backend every benchmark phase is built with "
             f"(default {DEFAULT_KV_BACKEND}; 'auto' may silently resolve "
             "either backend, so it cannot pin a measurement)"
         ),

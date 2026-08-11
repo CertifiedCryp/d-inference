@@ -103,6 +103,11 @@ struct DecodeBandwidthModelTests {
 @Suite("throughput sweep: row aggregation")
 struct ThroughputSweepRowAggregationTests {
 
+    @Test("decode sweep ignores EOS to preserve a fixed token budget")
+    func fixedDecodeBudget() {
+        #expect(ThroughputSweep.fixedBudgetStopTokens.isEmpty)
+    }
+
     @Test("clean rows aggregate tokens and the slowest row's elapsed")
     func cleanRowsAggregate() {
         let cell = ThroughputSweep.aggregateRows([
@@ -207,7 +212,8 @@ struct ThroughputSweepReportTests {
             prefill: [.init(promptTokens: 128, prefillTokensPerSecond: 900, elapsedMs: 142)],
             decode: decodeSamples(b1Aggregate: 21),
             derived: derived,
-            notes: ["test"]
+            notes: ["test"],
+            gemmaOptimizations: .init(settings: GemmaOptimizationSettings())
         )
 
         let json = try report.jsonString()
@@ -222,6 +228,13 @@ struct ThroughputSweepReportTests {
         #expect(decoded.modelID == report.modelID)
         #expect(decoded.decode.count == 2)
         #expect(decoded.derived.regime == .dense)
+        #expect(decoded.gemmaOptimizations.prefillLayer18)
+        #expect(decoded.gemmaOptimizations.weightedR1)
+        #expect(decoded.gemmaOptimizations.environment == [
+            GemmaOptimizationEnvironment.prefillLayer18Key: "18",
+            GemmaOptimizationEnvironment.weightedUnsortKey: "1",
+            GemmaOptimizationEnvironment.safeR1Key: "1",
+        ])
         #expect(decoded.schemaVersion == ThroughputSweepReport.currentSchemaVersion)
     }
 
@@ -249,6 +262,7 @@ struct ThroughputSweepReportTests {
             decode: [],
             derived: derived,
             notes: ["kv backend: selection=paged, resolved=n/a (no decode cells ran)"],
+            gemmaOptimizations: .init(settings: GemmaOptimizationSettings()),
             decodeConstructionFailure: .init(
                 kvBackendSelection: "paged", reason: reason)
         )
@@ -292,6 +306,7 @@ struct ThroughputSweepReportTests {
             decode: mixed,
             derived: derived,
             notes: [],
+            gemmaOptimizations: .init(settings: GemmaOptimizationSettings()),
             kvBackend: .init(
                 selection: "auto",
                 resolved: ["paged", "contiguous (fallback: pool capacity)"])
@@ -342,6 +357,7 @@ struct ThroughputSweepReportTests {
             ],
             derived: derived,
             notes: [],
+            gemmaOptimizations: .init(settings: GemmaOptimizationSettings()),
             kvBackend: .init(selection: "paged", resolved: ["paged"]),
             decodeCoverage: .init(
                 requestedBatchSizes: [1, 8],
@@ -379,6 +395,7 @@ struct ThroughputSweepReportTests {
                 memoryBandwidthGbs: 546),
             prefill: [], decode: decodeSamples(b1Aggregate: 21), derived: derived,
             notes: [],
+            gemmaOptimizations: .init(settings: GemmaOptimizationSettings()),
             kvBackend: .init(selection: "paged", resolved: ["paged"]),
             decodeCoverage: .init(requestedBatchSizes: [1, 2], unmeasured: []))
         let json = try report.jsonString()
@@ -388,7 +405,7 @@ struct ThroughputSweepReportTests {
             ThroughputSweepReport.self, from: Data(json.utf8))
         #expect(decoded.decodeCoverage.unmeasured.isEmpty)
         #expect(decoded.decodeCoverage.requestedBatchSizes == [1, 2])
-        #expect(decoded.schemaVersion == 4)
+        #expect(decoded.schemaVersion == ThroughputSweepReport.currentSchemaVersion)
     }
 }
 

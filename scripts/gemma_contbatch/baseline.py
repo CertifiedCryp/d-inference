@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .config import SCHEMA_VERSION
 from .environment import baseline_environment
+from .gemma_optimizations import validate_gemma_optimizations
 
 
 NO_COMPARE_HINT = "omit --baseline to run without a comparison"
@@ -101,11 +102,18 @@ def validate_hardware_pin(baseline: dict, hardware: dict) -> None:
         )
 
 
-def validate_configuration_pin(args: argparse.Namespace, baseline: dict) -> None:
+def validate_configuration_pin(
+    args: argparse.Namespace,
+    baseline: dict,
+    gemma_optimizations: dict,
+    comparison_axis: str = "code",
+) -> None:
     baseline_configuration = baseline.get("configuration")
     if not isinstance(baseline_configuration, dict):
         raise RuntimeError("baseline does not record a configuration; " + NO_COMPARE_HINT)
     expected = {
+        "iterations": args.iterations,
+        "decodeIterations": args.iterations,
         "decodePromptTokens": args.decode_prompt_tokens,
         "decodeTokens": args.decode_tokens,
         "arrivalPromptTokens": args.arrival_prompt_tokens,
@@ -123,6 +131,41 @@ def validate_configuration_pin(args: argparse.Namespace, baseline: dict) -> None
             "benchmark shape is not comparable to the baseline: "
             + ", ".join(mismatches)
             + "; " + NO_COMPARE_HINT
+        )
+
+    baseline_gemma = validate_gemma_optimizations(
+        baseline_configuration.get("gemmaOptimizations"), "baseline configuration"
+    )
+    if comparison_axis == "code":
+        if baseline_gemma != gemma_optimizations:
+            raise RuntimeError(
+                "gemmaOptimizations differ on a code comparison; " + NO_COMPARE_HINT
+            )
+    elif comparison_axis == "gemma-optimizations":
+        if baseline_gemma == gemma_optimizations:
+            raise RuntimeError(
+                "gemma-optimizations comparison requires different effective settings; "
+                + NO_COMPARE_HINT
+            )
+    else:
+        raise RuntimeError(f"unknown comparison axis {comparison_axis!r}")
+
+
+def validate_artifact_pin(baseline: dict, metadata: dict) -> None:
+    baseline_metadata = baseline.get("metadata")
+    if not isinstance(baseline_metadata, dict):
+        raise RuntimeError("baseline does not record artifact hashes; " + NO_COMPARE_HINT)
+    mismatches = [
+        f"{key}={metadata.get(key)!r} (baseline {baseline_metadata.get(key)!r})"
+        for key in ("binarySha256", "metallibSha256")
+        if metadata.get(key) != baseline_metadata.get(key)
+    ]
+    if mismatches:
+        raise RuntimeError(
+            "gemma-optimizations comparison requires identical artifacts: "
+            + ", ".join(mismatches)
+            + "; "
+            + NO_COMPARE_HINT
         )
 
 
@@ -188,11 +231,9 @@ def validate_environment_pin(baseline: dict, environment: dict[str, str]) -> Non
 def validate_schema_version_pin(baseline: dict) -> None:
     """Refuse a baseline written against a different wrapper schema.
 
-    Schema 3 removed `configuration.maxBatch` and added the `kvBackend`
-    block. A schema-2 baseline therefore records a batch ladder this runner
-    cannot see and no backend at all, so every pin below it reads absent
-    fields as "not recorded" and the comparison silently comes out as a
-    same-shape delta between two different experiments. Fail here instead.
+    Schema 5 additionally records the config-projected Gemma posture. Older
+    reports cannot distinguish an ON run from an OFF run, so every named field
+    below must come from the exact schema this runner writes.
     """
     recorded = baseline.get("schemaVersion")
     if recorded == SCHEMA_VERSION:
@@ -200,8 +241,8 @@ def validate_schema_version_pin(baseline: dict) -> None:
     raise RuntimeError(
         f"baseline schemaVersion is {recorded!r}, this runner writes "
         f"{SCHEMA_VERSION}; the two reports do not describe the same fields "
-        f"(schema 3 replaced configuration.maxBatch with configuration."
-        f"batchSizes and added the kvBackend block); "
+        f"(schema 5 includes batchSizes, kvBackend, and effective Gemma "
+        f"optimization settings); "
         + "re-record the baseline with this runner, or " + NO_COMPARE_HINT
     )
 
@@ -212,6 +253,9 @@ def validate_baseline_pins(
     model_snapshot: str,
     hardware: dict,
     environment: dict[str, str],
+    gemma_optimizations: dict,
+    comparison_axis: str = "code",
+    metadata: dict | None = None,
 ) -> None:
     """Every pin that must hold before a delta can be read as an engine delta."""
     # First: every pin below reads named fields, and a schema mismatch makes
@@ -219,5 +263,9 @@ def validate_baseline_pins(
     validate_schema_version_pin(baseline)
     validate_model_pin(baseline, args.model, model_snapshot)
     validate_hardware_pin(baseline, hardware)
-    validate_configuration_pin(args, baseline)
+    validate_configuration_pin(
+        args, baseline, gemma_optimizations, comparison_axis=comparison_axis
+    )
+    if comparison_axis == "gemma-optimizations":
+        validate_artifact_pin(baseline, metadata or {})
     validate_environment_pin(baseline, environment)

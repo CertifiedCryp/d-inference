@@ -31,6 +31,12 @@ public enum ThroughputSweep {
     public static let defaultDecodePromptTokens = 64
     public static let defaultDecodeIterations = 1
 
+    /// Throughput cells must generate the requested budget for every row.
+    /// Honoring model EOS would compare different token counts and lets one
+    /// early-stopping row corrupt a batch aggregate; arrival invariance uses
+    /// the same fixed-budget contract.
+    static let fixedBudgetStopTokens: Set<Int> = []
+
     /// Snapshot of model facts read once, off-actor, inside `perform`.
     private struct ModelFacts: Sendable {
         let weightBytes: Int
@@ -64,15 +70,15 @@ public enum ThroughputSweep {
         decodePromptTokens: Int = defaultDecodePromptTokens,
         decodeIterations: Int = defaultDecodeIterations,
         kvBackend: EngineV2KVBackendSelection = .auto,
+        gemmaOptimizations: GemmaOptimizationSettings,
         hardware: HardwareInfo,
         efficiency: Double = DecodeBandwidthModel.defaultBandwidthEfficiency
     ) async throws -> ThroughputSweepReport {
         log("loading model \(modelID)")
         log("  path: \(modelDirectory.path)")
 
-        // VLM checkpoints (config declares `vision_config`) load through the
-        // VLM factory and serve through the weight-sharing extracted text
-        // model — the same construction every production slot performs.
+        // VLM checkpoints load through the VLM factory and serve through the
+        // exact text tower owned by that wrapper, matching production.
         let isVLM = readHasVisionConfig(modelDirectory: modelDirectory)
         let container: ModelContainer
         if isVLM {
@@ -111,7 +117,6 @@ public enum ThroughputSweep {
             iterations: decodeIterations,
             weightBytes: facts.weightBytes,
             isVLM: isVLM,
-            modelDirectory: modelDirectory,
             kvBackend: kvBackend
         )
         let decode = decodeOutcome.samples
@@ -159,6 +164,8 @@ public enum ThroughputSweep {
             decode: decode,
             derived: derived,
             notes: notes,
+            gemmaOptimizations: BenchmarkGemmaOptimizations(
+                settings: gemmaOptimizations),
             kvBackend: ThroughputSweepReport.KVBackend(
                 selection: kvBackend.rawValue,
                 resolved: decodeOutcome.resolvedBackends),
@@ -321,7 +328,6 @@ public enum ThroughputSweep {
         iterations: Int,
         weightBytes: Int,
         isVLM: Bool,
-        modelDirectory: URL?,
         kvBackend: EngineV2KVBackendSelection
     ) async -> DecodeOutcome {
         let sizes = batchSizes.filter { $0 > 0 }.sorted()
@@ -339,7 +345,7 @@ public enum ThroughputSweep {
         let warmUp = await runDecodeBatch(
             container: container, modelID: modelID, baseTokens: baseTokens,
             batchSize: 1, decodeTokens: 4, promptLen: promptLen, weightBytes: weightBytes,
-            isVLM: isVLM, modelDirectory: modelDirectory, kvBackend: kvBackend)
+            isVLM: isVLM, kvBackend: kvBackend)
         // The warm-up is the FIRST cell to hit a refused paged selection, so
         // it carries the reason even when the sized cells below fail
         // identically. Keep it: an operator should not have to infer the
@@ -351,8 +357,7 @@ public enum ThroughputSweep {
                 let (totalTokens, maxElapsed, resolved, failure, submitFailure) = await runDecodeBatch(
                     container: container, modelID: modelID, baseTokens: baseTokens,
                     batchSize: batchSize, decodeTokens: genTokens, promptLen: promptLen,
-                    weightBytes: weightBytes, isVLM: isVLM, modelDirectory: modelDirectory,
-                    kvBackend: kvBackend)
+                    weightBytes: weightBytes, isVLM: isVLM, kvBackend: kvBackend)
                 if outcome.record(resolved), let resolved {
                     log("  engine resolved kv backend: \(resolved)")
                 }
@@ -413,7 +418,6 @@ public enum ThroughputSweep {
         promptLen: Int,
         weightBytes: Int,
         isVLM: Bool,
-        modelDirectory: URL?,
         kvBackend: EngineV2KVBackendSelection
     ) async -> (
         totalTokens: Int, maxElapsed: Duration, resolvedBackend: String?,
@@ -430,17 +434,16 @@ public enum ThroughputSweep {
             UInt64(Int.max)))
         struct EngineParts: @unchecked Sendable {
             let engine: any CBv2Engine
-            let eosTokenIds: Set<Int>
             /// The backend the factory resolved to, with any fallback reason.
             let resolvedBackend: String
         }
         let parts: EngineParts
         do {
             parts = try await container.perform { ctx -> EngineParts in
-                // Serving-model resolution: VLM checkpoints run the
-                // weight-sharing text extraction, exactly like a slot build.
+                // Serving-model resolution matches production: VLM checkpoints
+                // use the exact text tower owned by the loaded wrapper.
                 let servingModel = try EngineV2Factory.benchmarkServingModel(
-                    model: ctx.model, isVLM: isVLM, modelDirectory: modelDirectory)
+                    model: ctx.model, isVLM: isVLM)
                 // `makeProductionBuild` is the construction
                 // `makeProductionEngine` wraps, and additionally hands back the
                 // backend kind the engine actually resolved to — the fact a
@@ -453,7 +456,6 @@ public enum ThroughputSweep {
                     kvBackend: kvBackend)
                 return EngineParts(
                     engine: build.engine,
-                    eosTokenIds: ctx.configuration.eosTokenIds,
                     resolvedBackend: build.resolvedKVBackendDescriptor)
             }
         } catch {
@@ -465,7 +467,6 @@ public enum ThroughputSweep {
             return (0, .zero, nil, "\(error)", nil)
         }
         let engine = parts.engine
-        let eosTokenIds = parts.eosTokenIds
 
         let result = await withTaskGroup(of: RowMeasure.self) {
             group -> (Int, Duration, String?) in
@@ -482,7 +483,7 @@ public enum ThroughputSweep {
                             promptTokens: prompt,
                             sampling: CBv2SamplingParams(temperature: 0.0),
                             maxTokens: decodeTokens + 1,
-                            stopTokens: eosTokenIds
+                            stopTokens: Self.fixedBudgetStopTokens
                         ))
                     } catch {
                         Self.log("  submit failed: \(error)")
@@ -585,8 +586,8 @@ public enum ThroughputSweep {
         return (sorted[middle - 1] + sorted[middle]) / 2
     }
 
-    /// Whether the checkpoint's config.json declares a `vision_config`
-    /// (VLM — load via the VLM factory, serve via the text extraction).
+    /// Whether config.json declares `vision_config` (load through VLMModelFactory
+    /// and serve through the wrapper-owned text tower).
     static func readHasVisionConfig(modelDirectory: URL) -> Bool {
         let url = modelDirectory.appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: url),
